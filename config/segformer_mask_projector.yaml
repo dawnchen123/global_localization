@@ -1,0 +1,46 @@
+# C++ projector for stage-2 SegFormer fusion.
+#
+# This node does not run the SegFormer network. It consumes a mono8 semantic
+# mask produced by your SegFormer runtime and projects the mask labels to a
+# PointCloud2, producing x/y/z/label/confidence for semantic_voxel_mapper_node.
+
+# Use the same point geometry as RangeNet++ output. The projector ignores the
+# existing label field and only needs x/y/z in the LiDAR frame.
+cloud_topic: /rangenet/semantic_points
+mask_topic: /segformer/label_mask
+output_topic: /segformer/projected_semantic_points
+
+use_camera_info: false
+camera_info_topic: /camera/camera_info
+
+# cityscapes:
+#   road=0, sidewalk=1, building=2, wall=3, fence=4, vegetation=8, terrain=9,
+#   person=11, rider=12, vehicle classes=13..18.
+# internal:
+#   0 unknown, 1 road, 2 sidewalk, 3 building, 4 vegetation, 5 dynamic, 6 other.
+mask_label_mode: cityscapes
+
+fx: 1064.8950
+fy: 1065.2546
+cx: 801.4049
+cy: 624.6878
+d0: -0.1516
+d1: 0.0942
+d2: 0.000169
+d3: -0.000142
+use_distortion: true
+
+min_project_depth_m: 0.2
+max_mask_age_sec: 0.25
+point_stride: 1
+min_mask_support_ratio: 0.30
+support_kernel_px: 5
+default_confidence: 0.65
+drop_unknown: true
+
+# p_cam = T_cam_lidar * p_lidar
+T_cam_lidar:
+  [0.01097839, -0.99993887,  0.00131978,  0.19918991,
+  -0.00613344, -0.00138718, -0.99998023, -0.10540496,
+   0.99992093,  0.01097008, -0.00614829, -0.09131360,
+   0.0,         0.0,         0.0,         1.0]

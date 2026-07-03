@@ -1,0 +1,175 @@
+# v21: SAM3 image semantic segmentation + LiDAR projection + FAST-LIVO2 pose accumulation
+# This config supports datasets without /camera_info by using calibrated intrinsics/extrinsics here.
+# Label definition:
+#   0 unknown/unobserved
+#   1 road / drivable / pavement / sidewalk
+#   2 building / wall / structure
+#   3 tree / high vegetation
+#   4 grass / low vegetation / lawn
+
+queue_dir: /tmp/sam3_projected_semantic_queue
+
+# ROS topics. Change these according to your dataset.
+image_topic: /avt_camera/left/image_raw
+lidar_topic: /livox/mid360/points
+# v22: use livox_custom for livox_ros_driver/CustomMsg raw packets.
+# Use pointcloud2_lidar only for raw PointCloud2 in the LiDAR frame.
+lidar_input_type: livox_custom
+odom_topic: /aft_mapped_to_init
+
+# If your bag has no camera_info topic, keep this false.
+use_camera_info: false
+camera_info_topic: /camera/camera_info
+
+# Camera intrinsic parameters. These are used when use_camera_info=false.
+# If the published image is downsampled, set image_scale to that factor.
+# Example: original 1600x1200 image and published image 800x600 -> image_scale=0.5.
+cam_model: Pinhole
+cam_width: 1600
+cam_height: 1200
+image_scale: 1.0
+cam_fx: 1064.8950
+cam_fy: 1065.2546
+cam_cx: 801.4049
+cam_cy: 624.6878
+cam_d0: -0.1516
+cam_d1: 0.0942
+cam_d2: 0.000169
+cam_d3: -0.000142
+# If true, after applying image_scale, K is further adjusted to the actual ROS image size.
+auto_resize_intrinsics_to_image: true
+
+# Queue export frequency. SAM3 is heavy, do not export every camera frame.
+export_rate: 1.0
+approx_sync_slop: 0.30
+use_latest_odom: true
+max_odom_age_sec: 99999999.0
+debug_sync: true
+
+# LiDAR point filtering before saving to queue.
+# Important: /cloud_registered is usually in camera_init/map frame and should not be
+# used for image-mask projection with T_cam_lidar. Use /livox/mid360/points here.
+point_stride: 1
+max_export_points: 180000
+min_range_m: 0.5
+max_range_m: 120.0
+z_min_lidar: -5.0
+z_max_lidar: 8.0
+
+# Camera-LiDAR extrinsic. p_cam = T_cam_lidar * p_lidar.
+# The following matrix is built from your Rcl/Pcl:
+#   Rcl = [0.01097839, -0.99993887, 0.00131978,
+#          -0.00613344, -0.00138718, -0.99998023,
+#           0.99992093, 0.01097008, -0.00614829]
+#   Pcl = [0.19918991, -0.10540496, -0.09131360]
+T_cam_lidar:
+  [0.01097839, -0.99993887,  0.00131978,  0.19918991,
+  -0.00613344, -0.00138718, -0.99998023, -0.10540496,
+   0.99992093,  0.01097008, -0.00614829, -0.09131360,
+   0.0,         0.0,         0.0,         1.0]
+
+# Body/odom pose to lidar extrinsic. p_map = T_map_body * T_body_lidar * p_lidar.
+# If FAST-LIVO2 odometry pose already represents lidar frame in map, keep identity.
+T_body_lidar:
+  [1, 0, 0, 0,
+   0, 1, 0, 0,
+   0, 0, 1, 0,
+   0, 0, 0, 1]
+
+# Semantic BEV accumulation.
+bev_resolution: 0.20
+bev_size_m: 140.0
+accumulation_window_sec: 90.0
+max_semantic_points: 2500000
+min_votes_per_cell: 1
+publish_rate: 0.5
+
+# Optional postprocessing.
+morph_open_kernel: 3
+morph_close_kernel: 5
+min_region_area_px: 8
+
+# Label voting weights. Increase road/building because they are more valuable for satellite matching.
+label_weights:
+  road: 1.4
+  building: 1.5
+  tree: 1.0
+  grass: 0.8
+
+# Output topics.
+label_topic: /local_semantic_map/label
+color_topic: /local_semantic_map/color
+confidence_topic: /local_semantic_map/confidence
+debug_topic: /local_semantic_map/debug
+stats_topic: /local_semantic_map/stats
+
+# Projection options. If camera distortion is provided, use cv2.projectPoints.
+use_distortion_projection: true
+min_project_depth_m: 0.2
+enable_projection_depth_filter: true
+projection_depth_tolerance_m: 0.60
+
+# SuMa++-style refinement for projected image labels.
+# The mapper now treats SAM3 labels as semantic measurements, not final truth:
+# local mask support, range discontinuity score and simple LiDAR geometry are
+# fused into the per-point semantic weight before map integration.
+enable_semantic_support_filter: true
+semantic_support_kernel_px: 5
+min_semantic_support_ratio: 0.28
+enable_range_edge_weight: true
+range_edge_kernel_px: 5
+range_edge_soft_m: 0.8
+range_edge_hard_m: 2.5
+enable_lidar_geometry_refinement: true
+geometry_grid_resolution: 0.60
+road_max_ground_height_m: 0.35
+road_reject_ground_height_m: 1.10
+low_vegetation_max_ground_height_m: 0.75
+building_min_ground_height_m: 0.45
+tree_min_ground_height_m: 0.40
+structure_min_z_span_m: 0.80
+flat_cell_max_z_span_m: 0.45
+min_geometry_score: 0.18
+
+# 3D semantic point-cloud map output.
+# This is the main semantic-SLAM map: labels projected from camera masks are
+# fused in map-frame voxels and published as PointCloud2 with rgb/label/confidence.
+publish_semantic_cloud: true
+semantic_cloud_topic: /semantic_cloud_map
+semantic_cloud_stats_topic: /semantic_cloud_map/stats
+semantic_cloud_frame: camera_init
+semantic_cloud_voxel_size: 0.20
+semantic_cloud_min_votes: 1.8
+semantic_cloud_min_confidence: 0.60
+semantic_cloud_max_points: 600000
+semantic_cloud_confidence_vote_scale: 3.0
+# Optional binary PLY autosave. Leave empty for RViz-only debugging.
+semantic_cloud_save_path: ""
+semantic_cloud_save_every_sec: 0.0
+
+# v24 projection debug
+publish_projection_debug: true
+projection_debug_topic: /local_semantic_map/projection_debug
+projection_stats_topic: /local_semantic_map/projection_stats
+projection_debug_max_points: 12000
+
+# v26 dense local semantic BEV options
+# Sparse LiDAR-to-image semantic points are expanded into local semantic support
+# regions so that /local_semantic_map/color is useful for map matching.
+enable_dense_bev: true
+bev_size_m: 80.0
+bev_resolution: 0.15
+min_votes_per_cell: 1
+morph_open_kernel: 1
+morph_close_kernel: 3
+min_region_area_px: 1
+road_splat_radius_px: 5
+building_splat_radius_px: 3
+tree_splat_radius_px: 5
+grass_splat_radius_px: 5
+enable_road_ray_fill: true
+road_ray_max_range_m: 40.0
+road_ray_weight: 0.35
+road_ray_max_points: 3000
+bev_center_mode: latest_pose
+publish_rate: 1.0

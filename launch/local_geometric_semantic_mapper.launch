@@ -1,0 +1,6 @@
+<launch>
+  <arg name="config" default="$(find fast_livo2_global_localization)/config/local_geometric_semantic_mapper.yaml"/>
+  <node pkg="fast_livo2_global_localization" type="local_geometric_semantic_mapper.py" name="local_geometric_semantic_mapper" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+  </node>
+</launch>

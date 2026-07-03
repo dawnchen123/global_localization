@@ -1,0 +1,40 @@
+# v16 SAM3 semantic segmentation + semantic map matching configuration.
+# This file is for reference. The service is normally run in a separate conda env,
+# so pass these values as command-line arguments or source them in a shell script.
+queue_dir: /tmp/eloftr_queue
+
+# SAM3 runs outside ROS Noetic. Use Python 3.12+, PyTorch 2.7+, CUDA 12.6+.
+sam3_root: /home/dawn/software/sam3
+sam3_checkpoint: ""
+device: cuda
+sat_backend: sam3
+# For local BEV pseudo-images, heuristic is often more stable than SAM3.
+# Use sam3 only when bev_sem_path is a real RGB camera/orthographic image.
+local_backend: heuristic
+
+sat_prompts: "road=road|street|paved road|parking lot,building=building|roof|house|structure,vegetation=tree|vegetation|grass|green area,open=open ground|open area|square|bare ground,water=water|river|pond"
+local_prompts: "road=road|ground|drivable area|open ground,building=building|wall|structure,vegetation=tree|vegetation|bush,obstacle=vehicle|pole|barrier|obstacle"
+
+sam3_score_thresh: 0.25
+sam3_mask_thresh: 0.0
+sam3_max_instances: 20
+
+search_radius_m: 35.0
+search_step_m: 2.0
+yaw_degs: "-10,-5,0,5,10"
+min_score: 0.42
+min_coverage: 0.20
+target_coverage: 0.45
+peak_delta_min: 0.025
+peak_ratio_min: 1.025
+min_local_valid_pixels: 800
+min_local_foreground_ratio: 0.008
+max_points: 12000
+interior_sample_ratio: 0.08
+semantic_weight: 0.78
+boundary_weight: 0.22
+dt_sigma_px: 6.0
+dt_clip_px: 25.0
+max_local_dim: 900
+max_sat_dim: 1500
+output_variance: 9.0

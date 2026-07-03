@@ -1,0 +1,84 @@
+# New semantic SLAM pipeline.
+#
+# Stage 1:
+#   FAST-LIVO2 odom + RangeNet++ labeled LiDAR cloud
+#   -> semantic_voxel_mapper_node
+#   -> /semantic_cloud_map + /semantic_bev/*
+#
+# Stage 2:
+#   SegFormer mono8 image label mask + point cloud
+#   -> segformer_mask_projector_node
+#   -> /segformer/projected_semantic_points
+#   -> semantic_voxel_mapper_node vote fusion
+#
+# Internal labels:
+#   0 unknown
+#   1 road / drivable
+#   2 sidewalk / terrain / traversable margin
+#   3 building / wall / fence / structure
+#   4 vegetation / trunk / pole / traffic sign
+#   5 dynamic object
+#   6 other object
+
+odom_topic: /aft_mapped_to_init
+map_frame: camera_init
+
+# RangeNet++-compatible output. With the local rangenet_geometry_adapter this is
+# an internal-label PointCloud2 in the FAST-LIVO2 map frame. If you later replace
+# it with real RangeNet++ publishing SemanticKITTI ids in LiDAR frame, set:
+#   lidar_cloud_in_map_frame: false
+#   lidar_label_mode: semantic_kitti
+lidar_semantic_cloud_topic: /rangenet/semantic_points
+subscribe_lidar_semantic_cloud: true
+lidar_cloud_in_map_frame: true
+lidar_label_mode: internal
+label_field: label
+
+# Optional SegFormer fusion. Keep false for the first stage.
+subscribe_segformer_semantic_cloud: false
+segformer_semantic_cloud_topic: /segformer/projected_semantic_points
+image_cloud_in_map_frame: false
+image_label_mode: internal
+
+# If FAST-LIVO2 odometry pose is body=LiDAR, keep identity.
+T_body_lidar:
+  [1, 0, 0, 0,
+   0, 1, 0, 0,
+   0, 0, 1, 0,
+   0, 0, 0, 1]
+
+# Fusion weights.
+voxel_size: 0.20
+min_votes: 2.0
+min_confidence: 0.55
+confidence_vote_scale: 4.0
+lidar_source_weight: 1.0
+image_source_weight: 0.65
+default_confidence: 0.75
+fuse_dynamic_objects: false
+publish_static_labeled_cloud: true
+
+# Bounded runtime memory and publication.
+max_publish_points: 800000
+max_voxels: 1800000
+voxel_ttl_sec: 0.0
+publish_rate: 2.0
+min_range_m: 0.5
+max_range_m: 1200.0
+z_min_map: -5.0
+z_max_map: 25.0
+
+# Outputs.
+semantic_cloud_topic: /semantic_cloud_map
+semantic_cloud_stats_topic: /semantic_cloud_map/stats
+static_labeled_cloud_topic: /semantic_cloud/static_labeled_points
+
+# BEV used later for dynamic filtering, traversable extraction and prior matching.
+publish_bev: true
+bev_resolution: 0.20
+bev_size_m: 100.0
+bev_center_on_latest_pose: true
+bev_label_topic: /semantic_bev/label
+bev_color_topic: /semantic_bev/color
+bev_confidence_topic: /semantic_bev/confidence
+bev_traversable_topic: /semantic_bev/traversable

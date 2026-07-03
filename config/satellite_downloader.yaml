@@ -1,0 +1,30 @@
+gps_topic: /fix
+imu_topic: /imu
+
+# coverage_m means 3km x 3km by default. If you really need a radius of 3km,
+# set coverage_is_radius=true, which will generate a 6km x 6km mosaic.
+coverage_m: 3000.0
+coverage_is_radius: false
+
+# High-resolution imagery. At latitude around Xi'an, zoom 19 is about 0.25 m/pixel.
+# A 3km x 3km crop is roughly 12000 x 12000 pixels and around 1500 tiles.
+zoom: 19
+max_tiles: 2500
+reload_distance_m: 1000.0
+cache_dir: /tmp/fast_livo2_global_localization
+force_redownload: false
+
+# Publish a downsampled preview only. The C++ matcher reads the full-resolution PNG from disk.
+publish_downsample_scale: 0.12
+
+# Configure a licensed XYZ satellite or orthophoto tile server.
+# Check provider license before publication or deployment.
+tile_url_template: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+user_agent: "fast_livo2_global_localization/0.2"
+
+# Network robustness. If ArcGIS/other imagery server reports SSL EOF or rate limits,
+# increase tile_sleep_sec and retry_backoff. Set verify_ssl false only for local testing.
+retry_times: 5
+retry_backoff: 0.8
+tile_sleep_sec: 0.06
+verify_ssl: true

@@ -1,0 +1,42 @@
+# File-queue bridge between ROS Noetic Python3.8 and the external constrained
+# geographic-prior matching service.
+queue_dir: /tmp/eloftr_queue
+
+# ROS-side exporter topics
+bev_topic: /local_bev/match_image
+satellite_crop_topic: /satellite_map/match_image
+meta_topic: /map_match/input_meta
+
+# Structured local semantic maps. local_label_topic is the preferred source for
+# the final constrained-prior matcher; bev_semantic_topic is kept as a legacy
+# visual fallback.
+export_semantic_sources: true
+bev_semantic_topic: /local_semantic_map/color
+local_label_topic: /local_semantic_map/label
+local_confidence_topic: /local_semantic_map/confidence
+local_geometric_label_topic: /local_geometric_map/label
+local_geometric_confidence_topic: /local_geometric_map/confidence
+sam3_local_image_topic: /local_rgb_bev/image
+satellite_rgb_topic: /satellite_map/aligned_crop
+
+# Export frequency. The exporter writes one request when all inputs are available.
+export_rate: 0.05                  # timer rate, 0.05Hz = check every 20s
+min_seconds_between_requests: 10.0 # minimum interval between written requests
+max_pending_requests: 2
+overwrite_old_pending: true
+require_new_meta: false
+max_image_dim_to_save: 0           # 0 = save original published image; external service may resize later
+
+# ROS-side result publisher
+output_topic: /map_match_pose_external
+debug_topic: /map_match/file_queue_debug
+poll_rate: 2.0
+publish_rejected: false
+frame_id: earth
+move_processed: true
+
+# Visual diagnosis topics
+heatmap_topic: /map_match/similarity_heatmap
+overlay_topic: /map_match/sat_bev_overlay
+local_semantic_topic: /map_match/local_semantic_color
+satellite_semantic_topic: /geographic_prior_map/color

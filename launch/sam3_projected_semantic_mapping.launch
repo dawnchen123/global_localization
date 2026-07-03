@@ -1,0 +1,17 @@
+<launch>
+  <arg name="config" default="$(find fast_livo2_global_localization)/config/sam3_projected_semantic_mapper.yaml"/>
+  <arg name="run_exporter" default="true"/>
+  <arg name="run_mapper" default="true"/>
+
+  <group if="$(arg run_exporter)">
+    <node pkg="fast_livo2_global_localization" type="camera_lidar_queue_exporter.py" name="camera_lidar_queue_exporter" output="screen">
+      <rosparam command="load" file="$(arg config)" />
+    </node>
+  </group>
+
+  <group if="$(arg run_mapper)">
+    <node pkg="fast_livo2_global_localization" type="projected_semantic_bev_mapper.py" name="projected_semantic_bev_mapper" output="screen">
+      <rosparam command="load" file="$(arg config)" />
+    </node>
+  </group>
+</launch>

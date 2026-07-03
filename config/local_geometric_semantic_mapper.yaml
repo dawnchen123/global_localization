@@ -1,0 +1,90 @@
+# Local geometric semantic mapper parameters.
+# Input cloud should preferably be FAST-LIVO2 /cloud_registered in camera_init/map frame.
+
+cloud_topic: /cloud_registered
+odom_topic: /aft_mapped_to_init
+cloud_in_map_frame: true
+map_frame: camera_init
+robot_frame: base_link
+
+# Accumulation. Increase window if the BEV still covers only a tiny local area.
+cloud_accumulation_window: 60.0
+cloud_accumulation_max_frames: 600
+cloud_accumulation_stride: 1
+cloud_accumulation_voxel_size: 0.08
+max_points_per_frame: 80000
+min_total_points: 2000
+
+# BEV grid. For zoom=18 satellite map, 0.5m/px is closer; for zoom=19, 0.25m/px.
+# For local semantic extraction, 0.2m is useful; matching service should rescale to sat_mpp.
+bev_resolution: 0.20
+bev_size_m: 160.0
+max_point_range: 220.0
+center_mode: odom   # odom | cloud_median | origin
+fixed_center_x: 0.0
+fixed_center_y: 0.0
+z_min: -5.0
+z_max: 8.0
+
+# Ground/open-area detection
+ground_percentile: 5.0
+ground_margin: 0.35
+local_ground_smooth_cells: 21
+local_ground_seed_max_above_global: 0.80
+height_band_filter_enabled: true
+height_band_min_above_ground: -0.20
+height_band_max_above_ground: 1.50
+open_height_range_max: 0.28
+open_z_std_max: 0.12
+
+# Tall rigid structure/building wall
+structure_height_min: 1.30
+structure_z_std_max: 0.95
+
+# Vegetation: tall, rough, high vertical variation
+vegetation_height_min: 1.00
+vegetation_z_std_min: 0.45
+vegetation_height_range_min: 1.20
+
+# Low/mid obstacle
+obstacle_height_min: 0.25
+obstacle_height_max: 1.30
+
+# RGB / intensity assisted segmentation. FAST-LIVO2 colored clouds usually carry
+# rgb/rgba and sometimes intensity; when unavailable, the mapper falls back to
+# geometry-only rules.
+use_color_features: true
+use_intensity_features: true
+vegetation_green_excess_min: 0.08
+vegetation_saturation_min: 0.18
+vegetation_color_texture_min: 0.05
+structure_green_excess_max: 0.04
+structure_color_texture_max: 0.16
+road_saturation_max: 0.30
+road_green_excess_max: 0.05
+
+# Simplified matching map. Vegetation is dropped; only road area, road edge,
+# rigid building/structure and lane-line candidates are exported for matching.
+publish_simplified_geometric: true
+road_edge_dilate_iter: 1
+lane_line_intensity_min: 0.75
+lane_line_value_min: 0.72
+lane_line_saturation_max: 0.35
+simplified_road_height_max: 0.70
+simplified_road_height_range_max: 0.55
+simplified_road_z_std_max: 0.25
+simplified_road_min_area: 35
+simplified_building_height_min: 1.45
+simplified_building_height_range_min: 0.90
+simplified_building_z_std_max: 0.70
+simplified_building_green_excess_max: 0.01
+simplified_building_color_texture_max: 0.22
+simplified_building_min_area: 24
+
+# Cleanup
+min_component_area_structure: 6
+min_component_area_vegetation: 8
+min_component_area_open: 20
+dilate_observed: 1
+
+publish_rate: 1.0
