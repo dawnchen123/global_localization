@@ -1,0 +1,55 @@
+# RTK + IMU ground-truth trajectory evaluator.
+
+rtk_fix_topic: /novatel/oem7/fix
+imu_topic: /adi/adis16465/imu
+raw_odom_topic: /aft_mapped_to_init
+semantic_odom_topic: /semantic_graph_corrected_odom
+
+gt_odom_topic: /ground_truth/odom
+stats_topic: /trajectory_eval/rmse
+map_frame: rtk_enu
+
+# Origin is set from the first valid RTK fix by default. Set use_fixed_origin
+# true if you need comparable ENU coordinates across multiple bag runs.
+use_fixed_origin: false
+origin_latitude: 0.0
+origin_longitude: 0.0
+origin_altitude: 0.0
+
+# NavSatStatus::STATUS_FIX is enough for many bag files. Raise to 2 if your
+# NovAtel driver marks RTK fixed solutions as GBAS_FIX.
+min_navsat_status: 0
+default_rtk_xy_std: 0.03
+default_rtk_z_std: 0.06
+
+# IMU orientation is used for GT yaw and for first_pose alignment mode.
+use_imu_orientation: true
+integrate_imu_yaw_when_orientation_invalid: true
+max_imu_age_sec: 0.20
+max_imu_integration_dt: 0.05
+imu_yaw_offset_deg: 0.0
+imu_gyro_z_sign: 1.0
+imu_gyro_z_bias: 0.0
+default_imu_yaw_std_deg: 1.0
+
+# Evaluation alignment:
+#   se2_window: estimate one initial 2D yaw+translation+Z offset, then freeze it.
+#   first_pose: use first matched GT/odom pose directly.
+#   none: compare in existing frames.
+alignment_mode: se2_window
+alignment_min_samples: 5
+alignment_min_distance_m: 1.0
+alignment_fallback_to_first_pose: true
+alignment_fallback_samples: 30
+max_alignment_samples: 300
+gt_match_mode: stamp_or_latest
+max_gt_match_dt: 0.10
+max_latest_gt_age_sec: 1.50
+gt_buffer_sec: 30.0
+
+publish_rate: 1.0
+publish_paths: true
+max_path_points: 20000
+
+record_csv: true
+record_dir: /tmp/trajectory_eval

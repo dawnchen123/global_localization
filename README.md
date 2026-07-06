@@ -48,12 +48,13 @@ matcher uses the simplified geometric BEV and ignores vegetation labels.
     local mask support, range-edge penalty and LiDAR height/span geometry
   - accumulates semantic points in the FAST-LIVO2 map frame
   - fuses labels in map-frame voxels with semantic votes, margin and observation strength
-  - publishes `/semantic_cloud_map` as a colored semantic PointCloud2 with `label` and `confidence`
+  - publishes `/sam3/projected_semantic_points` as a colored semantic PointCloud2 with `label` and `confidence`
+  - can publish labels in the semantic-SLAM internal label space for fusion with RangeNet++
 
 - `semantic_voxel_mapper_node`
   - recommended semantic-SLAM mapper
   - subscribes FAST-LIVO2 odometry and RangeNet++ labeled LiDAR clouds
-  - optionally subscribes SegFormer-projected image semantic clouds
+  - optionally subscribes SAM3/SegFormer-projected image semantic clouds
   - fuses labels in a C++ semantic voxel map
   - publishes `/semantic_cloud_map`, `/semantic_bev/label`, `/semantic_bev/color`, `/semantic_bev/traversable`
 
@@ -121,11 +122,12 @@ watch -n 1 'ls -lh /tmp/eloftr_queue/input /tmp/eloftr_queue/output 2>/dev/null'
 
 ## RangeNet++ Semantic SLAM
 
-This is the new recommended semantic mapping path.  The old SAM3/local
-heuristic segmentation path should be treated as legacy.
+This is the recommended semantic mapping path. RangeNet++ is the real-time
+LiDAR semantic source; SAM3 can be added as a lower-rate image instance/semantic
+source to improve buildings, road surfaces and vegetation boundaries.
 
-If real RangeNet++ is not installed, the launch starts a local C++ compatibility
-adapter by default:
+If real RangeNet++ is not installed, a local C++ compatibility adapter can be
+started explicitly for pipeline debugging:
 
 ```text
 /cloud_registered
@@ -135,28 +137,83 @@ adapter by default:
   -> /semantic_cloud_map + /semantic_bev/*
 ```
 
-This lets the whole semantic voxel map and BEV pipeline run immediately.  It is
-not a neural network replacement for final semantic quality.
-
-With real RangeNet++ installed, disable the adapter:
-
 ```bash
 roslaunch fast_livo2_global_localization semantic_slam.launch \
-  run_rangenet_adapter:=false \
-  rangenet_semantic_cloud_in_map_frame:=false \
-  lidar_label_mode:=semantic_kitti \
-  rangenet_semantic_topic:=/rangenet/semantic_points
+  run_rangenet_adapter:=true
 ```
 
-Real RangeNet++ should publish:
+This lets the whole semantic voxel map and BEV pipeline run without a neural
+model. It is not a neural network replacement for final semantic quality, so it
+is disabled by default.
+
+For real RangeNet++, use the new bridge launch. It disables the fallback
+adapter automatically and uses the raw Livox scan by default:
+
+```bash
+roslaunch fast_livo2_global_localization rangenetpp_semantic_slam.launch
+```
+
+Default data path:
+
+```text
+/livox/mid360/points              livox_ros_driver/CustomMsg, sensor frame
+  -> livox_custom_to_pointcloud2_node
+/livox/mid360/points_xyzirt       PointCloud2 x y z intensity, sensor frame
+  -> rangenetpp_inference_bridge.py
+/rangenet/semantic_points         PointCloud2 x y z rgb label confidence
+  -> semantic_voxel_mapper_node   transformed to camera_init/map by odometry
+```
+
+This is preferred over feeding `/cloud_registered` into RangeNet++, because
+RangeNet++ expects a single LiDAR scan in the sensor frame for range-image
+projection. If you only want to debug with `/cloud_registered`, launch with:
+
+```bash
+roslaunch fast_livo2_global_localization rangenetpp_semantic_slam.launch \
+  run_livox_converter:=false \
+  input_cloud_topic:=/cloud_registered \
+  output_cloud_in_map_frame:=true
+```
+
+Configure the bridge in
+`config/rangenetpp_inference_bridge.yaml`:
+
+```yaml
+backend_python_path: /home/dawn/software/rangenetpp_ros_backend
+backend_module: rangenetpp_backend
+backend_class: RangeNetPPBackend
+model_dir: /home/dawn/models/rangenetpp
+backend_label_space: semantic_kitti
+output_label_mode: semantic_kitti
+```
+
+The backend wrapper must expose:
+
+```python
+class RangeNetPPBackend:
+    def __init__(self, model_dir, model_config, model_weights, device, **kwargs):
+        ...
+
+    def infer(self, points_xyzi):
+        # points_xyzi is Nx4 float32: x y z intensity
+        # return labels or (labels, confidence)
+        ...
+```
+
+A template is provided at
+`scripts/rangenetpp_backend_template.py`. Copy it to the directory configured by
+`backend_python_path` and replace the template body with your real RangeNet++
+runtime/model loading code.
+
+The bridge publishes:
 
 ```text
 FAST-LIVO2 publishes:
   /aft_mapped_to_init
 
-RangeNet++ publishes:
+RangeNet++ bridge publishes:
   /rangenet/semantic_points
-    sensor_msgs/PointCloud2 fields: x y z label [confidence]
+    sensor_msgs/PointCloud2 fields: x y z rgb label confidence
 ```
 
 If RangeNet++ publishes SemanticKITTI ids, keep
@@ -180,12 +237,47 @@ Start the C++ semantic mapper:
 
 ```bash
 source ~/workspace/fast_livo2_global_ws/devel/setup.bash
-roslaunch fast_livo2_global_localization semantic_slam.launch
+roslaunch fast_livo2_global_localization rangenetpp_semantic_slam.launch
 ```
+
+To fuse SAM3 projected image semantics as a second source, run the SAM3 ROS
+queue mapper and the SAM3 service, then enable the projected semantic input in
+the RangeNet++ semantic-SLAM launch:
+
+```bash
+# Terminal 1: FAST-LIVO2.
+roslaunch fast_livo mapping_i2nav.launch
+
+# Terminal 2: export synchronized camera/LiDAR/odom requests and publish
+# /sam3/projected_semantic_points after SAM3 results are ready.
+roslaunch fast_livo2_global_localization sam3_projected_semantic_mapping.launch
+
+# Terminal 3: run inside the sam3 mamba/conda environment.
+mamba activate sam3
+python3 ~/workspace/fast_livo2_global_ws/src/fast_livo2_global_localization/scripts/sam3_image_mask_service.py \
+  --queue_dir /tmp/sam3_projected_semantic_queue \
+  --sam3_root /home/dawn/software/sam3 \
+  --sam3_checkpoint /home/dawn/software/sam3/checkpoints/sam3.pt \
+  --device cuda \
+  --sam3_dtype bf16
+
+# Terminal 4: RangeNet++ real-time stream + semantic voxel fusion + pose graph.
+roslaunch fast_livo2_global_localization rangenetpp_semantic_slam.launch \
+  use_sam3_projected_semantic:=true
+```
+
+SAM3 projected labels are converted to the internal label space before fusion:
+road stays road, building becomes building, tree/grass become vegetation, and
+car/person/bicycle-style masks become dynamic. This prevents image labels from
+being interpreted as sidewalk/building incorrectly and lets the mapper drop
+dynamic points before voxel fusion.
 
 Check outputs:
 
 ```bash
+rostopic hz /sam3/projected_semantic_points
+rostopic echo -n1 /local_semantic_map/projection_stats
+rostopic echo -n1 /sam3/projected_semantic_cloud_map/stats
 rostopic hz /semantic_cloud_map
 rostopic echo -n1 /semantic_cloud_map/stats
 rqt_image_view /semantic_bev/color
@@ -203,23 +295,184 @@ roslaunch fast_livo mapping_i2nav.launch
 # 2. Start/play the dataset if you are using rosbag.
 # rosbag play --clock <bag>
 
-# 3. No local RangeNet++ needed by default.
-# semantic_slam.launch starts rangenet_geometry_adapter_node:
-#   /cloud_registered -> /rangenet/semantic_points
+# 3. Start real RangeNet++ bridge + semantic map.
+roslaunch fast_livo2_global_localization rangenetpp_semantic_slam.launch
 
-# 4. Start semantic voxel mapping.
-roslaunch fast_livo2_global_localization semantic_slam.launch
+# 3b. If SAM3 projected semantics are running, enable fusion:
+# roslaunch fast_livo2_global_localization rangenetpp_semantic_slam.launch use_sam3_projected_semantic:=true
+
+# For fallback-only debugging, use:
+# roslaunch fast_livo2_global_localization semantic_slam.launch run_rangenet_adapter:=true
 ```
 
-Check the adapter and mapper:
+Check the bridge and mapper:
 
 ```bash
-rostopic hz /cloud_registered
+rostopic hz /livox/mid360/points_xyzirt
 rostopic hz /rangenet/semantic_points
 rostopic echo -n1 /rangenet/semantic_points/fields
 rostopic hz /semantic_cloud_map
 rostopic echo -n1 /semantic_cloud_map/stats
+rostopic echo -n1 /semantic_slam/z_constraint
+rostopic hz /semantic_corrected_odom
+rostopic hz /semantic_graph_corrected_odom
+rostopic echo -n1 /semantic_pose_graph/stats
 ```
+
+Semantic XYZ correction is enabled by default in `config/semantic_slam.yaml`.
+It uses multi-frame semantic anchors:
+
+- road/sidewalk cells become local ground anchors;
+- building/other static cells become coarse XY object anchors;
+- building/vegetation/other static cells become coarse Z object anchors;
+- each new semantic frame estimates robust XY and Z residuals to existing anchors;
+- the correction is applied before voxel fusion and also published as
+  `/semantic_corrected_odom`.
+
+This is the first practical layer before a full factor-graph backend.  It
+reduces visible layer separation and return-pass XY misalignment in
+`/semantic_cloud_map` without modifying FAST-LIVO2 internals.  Important tuning
+knobs:
+
+- `max_xy_correction_step`: lower it if XY correction jitters; raise it if drift is fast.
+- `xy_correction_alpha`: lower for smoother XY correction.
+- `min_xy_constraint_matches`: raise it if object matches are unstable.
+- `max_xy_match_residual`: lower it to reject wrong building/object associations.
+- `max_yaw_correction_step_deg`: lower it if yaw correction oscillates.
+- `max_se2_residual_rms`: lower it to reject weak geometric matches.
+- `pose_constraint_interval_sec`: semantic SE(2) constraints are applied at this low rate.
+- `min_semantic_correction_trust`: lower it if you want corrections to fade more in unobserved areas.
+- `max_z_correction_step`: lower it if correction jitters; raise it if Z drift is fast.
+- `z_correction_alpha`: lower for smoother correction.
+- `min_z_constraint_matches`: raise it if false corrections appear in sparse scenes.
+- `z_anchor_resolution`: smaller anchors are stricter; larger anchors are smoother.
+- `enable_local_semantic_map_constraint`: accumulate several semantic frames into
+  a local submap, then match that local submap to mature global anchors at low
+  frequency. Keep this on for drift correction; turn it off only for debugging
+  per-frame constraints.
+- `local_semantic_window_sec` / `local_semantic_min_frames`: increase these if
+  `z_last_mad` is high or local matches are unstable; decrease them if correction
+  reacts too slowly.
+
+Watch these fields while replaying a bag:
+
+```bash
+rostopic echo -n1 /semantic_slam/z_constraint
+```
+
+Useful fields are `x_correction`, `y_correction`, `xy_matches`,
+`yaw_correction_deg`, `se2_residual_rms`, `pose_constraint_accepted`,
+`semantic_correction_trust`, `z_correction`, `z_slope_x`, `z_slope_y`,
+`semantic_z_correction_trust`, `z_last_mad`, `z_constraint_stale_frames`,
+`local_semantic_frames`, `local_semantic_points`, `local_semantic_constraints`,
+`z_slope_samples`, and `z_slope_spread`. If `z_last_mad` stays high or
+`semantic_z_correction_trust` decays, the mapper is rejecting unstable Z
+constraints instead of forcing them into the corrected odometry.
+
+`semantic_slam.launch` also starts a keyframe-level semantic pose graph by
+default.  It subscribes to `/aft_mapped_to_init` and `/rangenet/semantic_points`,
+creates static semantic keyframes, detects low-frequency revisit constraints
+from road/building/sidewalk geometry, and publishes:
+
+```text
+/semantic_graph_corrected_odom
+/semantic_pose_graph/path
+/semantic_pose_graph/map
+/semantic_pose_graph/stats
+```
+
+Use `/semantic_graph_corrected_odom` for RTK evaluation.  Important pose-graph
+debug fields are `keyframes`, `loop_edges`, `xy_loop_edges`, `z_loop_edges`,
+`loop_xy_rejected_ambiguous`, `last_loop_inliers`,
+`last_loop_building_inliers`, `last_loop_rms`, `last_loop_z_median`,
+`last_loop_z_mad`, `last_loop_spread_ratio`, `last_loop_score_ratio`,
+`last_loop_xy_delta`, `last_loop_yaw_delta_deg`, `last_loop_weight`,
+`last_opt_mean_residual`, `last_opt_max_step`, `output_mode`, `output_dx`,
+`output_dy`, `output_dz`, and `output_dyaw_deg`.
+
+The default output mode is `z_only`: `/semantic_graph_corrected_odom`,
+`/semantic_pose_graph/path`, and `/semantic_pose_graph/map` keep FAST-LIVO2
+XY/Yaw and only apply the semantic graph Z correction. This is deliberate:
+current RTK evaluation showed the semantic backend improves height but local
+semantic similarity can hurt XY/Yaw.  The backend therefore separates two
+constraint types:
+
+```text
+building / static-object points -> structural XY/Yaw loop constraint
+road / sidewalk ground points   -> Z loop constraint
+```
+
+XY/Yaw loop constraints are disabled by default
+(`enable_xy_loop_constraints: false`). To enable them for experiments, first
+check that accepted loops have enough `last_loop_building_inliers`, a healthy
+`last_loop_spread_ratio`, and a clear `last_loop_score_ratio`; otherwise the
+scene is locally ambiguous and the XY/Yaw factor should stay off.  Large local
+coarse search is also disabled by default because it previously accepted false
+large corrections. Use `output_mode: safe` only after the structure gates are
+stable; use `output_mode: full` only for debugging.
+
+If `loop_edges` remains zero, the current semantic geometry is not producing
+accepted loop/revisit constraints; inspect segmentation quality and relax
+`config/semantic_keyframe_pose_graph.yaml` only after checking the inlier/RMS
+fields.
+
+## RTK/IMU GroundTruth Evaluation
+
+The evaluator builds a reference trajectory from dataset RTK and IMU topics:
+
+```text
+/novatel/oem7/fix       -> RTK ENU position
+/adi/adis16465/imu      -> GroundTruth yaw/orientation
+/aft_mapped_to_init     -> FAST-LIVO2 raw trajectory
+/semantic_graph_corrected_odom -> semantic keyframe graph corrected trajectory
+```
+
+Start it after FAST-LIVO2 and the semantic mapper are publishing odometry:
+
+```bash
+roslaunch fast_livo2_global_localization trajectory_groundtruth_evaluation.launch
+```
+
+Check live RMSE:
+
+```bash
+rostopic echo -n1 /trajectory_eval/rmse
+rostopic hz /ground_truth/odom
+```
+
+If RMSE stays at `n=0`, inspect the diagnostic counters in
+`/trajectory_eval/rmse`: `received=0` means the odometry topic is wrong or not
+publishing; increasing `no_gt_match` means RTK/odom timestamps cannot be paired;
+increasing `waiting_alignment` means the node is still collecting the initial
+alignment window; small `alignment_spread` means the initial motion segment is
+too short for a stable SE2 fit. The default `gt_match_mode: stamp_or_latest` first tries
+header-stamp pairing, then falls back to the latest fresh RTK sample for bags
+where FAST-LIVO2 odometry uses runtime stamps.
+
+It publishes RViz paths:
+
+```text
+/trajectory_eval/ground_truth_path
+/trajectory_eval/raw_aligned_path
+/trajectory_eval/semantic_aligned_path
+```
+
+CSV logs are written by default to:
+
+```text
+/tmp/trajectory_eval/ground_truth.csv
+/tmp/trajectory_eval/raw_fast_livo2_eval.csv
+/tmp/trajectory_eval/semantic_corrected_eval.csv
+```
+
+Default alignment mode is `se2_window`: it estimates one initial yaw +
+translation + Z offset from the first short motion segment and then freezes that
+alignment, so the RMSE reflects drift instead of arbitrary `camera_init` frame
+choice. Change parameters in
+`config/trajectory_groundtruth_evaluator.yaml` if the RTK/IMU timestamps or
+heading convention differ. If the IMU message has no valid orientation
+quaternion, the evaluator falls back to integrating `angular_velocity.z` for GT
+yaw; RTK still defines the GroundTruth position.
 
 If your RangeNet++ topic is not `/rangenet/semantic_points`, pass it directly:
 

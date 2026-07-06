@@ -1,0 +1,80 @@
+<launch>
+  <arg name="rangenetpp_config" default="$(find fast_livo2_global_localization)/config/rangenetpp_ros_node.yaml"/>
+  <arg name="livox_converter_config" default="$(find fast_livo2_global_localization)/config/livox_custom_to_pointcloud2.yaml"/>
+  <arg name="semantic_slam_config" default="$(find fast_livo2_global_localization)/config/semantic_slam.yaml"/>
+  <arg name="pose_graph_config" default="$(find fast_livo2_global_localization)/config/semantic_keyframe_pose_graph.yaml"/>
+
+  <arg name="run_livox_converter" default="true"/>
+  <arg name="livox_custom_topic" default="/livox/mid360/points"/>
+  <arg name="converted_cloud_topic" default="/livox/mid360/points_xyzirt"/>
+  <arg name="input_cloud_topic" default="/livox/mid360/points_xyzirt"/>
+  <arg name="output_cloud_topic" default="/rangenet/semantic_points"/>
+  <arg name="odom_topic" default="/aft_mapped_to_init"/>
+  <arg name="pose_graph_odom_topic" default="/semantic_corrected_odom"/>
+  <arg name="rangenetpp_respawn" default="true"/>
+  <arg name="rangenetpp_respawn_delay" default="2.0"/>
+
+  <!--
+    Default path:
+      /livox/mid360/points (CustomMsg, sensor frame)
+        -> livox_custom_to_pointcloud2_node
+        -> /livox/mid360/points_xyzirt (PointCloud2, sensor frame)
+        -> RangeNet++ bridge
+        -> /rangenet/semantic_points (sensor frame)
+
+    Therefore output_cloud_in_map_frame=false by default so
+    semantic_voxel_mapper_node transforms points with odometry. If you feed
+    /cloud_registered instead, set:
+      run_livox_converter:=false input_cloud_topic:=/cloud_registered
+      output_cloud_in_map_frame:=true
+  -->
+  <arg name="output_cloud_in_map_frame" default="false"/>
+  <arg name="lidar_label_mode" default="semantic_kitti"/>
+
+  <arg name="run_semantic_mapper" default="true"/>
+  <arg name="run_semantic_pose_graph" default="true"/>
+  <arg name="run_segformer_projector" default="false"/>
+  <arg name="use_sam3_projected_semantic" default="false"/>
+  <arg name="sam3_projected_semantic_topic" default="/sam3/projected_semantic_points"/>
+
+  <node if="$(arg run_livox_converter)"
+        pkg="fast_livo2_global_localization"
+        type="livox_custom_to_pointcloud2_node"
+        name="livox_custom_to_pointcloud2"
+        output="screen">
+    <rosparam file="$(arg livox_converter_config)" command="load"/>
+    <param name="input_custom_topic" value="$(arg livox_custom_topic)"/>
+    <param name="output_cloud_topic" value="$(arg converted_cloud_topic)"/>
+  </node>
+
+  <node pkg="fast_livo2_global_localization"
+        type="rangenetpp_ros_node"
+        name="rangenetpp_ros_node"
+        output="screen"
+        respawn="$(arg rangenetpp_respawn)"
+        respawn_delay="$(arg rangenetpp_respawn_delay)">
+    <env name="LD_LIBRARY_PATH"
+         value="/home/dawn/software/rangenet_ws/devel/lib:/usr/local/TensorRT-10.8.0.43/targets/x86_64-linux-gnu/lib:/usr/local/TensorRT-10.8.0.43/lib:$(env LD_LIBRARY_PATH)"/>
+    <rosparam file="$(arg rangenetpp_config)" command="load"/>
+    <param name="input_cloud_topic" value="$(arg input_cloud_topic)"/>
+    <param name="output_cloud_topic" value="$(arg output_cloud_topic)"/>
+  </node>
+
+  <include file="$(find fast_livo2_global_localization)/launch/semantic_slam.launch">
+    <arg name="config" value="$(arg semantic_slam_config)"/>
+    <arg name="pose_graph_config" value="$(arg pose_graph_config)"/>
+    <arg name="run_rangenet_adapter" value="false"/>
+    <arg name="run_semantic_mapper" value="$(arg run_semantic_mapper)"/>
+    <arg name="run_semantic_pose_graph" value="$(arg run_semantic_pose_graph)"/>
+    <arg name="run_segformer_projector" value="$(arg run_segformer_projector)"/>
+    <arg name="subscribe_projected_semantic_cloud" value="$(arg use_sam3_projected_semantic)"/>
+    <arg name="projected_semantic_topic" value="$(arg sam3_projected_semantic_topic)"/>
+    <arg name="projected_semantic_cloud_in_map_frame" value="true"/>
+    <arg name="projected_semantic_label_mode" value="internal"/>
+    <arg name="odom_topic" value="$(arg odom_topic)"/>
+    <arg name="pose_graph_odom_topic" value="$(arg pose_graph_odom_topic)"/>
+    <arg name="rangenet_semantic_topic" value="$(arg output_cloud_topic)"/>
+    <arg name="rangenet_semantic_cloud_in_map_frame" value="$(arg output_cloud_in_map_frame)"/>
+    <arg name="lidar_label_mode" value="$(arg lidar_label_mode)"/>
+  </include>
+</launch>

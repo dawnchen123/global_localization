@@ -1,0 +1,30 @@
+<launch>
+  <arg name="config" default="$(find fast_livo2_global_localization)/config/trajectory_groundtruth_evaluator.yaml"/>
+  <arg name="rtk_fix_topic" default="/novatel/oem7/fix"/>
+  <arg name="imu_topic" default="/adi/adis16465/imu"/>
+  <arg name="raw_odom_topic" default="/aft_mapped_to_init"/>
+  <arg name="semantic_odom_topic" default="/semantic_graph_corrected_odom"/>
+  <arg name="record_dir" default="/tmp/trajectory_eval"/>
+
+  <!--
+    Start FAST-LIVO2 and semantic_slam.launch first, then play the bag.
+    This node publishes:
+      /ground_truth/odom
+      /trajectory_eval/rmse
+      /trajectory_eval/ground_truth_path
+      /trajectory_eval/raw_aligned_path
+      /trajectory_eval/semantic_aligned_path
+  -->
+
+  <node pkg="fast_livo2_global_localization"
+        type="trajectory_groundtruth_evaluator_node"
+        name="trajectory_groundtruth_evaluator"
+        output="screen">
+    <rosparam file="$(arg config)" command="load"/>
+    <param name="rtk_fix_topic" value="$(arg rtk_fix_topic)"/>
+    <param name="imu_topic" value="$(arg imu_topic)"/>
+    <param name="raw_odom_topic" value="$(arg raw_odom_topic)"/>
+    <param name="semantic_odom_topic" value="$(arg semantic_odom_topic)"/>
+    <param name="record_dir" value="$(arg record_dir)"/>
+  </node>
+</launch>

@@ -10,7 +10,8 @@ Input queue:
 
 Output queue:
   output/result_<id>.json
-  output/label_<id>.png       mono8 label image: 0 unknown, 1 road, 2 building, 3 tree, 4 grass
+  output/label_<id>.png       mono8 label image: 0 unknown, 1 road, 2 building, 3 tree, 4 grass, 5 dynamic
+  output/instance_<id>.png    uint16 connected-instance image, 0 unknown/no-instance
   output/color_<id>.png       bgr color label image
   output/debug_<id>.png
 
@@ -39,6 +40,7 @@ LABEL_ROAD = 1
 LABEL_BUILDING = 2
 LABEL_TREE = 3
 LABEL_GRASS = 4
+LABEL_DYNAMIC = 5
 
 COLOR_BGR = {
     LABEL_UNKNOWN: (190, 190, 190),
@@ -46,6 +48,7 @@ COLOR_BGR = {
     LABEL_BUILDING: (0, 0, 255),
     LABEL_TREE: (0, 170, 0),
     LABEL_GRASS: (0, 220, 120),
+    LABEL_DYNAMIC: (0, 255, 255),
 }
 
 PROMPTS = {
@@ -53,9 +56,10 @@ PROMPTS = {
     LABEL_BUILDING: ["building", "wall", "house", "facade", "construction", "roof"],
     LABEL_TREE: ["tree", "trees", "vegetation", "bush", "shrub"],
     LABEL_GRASS: ["grass", "lawn", "green ground", "grassland"],
+    LABEL_DYNAMIC: ["car", "vehicle", "bus", "truck", "pedestrian", "person", "bicycle", "motorcycle"],
 }
 
-PRIORITY = [LABEL_BUILDING, LABEL_ROAD, LABEL_TREE, LABEL_GRASS]
+PRIORITY = [LABEL_BUILDING, LABEL_DYNAMIC, LABEL_ROAD, LABEL_TREE, LABEL_GRASS]
 
 
 def normalize_proxy_env():
@@ -354,6 +358,23 @@ class Sam3ImageMaskService(object):
                     cleaned[cc == i] = lab
         return cleaned
 
+    def build_instance_image(self, label):
+        instance = np.zeros(label.shape, dtype=np.uint16)
+        next_id = 1
+        for lab in PRIORITY:
+            m = (label == lab).astype(np.uint8)
+            if m.sum() == 0:
+                continue
+            num, cc, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+            for i in range(1, num):
+                if stats[i, cv2.CC_STAT_AREA] < self.args.min_mask_area:
+                    continue
+                if next_id >= np.iinfo(np.uint16).max:
+                    break
+                instance[cc == i] = next_id
+                next_id += 1
+        return instance
+
     def process_request(self, meta_path):
         with open(str(meta_path), "r") as f:
             meta = json.load(f)
@@ -363,10 +384,12 @@ class Sam3ImageMaskService(object):
         if image is None:
             raise RuntimeError("cannot read image %s" % image_path)
         label = self.segment_image(image)
+        instance = self.build_instance_image(label)
         color = colorize_label(label)
         debug = cv2.addWeighted(image, 0.55, color, 0.45, 0.0)
 
         label_path = self.output_dir / ("label_%s.png" % req_id)
+        instance_path = self.output_dir / ("instance_%s.png" % req_id)
         color_path = self.output_dir / ("color_%s.png" % req_id)
         debug_path = self.output_dir / ("debug_%s.png" % req_id)
         result_tmp = self.output_dir / ("result_%s.json.tmp" % req_id)
@@ -381,6 +404,7 @@ class Sam3ImageMaskService(object):
         os.replace(str(meta_copy_tmp), str(meta_copy_path))
 
         cv2.imwrite(str(label_path), label)
+        cv2.imwrite(str(instance_path), instance)
         cv2.imwrite(str(color_path), color)
         cv2.imwrite(str(debug_path), debug)
         stats = {
@@ -389,13 +413,16 @@ class Sam3ImageMaskService(object):
             "meta_path": str(meta_copy_path),
             "original_meta_path": str(meta_path),
             "label_path": str(label_path),
+            "instance_path": str(instance_path),
             "color_path": str(color_path),
             "debug_path": str(debug_path),
             "road_px": int((label == LABEL_ROAD).sum()),
             "building_px": int((label == LABEL_BUILDING).sum()),
             "tree_px": int((label == LABEL_TREE).sum()),
             "grass_px": int((label == LABEL_GRASS).sum()),
+            "dynamic_px": int((label == LABEL_DYNAMIC).sum()),
             "unknown_px": int((label == LABEL_UNKNOWN).sum()),
+            "instances": int(instance.max()),
         }
         with open(str(result_tmp), "w") as f:
             json.dump(stats, f, indent=2)
@@ -404,8 +431,9 @@ class Sam3ImageMaskService(object):
             os.replace(str(meta_path), str(self.done_dir / meta_path.name))
         except Exception:
             pass
-        print("[INFO] segmented id=%s road=%d building=%d tree=%d grass=%d" %
-              (req_id, stats["road_px"], stats["building_px"], stats["tree_px"], stats["grass_px"]))
+        print("[INFO] segmented id=%s road=%d building=%d tree=%d grass=%d dynamic=%d instances=%d" %
+              (req_id, stats["road_px"], stats["building_px"], stats["tree_px"], stats["grass_px"],
+               stats["dynamic_px"], stats["instances"]))
 
     def run(self):
         while True:

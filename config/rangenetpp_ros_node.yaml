@@ -1,0 +1,60 @@
+# This topic is generated at runtime by livox_custom_to_pointcloud2_node:
+#   /livox/mid360/points        livox_ros_driver/CustomMsg from the bag/driver
+#   /livox/mid360/points_xyzirt sensor_msgs/PointCloud2 for RangeNet++
+#
+# Real RangeNet++ should consume one raw LiDAR scan in the sensor frame, not
+# FAST-LIVO2's accumulated/map-frame /cloud_registered.
+input_cloud_topic: /livox/mid360/points_xyzirt
+output_cloud_topic: /rangenet/semantic_points
+
+model_dir: /home/dawn/models/rangenetpp
+backend: tensorrt
+verbose: false
+
+# Livox raw clouds are already sparse enough for real-time testing.
+# Increase point_stride or lower max_points only if TensorRT inference cannot keep up.
+point_stride: 1
+max_points: 120000
+# TensorRT RangeNet++ is the expensive part of this pipeline. On this setup it
+# can segfault when hammered by every Livox frame, so default to a conservative
+# low-rate semantic stream. FAST-LIVO2 and voxel fusion keep running between
+# semantic frames.
+publish_every_n: 2
+min_inference_interval_sec: 0.20
+subscriber_queue_size: 1
+
+min_range_m: 0.3
+max_range_m: 120.0
+
+# The bundled RangeNet++ model is trained on SemanticKITTI/Velodyne with about
+# [-25, +3] degrees vertical FOV. For Livox MID360, this is now used only as
+# the model-inference FOV. Out-of-FOV points are preserved and labeled by the
+# geometry refinement path, otherwise the semantic cloud becomes too thin in Z.
+enable_pitch_filter: true
+min_pitch_deg: -25.0
+max_pitch_deg: 3.0
+preserve_out_of_fov_points: true
+
+require_intensity: false
+default_intensity: 0.0
+intensity_field_candidates: [intensity, reflectivity, remission]
+
+# Livox CustomMsg reflectivity is uint8-like [0,255], while the SemanticKITTI
+# RangeNet++ model expects remission close to [0,1]. A wrong intensity scale
+# strongly biases the network output.
+intensity_scale: 255.0
+clamp_intensity: true
+
+# Domain-gap guard for Livox MID360. RangeNet++ still provides a prior, while
+# simple ground/vertical geometry fixes common vegetation/road/building swaps.
+enable_geometry_refinement: true
+geometry_grid_resolution: 0.6
+ground_height_threshold: 0.28
+ground_reference_percentile: 0.12
+ground_reference_max_above: 0.75
+structure_min_height: 0.80
+structure_min_vertical_span: 1.10
+structure_min_points: 5
+keep_dynamic_confidence: 0.80
+geometry_confidence: 0.85
+T_body_lidar: [0.99997669, 0.00548118, -0.00407184, 0.0, 0.00549873, -0.99997558, 0.00431282, 0.0, -0.0040481, -0.00433511, -0.99998241, -0.159, 0, 0, 0, 1]

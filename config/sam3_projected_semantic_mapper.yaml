@@ -6,6 +6,7 @@
 #   2 building / wall / structure
 #   3 tree / high vegetation
 #   4 grass / low vegetation / lawn
+#   5 dynamic / car / person / bicycle / motorcycle
 
 queue_dir: /tmp/sam3_projected_semantic_queue
 
@@ -95,6 +96,7 @@ label_weights:
   building: 1.5
   tree: 1.0
   grass: 0.8
+  dynamic: 0.8
 
 # Output topics.
 label_topic: /local_semantic_map/label
@@ -135,9 +137,15 @@ min_geometry_score: 0.18
 # This is the main semantic-SLAM map: labels projected from camera masks are
 # fused in map-frame voxels and published as PointCloud2 with rgb/label/confidence.
 publish_semantic_cloud: true
-semantic_cloud_topic: /semantic_cloud_map
-semantic_cloud_stats_topic: /semantic_cloud_map/stats
+publish_projected_points: true
+projected_points_topic: /sam3/projected_semantic_points
+semantic_cloud_topic: /sam3/projected_semantic_cloud_map
+semantic_cloud_stats_topic: /sam3/projected_semantic_cloud_map/stats
 semantic_cloud_frame: camera_init
+# sam3: keep labels 1=road,2=building,3=tree,4=grass.
+# internal: publish labels compatible with semantic_voxel_mapper_node:
+#   1=road, 3=building, 4=vegetation, 5=dynamic. Use this when fusing with RangeNet++.
+semantic_cloud_output_label_mode: internal
 semantic_cloud_voxel_size: 0.20
 semantic_cloud_min_votes: 1.8
 semantic_cloud_min_confidence: 0.60

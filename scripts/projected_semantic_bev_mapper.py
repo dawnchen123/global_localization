@@ -32,6 +32,29 @@ LABEL_ROAD = 1
 LABEL_BUILDING = 2
 LABEL_TREE = 3
 LABEL_GRASS = 4
+LABEL_DYNAMIC = 5
+SAM3_LABELS = [LABEL_ROAD, LABEL_BUILDING, LABEL_TREE, LABEL_GRASS, LABEL_DYNAMIC]
+BEV_LABELS = [LABEL_ROAD, LABEL_BUILDING, LABEL_TREE, LABEL_GRASS]
+
+# semantic_voxel_mapper_node internal labels. Keep this mapper's local BEV in
+# SAM3 labels, but publish the optional 3D semantic cloud in internal labels
+# when it is fused with RangeNet++.
+INTERNAL_LABEL_UNKNOWN = 0
+INTERNAL_LABEL_ROAD = 1
+INTERNAL_LABEL_SIDEWALK = 2
+INTERNAL_LABEL_BUILDING = 3
+INTERNAL_LABEL_VEGETATION = 4
+INTERNAL_LABEL_DYNAMIC = 5
+INTERNAL_LABEL_OTHER = 6
+
+SAM3_TO_INTERNAL_LABEL = {
+    LABEL_UNKNOWN: INTERNAL_LABEL_UNKNOWN,
+    LABEL_ROAD: INTERNAL_LABEL_ROAD,
+    LABEL_BUILDING: INTERNAL_LABEL_BUILDING,
+    LABEL_TREE: INTERNAL_LABEL_VEGETATION,
+    LABEL_GRASS: INTERNAL_LABEL_VEGETATION,
+    LABEL_DYNAMIC: INTERNAL_LABEL_DYNAMIC,
+}
 
 COLOR_BGR = {
     LABEL_UNKNOWN: (190, 190, 190),
@@ -39,6 +62,17 @@ COLOR_BGR = {
     LABEL_BUILDING: (0, 0, 255),
     LABEL_TREE: (0, 170, 0),
     LABEL_GRASS: (0, 220, 120),
+    LABEL_DYNAMIC: (0, 255, 255),
+}
+
+INTERNAL_COLOR_BGR = {
+    INTERNAL_LABEL_UNKNOWN: (190, 190, 190),
+    INTERNAL_LABEL_ROAD: (80, 80, 80),
+    INTERNAL_LABEL_SIDEWALK: (80, 180, 80),
+    INTERNAL_LABEL_BUILDING: (0, 0, 255),
+    INTERNAL_LABEL_VEGETATION: (0, 170, 0),
+    INTERNAL_LABEL_DYNAMIC: (0, 255, 255),
+    INTERNAL_LABEL_OTHER: (120, 120, 120),
 }
 
 
@@ -50,6 +84,10 @@ def rgb_float_from_bgr(bgr):
 
 LABEL_RGB_FLOAT = {
     lab: rgb_float_from_bgr(bgr) for lab, bgr in COLOR_BGR.items()
+}
+
+INTERNAL_LABEL_RGB_FLOAT = {
+    lab: rgb_float_from_bgr(bgr) for lab, bgr in INTERNAL_COLOR_BGR.items()
 }
 
 
@@ -137,6 +175,13 @@ class ProjectedSemanticBEVMapper(object):
         self.publish_semantic_cloud = bool(rospy.get_param("~publish_semantic_cloud", True))
         self.semantic_cloud_topic = rospy.get_param("~semantic_cloud_topic", "/semantic_cloud_map")
         self.semantic_cloud_frame = rospy.get_param("~semantic_cloud_frame", "camera_init")
+        self.publish_projected_points = bool(rospy.get_param("~publish_projected_points", True))
+        self.projected_points_topic = rospy.get_param("~projected_points_topic", "/sam3/projected_semantic_points")
+        self.semantic_cloud_output_label_mode = rospy.get_param("~semantic_cloud_output_label_mode", "sam3").strip().lower()
+        if self.semantic_cloud_output_label_mode not in ("sam3", "internal"):
+            rospy.logwarn("unknown semantic_cloud_output_label_mode=%s, fallback to sam3",
+                          self.semantic_cloud_output_label_mode)
+            self.semantic_cloud_output_label_mode = "sam3"
         self.semantic_cloud_voxel_size = float(rospy.get_param("~semantic_cloud_voxel_size", 0.15))
         self.semantic_cloud_min_votes = float(rospy.get_param("~semantic_cloud_min_votes", 1.0))
         self.semantic_cloud_min_confidence = float(rospy.get_param("~semantic_cloud_min_confidence", 0.55))
@@ -152,6 +197,7 @@ class ProjectedSemanticBEVMapper(object):
             LABEL_BUILDING: float(label_weights.get("building", 1.5)),
             LABEL_TREE: float(label_weights.get("tree", 1.0)),
             LABEL_GRASS: float(label_weights.get("grass", 0.8)),
+            LABEL_DYNAMIC: float(label_weights.get("dynamic", 0.8)),
         }
 
         self.bridge = CvBridge()
@@ -166,6 +212,7 @@ class ProjectedSemanticBEVMapper(object):
         self.stats_pub = rospy.Publisher(rospy.get_param("~stats_topic", "/local_semantic_map/stats"), String, queue_size=1)
         self.semantic_cloud_pub = rospy.Publisher(self.semantic_cloud_topic, PointCloud2, queue_size=1)
         self.semantic_cloud_stats_pub = rospy.Publisher(rospy.get_param("~semantic_cloud_stats_topic", "/semantic_cloud_map/stats"), String, queue_size=1)
+        self.projected_points_pub = rospy.Publisher(self.projected_points_topic, PointCloud2, queue_size=1)
 
         self.semantic_batches = deque()  # list of dict: {time, pts_map, labels, weights}
         self.latest_T_map_body = np.eye(4)
@@ -174,8 +221,9 @@ class ProjectedSemanticBEVMapper(object):
         self.last_queue_wait_log = 0.0
 
         rospy.Timer(rospy.Duration(0.2), self.timer_cb)
-        rospy.loginfo("v27 projected_semantic_bev_mapper started queue=%s semantic_cloud=%s voxel=%.2fm",
-                      str(self.queue_dir), self.semantic_cloud_topic, self.semantic_cloud_voxel_size)
+        rospy.loginfo("v29 projected_semantic_bev_mapper started queue=%s projected_points=%s semantic_cloud=%s voxel=%.2fm output_label_mode=%s",
+                      str(self.queue_dir), self.projected_points_topic, self.semantic_cloud_topic,
+                      self.semantic_cloud_voxel_size, self.semantic_cloud_output_label_mode)
 
     def read_result(self, result_path):
         with open(str(result_path), "r") as f:
@@ -205,6 +253,7 @@ class ProjectedSemanticBEVMapper(object):
                 LABEL_BUILDING: (0, 0, 255),
                 LABEL_TREE: (0, 170, 0),
                 LABEL_GRASS: (0, 220, 120),
+                LABEL_DYNAMIC: (0, 255, 255),
             }
 
             # Draw sampled projected points. Unknown points are blue; semantic points use class color.
@@ -287,7 +336,7 @@ class ProjectedSemanticBEVMapper(object):
             return labels, support
 
         k = self.odd_kernel(self.semantic_support_kernel_px)
-        class_labels = np.asarray([LABEL_ROAD, LABEL_BUILDING, LABEL_TREE, LABEL_GRASS], dtype=np.uint8)
+        class_labels = np.asarray(SAM3_LABELS, dtype=np.uint8)
         support_stack = []
         for lab in class_labels:
             mask = (label_img == lab).astype(np.float32)
@@ -467,6 +516,18 @@ class ProjectedSemanticBEVMapper(object):
             label_img = label_img[:, :, 0]
         label_img = label_img.astype(np.uint8)
 
+        instance_path = Path(result.get("instance_path", ""))
+        if not instance_path.exists():
+            instance_path = self.output_dir / ("instance_%s.png" % req_id)
+        instance_img = None
+        if instance_path.exists():
+            instance_img = cv2.imread(str(instance_path), cv2.IMREAD_UNCHANGED)
+            if instance_img is not None and instance_img.ndim == 3:
+                instance_img = instance_img[:, :, 0]
+            if instance_img is not None and instance_img.shape[:2] != label_img.shape[:2]:
+                rospy.logwarn("instance image shape mismatch for id=%s, ignoring instance ids", req_id)
+                instance_img = None
+
         data = np.load(str(cloud_path))
         xyz = data["xyz"].astype(np.float64)
         K = data["K"].astype(np.float64)
@@ -513,12 +574,17 @@ class ProjectedSemanticBEVMapper(object):
         support_inside = None
         depth_score_inside = None
         range_score_inside = None
+        instance_inside = None
         counts = {}
         status_text = "raw=%d front=%d inside=%d sem=0" % (n, int(valid.sum()), int(inside.sum()))
         if inside.sum() > 0:
             ui_inside = ui[inside]
             vi_inside = vi[inside]
             labels_inside, support_inside = self.semantic_label_support(label_img, vi_inside, ui_inside)
+            if instance_img is not None:
+                instance_inside = instance_img[vi_inside, ui_inside].astype(np.uint32)
+            else:
+                instance_inside = np.zeros(labels_inside.shape, dtype=np.uint32)
 
             need_depth_image = self.enable_projection_depth_filter or self.enable_range_edge_weight
             if need_depth_image:
@@ -563,6 +629,7 @@ class ProjectedSemanticBEVMapper(object):
 
         sem_orig_idx = inside_orig_idx[sem_mask]
         labels = labels[sem_mask].astype(np.uint8)
+        instance_ids = instance_inside[sem_mask].astype(np.uint32) if instance_inside is not None else np.zeros(labels.shape, dtype=np.uint32)
         support_sem = support_inside[sem_mask].astype(np.float32) if support_inside is not None else np.ones(labels.shape, dtype=np.float32)
         depth_score_sem = depth_score_inside[sem_mask].astype(np.float32) if depth_score_inside is not None else np.ones(labels.shape, dtype=np.float32)
         range_score_sem = range_score_inside[sem_mask].astype(np.float32) if range_score_inside is not None else np.ones(labels.shape, dtype=np.float32)
@@ -575,6 +642,7 @@ class ProjectedSemanticBEVMapper(object):
         if geom_keep.sum() < 30:
             raise RuntimeError("too few semantic LiDAR points after geometry refinement")
         labels = labels[geom_keep]
+        instance_ids = instance_ids[geom_keep]
         pts_map = pts_map[geom_keep]
         support_sem = support_sem[geom_keep]
         depth_score_sem = depth_score_sem[geom_keep]
@@ -595,6 +663,12 @@ class ProjectedSemanticBEVMapper(object):
             t = time.time()
         else:
             t = float(stamp_sec) + float(stamp_nsec) * 1e-9
+
+        if self.publish_projected_points and self.projected_points_pub.get_num_connections() >= 0:
+            msg_stamp = rospy.Time.from_sec(t) if t > 0.0 else rospy.Time.now()
+            confidence = np.clip(weights, 0.05, 1.0).astype(np.float32)
+            msg = self.semantic_points_to_msg(pts_map, labels, confidence, msg_stamp, instance_ids)
+            self.projected_points_pub.publish(msg)
 
         self.semantic_batches.append({"time": t, "pts": pts_map, "labels": labels, "weights": weights})
         self.trim_batches(t)
@@ -624,7 +698,7 @@ class ProjectedSemanticBEVMapper(object):
         pts = np.concatenate([b["pts"] for b in self.semantic_batches], axis=0).astype(np.float32)
         labels = np.concatenate([b["labels"] for b in self.semantic_batches], axis=0).astype(np.uint8)
         weights = np.concatenate([b["weights"] for b in self.semantic_batches], axis=0).astype(np.float32)
-        valid = np.isfinite(pts).all(axis=1) & (labels > 0) & (labels <= LABEL_GRASS) & (weights > 0)
+        valid = np.isfinite(pts).all(axis=1) & (labels > 0) & (labels <= LABEL_DYNAMIC) & (weights > 0)
         pts = pts[valid]
         labels = labels[valid]
         weights = weights[valid]
@@ -635,13 +709,13 @@ class ProjectedSemanticBEVMapper(object):
         keys = np.floor(pts / voxel).astype(np.int64)
         unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
         nvox = unique_keys.shape[0]
-        vote = np.zeros((LABEL_GRASS + 1, nvox), dtype=np.float32)
+        vote = np.zeros((LABEL_DYNAMIC + 1, nvox), dtype=np.float32)
         sum_xyz = np.zeros((nvox, 3), dtype=np.float64)
         sum_w = np.zeros((nvox,), dtype=np.float64)
 
         np.add.at(sum_xyz, inverse, pts.astype(np.float64) * weights[:, None].astype(np.float64))
         np.add.at(sum_w, inverse, weights.astype(np.float64))
-        for lab in [LABEL_ROAD, LABEL_BUILDING, LABEL_TREE, LABEL_GRASS]:
+        for lab in SAM3_LABELS:
             m = labels == lab
             if m.any():
                 np.add.at(vote[lab], inverse[m], weights[m])
@@ -683,7 +757,7 @@ class ProjectedSemanticBEVMapper(object):
             conf_out = conf_out[idx]
             votes_out = votes_out[idx]
 
-        counts = {int(lab): int((labels_out == lab).sum()) for lab in [LABEL_ROAD, LABEL_BUILDING, LABEL_TREE, LABEL_GRASS]}
+        counts = {int(lab): int((labels_out == lab).sum()) for lab in SAM3_LABELS}
         return {
             "pts": pts_out,
             "labels": labels_out,
@@ -694,11 +768,21 @@ class ProjectedSemanticBEVMapper(object):
             "counts": counts,
         }
 
-    def semantic_cloud_to_msg(self, cloud, stamp):
-        pts = cloud["pts"]
-        labels = cloud["labels"]
-        confidence = cloud["confidence"]
+    def semantic_points_to_msg(self, pts, labels, confidence, stamp, instance_ids=None):
+        if self.semantic_cloud_output_label_mode == "internal":
+            labels_msg = np.zeros_like(labels, dtype=np.uint32)
+            for sam3_label, internal_label in SAM3_TO_INTERNAL_LABEL.items():
+                labels_msg[labels == sam3_label] = internal_label
+            color_table = INTERNAL_LABEL_RGB_FLOAT
+        else:
+            labels_msg = labels.astype(np.uint32)
+            color_table = LABEL_RGB_FLOAT
         n = pts.shape[0]
+        include_instance = instance_ids is not None
+        if include_instance:
+            instance_ids = np.asarray(instance_ids, dtype=np.uint32).reshape(-1)
+            if instance_ids.shape[0] != n:
+                instance_ids = np.zeros((n,), dtype=np.uint32)
         arr = np.zeros(n, dtype=[
             ("x", "<f4"),
             ("y", "<f4"),
@@ -706,22 +790,24 @@ class ProjectedSemanticBEVMapper(object):
             ("rgb", "<f4"),
             ("label", "<u4"),
             ("confidence", "<f4"),
-        ])
+        ] + ([("instance_id", "<u4")] if include_instance else []))
         arr["x"] = pts[:, 0]
         arr["y"] = pts[:, 1]
         arr["z"] = pts[:, 2]
         rgb = np.zeros((n,), dtype=np.float32)
-        for lab, rgb_float in LABEL_RGB_FLOAT.items():
-            rgb[labels == lab] = rgb_float
+        for lab, rgb_float in color_table.items():
+            rgb[labels_msg == lab] = rgb_float
         arr["rgb"] = rgb
-        arr["label"] = labels.astype(np.uint32)
+        arr["label"] = labels_msg
         arr["confidence"] = confidence.astype(np.float32)
+        if include_instance:
+            arr["instance_id"] = instance_ids
 
         msg = PointCloud2()
         msg.header = Header(stamp=stamp, frame_id=self.semantic_cloud_frame)
         msg.height = 1
         msg.width = n
-        msg.fields = [
+        fields = [
             PointField("x", 0, PointField.FLOAT32, 1),
             PointField("y", 4, PointField.FLOAT32, 1),
             PointField("z", 8, PointField.FLOAT32, 1),
@@ -729,12 +815,19 @@ class ProjectedSemanticBEVMapper(object):
             PointField("label", 16, PointField.UINT32, 1),
             PointField("confidence", 20, PointField.FLOAT32, 1),
         ]
+        if include_instance:
+            fields.append(PointField("instance_id", 24, PointField.UINT32, 1))
+        msg.fields = fields
         msg.is_bigendian = False
         msg.point_step = arr.dtype.itemsize
         msg.row_step = msg.point_step * n
         msg.is_dense = True
         msg.data = arr.tobytes()
         return msg
+
+    def semantic_cloud_to_msg(self, cloud, stamp):
+        return self.semantic_points_to_msg(
+            cloud["pts"], cloud["labels"], cloud["confidence"], stamp, None)
 
     def save_semantic_cloud_ply(self, cloud):
         path = self.semantic_cloud_save_path
@@ -809,10 +902,11 @@ class ProjectedSemanticBEVMapper(object):
         self.semantic_cloud_stats_pub.publish(String(data=json.dumps(stats)))
         rospy.loginfo_throttle(
             5.0,
-            "semantic cloud points=%d raw=%d voxels=%d road=%d building=%d tree=%d grass=%d",
+            "semantic cloud points=%d raw=%d voxels=%d road=%d building=%d tree=%d grass=%d dynamic=%d",
             stats["points"], stats["raw_projected_points"], stats["voxels"],
             cloud["counts"].get(LABEL_ROAD, 0), cloud["counts"].get(LABEL_BUILDING, 0),
             cloud["counts"].get(LABEL_TREE, 0), cloud["counts"].get(LABEL_GRASS, 0),
+            cloud["counts"].get(LABEL_DYNAMIC, 0),
         )
         return cloud
 
@@ -888,8 +982,8 @@ class ProjectedSemanticBEVMapper(object):
         if ix.size < 30:
             return None
 
-        vote_sparse = np.zeros((5, size_px, size_px), dtype=np.float32)
-        for lab in [LABEL_ROAD, LABEL_BUILDING, LABEL_TREE, LABEL_GRASS]:
+        vote_sparse = np.zeros((LABEL_DYNAMIC + 1, size_px, size_px), dtype=np.float32)
+        for lab in BEV_LABELS:
             m = labs == lab
             if m.any():
                 np.add.at(vote_sparse[lab], (iy[m], ix[m]), wts[m])
@@ -920,7 +1014,7 @@ class ProjectedSemanticBEVMapper(object):
         # Morphological clean by class. Keep this conservative in debug mode;
         # aggressive opening removes sparse but valid scan-line semantics.
         cleaned = np.zeros_like(label)
-        for lab in [LABEL_ROAD, LABEL_BUILDING, LABEL_TREE, LABEL_GRASS]:
+        for lab in BEV_LABELS:
             mask = (label == lab).astype(np.uint8) * 255
             if self.morph_open_kernel > 1:
                 k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.morph_open_kernel, self.morph_open_kernel))
