@@ -3,25 +3,25 @@
 """
 ROS-side queue exporter for SAM3 projected semantic mapping.
 
-v22 changes:
+v25 changes:
+  - supports raw sensor_msgs/Image and sensor_msgs/CompressedImage inputs
   - supports two LiDAR input types:
       1) sensor_msgs/PointCloud2 in LiDAR frame
       2) livox_ros_driver/CustomMsg raw Livox packets
   - keeps YAML intrinsics/extrinsics for datasets without /camera_info
   - explicitly distinguishes raw LiDAR points from FAST-LIVO2 /cloud_registered.
+  - supports cloud_in_map_frame=true: queue stores /cloud_registered points and
+    the projector will transform them back to the LiDAR frame before image projection.
 
-Recommended for SAM3 image-mask projection:
-  image_topic + /livox/mid360/points + /aft_mapped_to_init
-
-Do NOT use /cloud_registered for image-mask projection unless it is still in the
-same LiDAR frame as T_cam_lidar. FAST-LIVO2 /cloud_registered is usually in
-camera_init/map frame, so it is better used for geometric BEV fallback, not for
-per-frame image projection.
+Recommended for the unified-frame i2Nav AT128 pipeline:
+  /avt_camera/left/image/compressed + /cloud_registered + /aft_mapped_to_init
+  with cloud_in_map_frame=true.
 """
 
 import json
 import os
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -31,7 +31,7 @@ import sensor_msgs.point_cloud2 as pc2
 from cv_bridge import CvBridge
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image, CameraInfo, PointCloud2
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo, PointCloud2
 from tf.transformations import quaternion_matrix
 
 try:
@@ -51,33 +51,46 @@ class CameraLidarQueueExporter(object):
         self.input_dir = self.queue_dir / "input"
         self.input_dir.mkdir(parents=True, exist_ok=True)
 
-        self.image_topic = rospy.get_param("~image_topic", "/camera/image_color")
+        self.image_topic = rospy.get_param("~image_topic", "/avt_camera/left/image/compressed")
+        self.image_input_type = rospy.get_param("~image_input_type", "compressed").strip().lower()
+        if self.image_input_type not in ["image", "compressed"]:
+            raise RuntimeError("Unsupported ~image_input_type=%s. Use image or compressed." % self.image_input_type)
         self.use_camera_info = bool(rospy.get_param("~use_camera_info", False))
         self.camera_info_topic = rospy.get_param("~camera_info_topic", "/camera/camera_info")
-        self.lidar_topic = rospy.get_param("~lidar_topic", "/livox/mid360/points")
+        self.lidar_topic = rospy.get_param("~lidar_topic", "/hesai/at128/points")
         self.odom_topic = rospy.get_param("~odom_topic", "/aft_mapped_to_init")
 
         # v22: pointcloud2_lidar or livox_custom.
         # pointcloud2_lidar: use a sensor_msgs/PointCloud2 whose points are in the LiDAR frame.
-        # livox_custom: use livox_ros_driver/CustomMsg raw Mid-360 packets.
-        self.lidar_input_type = rospy.get_param("~lidar_input_type", "livox_custom").strip().lower()
+        # livox_custom: legacy livox_ros_driver/CustomMsg raw packets.
+        self.lidar_input_type = rospy.get_param("~lidar_input_type", "pointcloud2_lidar").strip().lower()
         if self.lidar_input_type not in ["pointcloud2_lidar", "livox_custom"]:
             raise RuntimeError("Unsupported ~lidar_input_type=%s. Use pointcloud2_lidar or livox_custom." % self.lidar_input_type)
+        self.cloud_in_map_frame = bool(rospy.get_param("~cloud_in_map_frame", False))
+        if self.cloud_in_map_frame and self.lidar_input_type == "livox_custom":
+            raise RuntimeError("~cloud_in_map_frame=true requires sensor_msgs/PointCloud2 input, not livox_custom")
 
         self.export_rate = float(rospy.get_param("~export_rate", 1.0))
+        self.max_pending_requests = int(rospy.get_param("~max_pending_requests", 8))
         self.approx_sync_slop = float(rospy.get_param("~approx_sync_slop", 0.08))
-        # v23: Most real bags do not have image, raw Livox CustomMsg and FAST-LIVO2 odometry
+        # v23: Most real bags do not have image, raw LiDAR scan and FAST-LIVO2 odometry
         # timestamps aligned closely enough for a 3-way ApproximateTimeSynchronizer.
         # Default to synchronizing image + LiDAR only and using the latest buffered odometry.
         self.use_latest_odom = bool(rospy.get_param("~use_latest_odom", True))
         self.max_odom_age_sec = float(rospy.get_param("~max_odom_age_sec", 1.0))
+        self.odom_match_mode = rospy.get_param("~odom_match_mode", "receipt").strip().lower()
+        if self.odom_match_mode not in ["receipt", "latest", "stamp"]:
+            raise RuntimeError("Unsupported ~odom_match_mode=%s. Use receipt, latest, or stamp." % self.odom_match_mode)
+        self.odom_buffer_size = max(1, int(rospy.get_param("~odom_buffer_size", 500)))
+        self.max_odom_receipt_age_sec = float(rospy.get_param("~max_odom_receipt_age_sec", 0.50))
+        self.defer_odom_lookup_sec = float(rospy.get_param("~defer_odom_lookup_sec", 0.05))
         self.debug_sync = bool(rospy.get_param("~debug_sync", True))
         self.point_stride = max(1, int(rospy.get_param("~point_stride", 2)))
         self.max_export_points = int(rospy.get_param("~max_export_points", 180000))
         self.min_range_m = float(rospy.get_param("~min_range_m", 0.5))
-        self.max_range_m = float(rospy.get_param("~max_range_m", 120.0))
-        self.z_min_lidar = float(rospy.get_param("~z_min_lidar", -5.0))
-        self.z_max_lidar = float(rospy.get_param("~z_max_lidar", 8.0))
+        self.max_range_m = float(rospy.get_param("~max_range_m", 220.0))
+        self.z_min_lidar = float(rospy.get_param("~z_min_lidar", -8.0))
+        self.z_max_lidar = float(rospy.get_param("~z_max_lidar", 25.0))
 
         # Intrinsic fallback for bags without CameraInfo.
         self.cam_width = int(rospy.get_param("~cam_width", 0))
@@ -97,11 +110,14 @@ class CameraLidarQueueExporter(object):
         self.last_export_time = 0.0
         self.exported = 0
 
-        image_sub = Subscriber(self.image_topic, Image)
+        image_cls = CompressedImage if self.image_input_type == "compressed" else Image
+        image_sub = Subscriber(self.image_topic, image_cls)
 
         # v23: odom is buffered separately by default. This prevents zero export when
         # /aft_mapped_to_init has timestamps that do not align with raw camera/Livox stamps.
         self.latest_odom = None
+        self.latest_odom_wall = None
+        self.odom_buffer = deque(maxlen=self.odom_buffer_size)
         self.last_image_stamp = None
         self.last_cloud_stamp = None
         self.last_odom_stamp = None
@@ -123,7 +139,7 @@ class CameraLidarQueueExporter(object):
             cloud_sub = Subscriber(self.lidar_topic, PointCloud2)
 
         # Lightweight topic counters for diagnosing why no queue files are generated.
-        rospy.Subscriber(self.image_topic, Image, self.image_count_cb, queue_size=1)
+        rospy.Subscriber(self.image_topic, image_cls, self.image_count_cb, queue_size=1)
         if self.lidar_input_type == "livox_custom":
             rospy.Subscriber(self.lidar_topic, lidar_cls, self.cloud_count_cb, queue_size=1)
         else:
@@ -169,12 +185,18 @@ class CameraLidarQueueExporter(object):
 
         rospy.Timer(rospy.Duration(5.0), self.debug_timer_cb)
 
-        rospy.loginfo("v22 camera_lidar_queue_exporter started")
-        rospy.loginfo("image=%s use_camera_info=%s lidar=%s lidar_input_type=%s odom=%s queue=%s",
-                      self.image_topic, str(self.use_camera_info),
-                      self.lidar_topic, self.lidar_input_type, self.odom_topic, str(self.queue_dir))
+        rospy.loginfo("v25 camera_lidar_queue_exporter started")
+        rospy.loginfo("image=%s image_input_type=%s use_camera_info=%s lidar=%s lidar_input_type=%s cloud_in_map=%s odom=%s queue=%s",
+                      self.image_topic, self.image_input_type, str(self.use_camera_info),
+                      self.lidar_topic, self.lidar_input_type, str(self.cloud_in_map_frame),
+                      self.odom_topic, str(self.queue_dir))
         rospy.loginfo("sync mode: use_latest_odom=%s approx_sync_slop=%.3f max_odom_age=%.3f debug_sync=%s",
                       str(self.use_latest_odom), self.approx_sync_slop, self.max_odom_age_sec, str(self.debug_sync))
+        rospy.loginfo("odom match: mode=%s buffer=%d max_receipt_age=%.3f defer_lookup=%.3f",
+                      self.odom_match_mode, self.odom_buffer_size,
+                      self.max_odom_receipt_age_sec, self.defer_odom_lookup_sec)
+        rospy.loginfo("queue backpressure: export_rate=%.3fHz max_pending_requests=%d",
+                      self.export_rate, self.max_pending_requests)
         if not self.use_camera_info:
             rospy.loginfo("using YAML intrinsics: width=%d height=%d scale=%.3f fx=%.3f fy=%.3f cx=%.3f cy=%.3f D=[%.5f %.5f %.6f %.6f]",
                           self.cam_width, self.cam_height, self.image_scale,
@@ -196,22 +218,79 @@ class CameraLidarQueueExporter(object):
         self.last_cloud_stamp = msg.header.stamp
 
     def odom_cb(self, msg):
+        wall = time.time()
         self.latest_odom = msg
+        self.latest_odom_wall = wall
+        self.odom_buffer.append((wall, msg))
         self.odom_seen += 1
         self.last_odom_stamp = msg.header.stamp
 
-    def get_latest_odom_for(self, ref_stamp):
+    def can_export_now(self):
+        now = time.time()
+        if self.export_rate > 0.0 and now - self.last_export_time < 1.0 / self.export_rate:
+            return False
+        if self.max_pending_requests > 0:
+            pending = len(list(self.input_dir.glob("ready_*.json")))
+            if pending >= self.max_pending_requests:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "SAM3 queue backpressure active: pending ready requests=%d >= max_pending_requests=%d. "
+                    "Exporter will skip frames until sam3_image_mask_service catches up.",
+                    pending, self.max_pending_requests)
+                return False
+        return True
+
+    def get_latest_odom_for(self, ref_stamp, ref_wall=None):
         if self.latest_odom is None:
             rospy.logwarn_throttle(3.0, "No odometry received yet on %s", self.odom_topic)
-            return None
-        age = abs(self.stamp_to_sec(ref_stamp) - self.stamp_to_sec(self.latest_odom.header.stamp))
-        if self.max_odom_age_sec > 0.0 and age > self.max_odom_age_sec:
+            return None, {}
+
+        if ref_wall is None:
+            ref_wall = time.time()
+
+        selected = self.latest_odom
+        selected_wall = self.latest_odom_wall
+        stamp_dt = abs(self.stamp_to_sec(ref_stamp) - self.stamp_to_sec(selected.header.stamp))
+
+        if self.odom_match_mode == "stamp" and self.odom_buffer:
+            selected_wall, selected = min(
+                self.odom_buffer,
+                key=lambda item: abs(self.stamp_to_sec(ref_stamp) - self.stamp_to_sec(item[1].header.stamp)))
+            stamp_dt = abs(self.stamp_to_sec(ref_stamp) - self.stamp_to_sec(selected.header.stamp))
+        elif self.odom_match_mode == "receipt" and self.odom_buffer:
+            latest_allowed = ref_wall + max(0.0, self.defer_odom_lookup_sec)
+            candidates = [item for item in self.odom_buffer if item[0] <= latest_allowed]
+            if candidates:
+                selected_wall, selected = candidates[-1]
+            stamp_dt = abs(self.stamp_to_sec(ref_stamp) - self.stamp_to_sec(selected.header.stamp))
+
+        receipt_age = None if selected_wall is None else ref_wall - selected_wall
+        diag = {
+            "odom_match_mode": self.odom_match_mode,
+            "odom_stamp_dt": float(stamp_dt),
+            "odom_receipt_age_sec": None if receipt_age is None else float(receipt_age),
+            "odom_header_stamp": self.stamp_to_sec(selected.header.stamp),
+        }
+
+        # With FAST-LIVO2 publish/use_sensor_time enabled, stamp mode is the
+        # safest projection path: image, cloud, and odom all refer to sensor time.
+        # Receipt mode is kept only as a fallback for older wall-time odometry.
+        if self.odom_match_mode == "stamp" and self.max_odom_age_sec > 0.0 and stamp_dt > self.max_odom_age_sec:
             rospy.logwarn_throttle(3.0,
                 "Latest odom too old for image/lidar pair: age=%.3fs > %.3fs. "
                 "Increase ~max_odom_age_sec or play bag with /clock correctly.",
-                age, self.max_odom_age_sec)
-            return None
-        return self.latest_odom
+                stamp_dt, self.max_odom_age_sec)
+            return None, diag
+
+        if (receipt_age is not None and self.max_odom_receipt_age_sec > 0.0 and
+                abs(receipt_age) > self.max_odom_receipt_age_sec):
+            rospy.logwarn_throttle(
+                2.0,
+                "Selected odom receipt age is large: mode=%s receipt_age=%.3fs stamp_dt=%.3fs. "
+                "This can scramble map-frame SAM3 semantic points.",
+                self.odom_match_mode, receipt_age, stamp_dt)
+
+        return selected, diag
 
     def debug_timer_cb(self, event):
         if not self.debug_sync:
@@ -225,17 +304,27 @@ class CameraLidarQueueExporter(object):
 
     def callback_with_info_latest_odom(self, image_msg, camera_info_msg, cloud_msg):
         self.sync_seen += 1
-        odom_msg = self.get_latest_odom_for(image_msg.header.stamp)
+        if not self.can_export_now():
+            return
+        ref_wall = time.time()
+        if self.defer_odom_lookup_sec > 0.0:
+            time.sleep(self.defer_odom_lookup_sec)
+        odom_msg, odom_diag = self.get_latest_odom_for(image_msg.header.stamp, ref_wall)
         if odom_msg is None:
             return
-        self.callback_with_info(image_msg, camera_info_msg, cloud_msg, odom_msg)
+        self.callback_with_info(image_msg, camera_info_msg, cloud_msg, odom_msg, odom_diag=odom_diag)
 
     def callback_without_info_latest_odom(self, image_msg, cloud_msg):
         self.sync_seen += 1
-        odom_msg = self.get_latest_odom_for(image_msg.header.stamp)
+        if not self.can_export_now():
+            return
+        ref_wall = time.time()
+        if self.defer_odom_lookup_sec > 0.0:
+            time.sleep(self.defer_odom_lookup_sec)
+        odom_msg, odom_diag = self.get_latest_odom_for(image_msg.header.stamp, ref_wall)
         if odom_msg is None:
             return
-        self.callback_without_info(image_msg, cloud_msg, odom_msg)
+        self.callback_without_info(image_msg, cloud_msg, odom_msg, odom_diag=odom_diag)
 
     @staticmethod
     def odom_to_matrix(odom_msg):
@@ -274,7 +363,7 @@ class CameraLidarQueueExporter(object):
         D = np.asarray([self.cam_d0, self.cam_d1, self.cam_d2, self.cam_d3], dtype=np.float64)
         return K, D
 
-    def filter_xyz_list(self, iterable):
+    def filter_xyz_list(self, iterable, apply_lidar_filters=True):
         pts = []
         idx = 0
         for x, y, z in iterable:
@@ -285,11 +374,12 @@ class CameraLidarQueueExporter(object):
             x, y, z = float(x), float(y), float(z)
             if not np.isfinite(x + y + z):
                 continue
-            r = (x * x + y * y + z * z) ** 0.5
-            if r < self.min_range_m or r > self.max_range_m:
-                continue
-            if z < self.z_min_lidar or z > self.z_max_lidar:
-                continue
+            if apply_lidar_filters:
+                r = (x * x + y * y + z * z) ** 0.5
+                if r < self.min_range_m or r > self.max_range_m:
+                    continue
+                if z < self.z_min_lidar or z > self.z_max_lidar:
+                    continue
             pts.append((x, y, z))
             if len(pts) >= self.max_export_points:
                 break
@@ -302,50 +392,71 @@ class CameraLidarQueueExporter(object):
         if not all(k in fields for k in ["x", "y", "z"]):
             rospy.logwarn_throttle(5.0, "PointCloud2 lacks x/y/z fields. fields=%s", fields)
             return None
-        return self.filter_xyz_list(pc2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True))
+        return self.filter_xyz_list(
+            pc2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True),
+            apply_lidar_filters=not self.cloud_in_map_frame)
 
     def livox_custom_to_xyz(self, msg):
         # livox_ros_driver/CustomMsg points are CustomPoint: offset_time, x, y, z, reflectivity, tag, line.
         if not hasattr(msg, "points"):
             rospy.logwarn_throttle(5.0, "Livox CustomMsg has no points field")
             return None
-        return self.filter_xyz_list((p.x, p.y, p.z) for p in msg.points)
+        return self.filter_xyz_list(((p.x, p.y, p.z) for p in msg.points), apply_lidar_filters=True)
 
     def cloud_to_xyz(self, cloud_msg):
         if self.lidar_input_type == "livox_custom":
             return self.livox_custom_to_xyz(cloud_msg)
         return self.pointcloud2_to_xyz(cloud_msg)
 
-    def callback_with_info(self, image_msg, camera_info_msg, cloud_msg, odom_msg):
+    def callback_with_info(self, image_msg, camera_info_msg, cloud_msg, odom_msg, odom_diag=None):
         K = np.asarray(camera_info_msg.K, dtype=np.float64).reshape(3, 3)
         D = np.asarray(camera_info_msg.D, dtype=np.float64) if camera_info_msg.D else np.zeros((0,), dtype=np.float64)
         self.handle_sample(image_msg, cloud_msg, odom_msg, K, D,
                            int(camera_info_msg.width), int(camera_info_msg.height),
-                           camera_info_msg.header.frame_id, "camera_info")
+                           camera_info_msg.header.frame_id, "camera_info", odom_diag=odom_diag)
 
-    def callback_without_info(self, image_msg, cloud_msg, odom_msg):
-        try:
-            image_bgr = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
-        except Exception as e:
-            rospy.logwarn("Failed to convert image: %s", e)
+    def callback_without_info(self, image_msg, cloud_msg, odom_msg, odom_diag=None):
+        image_bgr = self.image_to_bgr(image_msg)
+        if image_bgr is None:
             return
         h, w = image_bgr.shape[:2]
         K, D = self.yaml_intrinsics_for_image(w, h)
         self.handle_sample(image_msg, cloud_msg, odom_msg, K, D, w, h,
-                           image_msg.header.frame_id, "yaml", image_bgr=image_bgr)
+                           image_msg.header.frame_id, "yaml", image_bgr=image_bgr,
+                           odom_diag=odom_diag)
+
+    def image_to_bgr(self, image_msg):
+        try:
+            if self.image_input_type == "compressed":
+                arr = np.frombuffer(image_msg.data, dtype=np.uint8)
+                image_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if image_bgr is None:
+                    raise RuntimeError("cv2.imdecode returned None")
+                return image_bgr
+            return self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
+        except Exception as e:
+            rospy.logwarn("Failed to convert image from %s: %s", self.image_input_type, e)
+            return None
 
     def handle_sample(self, image_msg, cloud_msg, odom_msg, K, D, image_width, image_height,
-                      camera_frame_id, intrinsic_source, image_bgr=None):
+                      camera_frame_id, intrinsic_source, image_bgr=None, odom_diag=None):
         now = time.time()
         if self.export_rate > 0.0 and now - self.last_export_time < 1.0 / self.export_rate:
             return
+        if self.max_pending_requests > 0:
+            pending = len(list(self.input_dir.glob("ready_*.json")))
+            if pending >= self.max_pending_requests:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "SAM3 queue backpressure active: pending ready requests=%d >= max_pending_requests=%d. "
+                    "Exporter will skip frames until sam3_image_mask_service catches up.",
+                    pending, self.max_pending_requests)
+                return
         self.last_export_time = now
 
         if image_bgr is None:
-            try:
-                image_bgr = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
-            except Exception as e:
-                rospy.logwarn("Failed to convert image: %s", e)
+            image_bgr = self.image_to_bgr(image_msg)
+            if image_bgr is None:
                 return
 
         xyz = self.cloud_to_xyz(cloud_msg)
@@ -369,6 +480,7 @@ class CameraLidarQueueExporter(object):
             K=K,
             D=D,
             lidar_input_type=np.asarray(self.lidar_input_type),
+            cloud_in_map_frame=np.asarray(self.cloud_in_map_frame),
         )
 
         meta = {
@@ -386,7 +498,11 @@ class CameraLidarQueueExporter(object):
             "D": D.reshape(-1).tolist(),
             "lidar_frame_id": getattr(cloud_msg.header, "frame_id", ""),
             "lidar_input_type": self.lidar_input_type,
+            "cloud_in_map_frame": self.cloud_in_map_frame,
             "odom_frame_id": odom_msg.header.frame_id,
+            "odom_child_frame_id": odom_msg.child_frame_id,
+            "odom_diag": odom_diag or {},
+            "image_cloud_stamp_dt": abs(self.stamp_to_sec(image_msg.header.stamp) - self.stamp_to_sec(cloud_msg.header.stamp)),
             "T_map_body": T_map_body.reshape(-1).tolist(),
         }
 
@@ -395,10 +511,16 @@ class CameraLidarQueueExporter(object):
         os.replace(str(meta_tmp), str(meta_path))
 
         self.exported += 1
-        rospy.loginfo("exported SAM3 semantic request id=%s points=%d image=%dx%d Kfx=%.2f Kfy=%.2f lidar_type=%s frame=%s total=%d",
+        diag = odom_diag or {}
+        rospy.loginfo("exported SAM3 semantic request id=%s points=%d image=%dx%d Kfx=%.2f Kfy=%.2f lidar_type=%s cloud_in_map=%s frame=%s odom_mode=%s odom_receipt_age=%s odom_stamp_dt=%.3f total=%d",
                       req_id, xyz.shape[0], image_bgr.shape[1], image_bgr.shape[0],
                       K[0, 0], K[1, 1], self.lidar_input_type,
-                      getattr(cloud_msg.header, "frame_id", ""), self.exported)
+                      str(self.cloud_in_map_frame),
+                      getattr(cloud_msg.header, "frame_id", ""),
+                      diag.get("odom_match_mode", "direct"),
+                      "none" if diag.get("odom_receipt_age_sec", None) is None else "%.3f" % diag.get("odom_receipt_age_sec"),
+                      float(diag.get("odom_stamp_dt", 0.0)),
+                      self.exported)
 
 
 if __name__ == "__main__":

@@ -201,6 +201,28 @@ geometry_msgs::Quaternion quatFromYaw(double yaw)
   return tf2::toMsg(q);
 }
 
+geometry_msgs::Quaternion quatWithRawRollPitchAndYaw(const geometry_msgs::Quaternion& raw_msg,
+                                                     double yaw)
+{
+  tf2::Quaternion raw_q;
+  tf2::fromMsg(raw_msg, raw_q);
+  if (raw_q.length2() < 1e-12)
+  {
+    return quatFromYaw(yaw);
+  }
+  raw_q.normalize();
+  double roll = 0.0;
+  double pitch = 0.0;
+  double raw_yaw = 0.0;
+  tf2::Matrix3x3(raw_q).getRPY(roll, pitch, raw_yaw);
+  (void)raw_yaw;
+
+  tf2::Quaternion q;
+  q.setRPY(roll, pitch, yaw);
+  q.normalize();
+  return tf2::toMsg(q);
+}
+
 Eigen::Vector2d rotate2(double yaw, const Eigen::Vector2d& p)
 {
   const double c = std::cos(yaw);
@@ -433,12 +455,14 @@ class SemanticKeyframePoseGraph
     pnh_.param<std::string>("label_field", label_field_, "label");
     pnh_.param<std::string>("label_mode", label_mode_, "internal");
     pnh_.param<std::string>("output_mode", output_mode_, "z_only");
+    pnh_.param<std::string>("output_orientation_mode", output_orientation_mode_, "preserve_roll_pitch");
 
     pnh_.param<bool>("cloud_in_map_frame", cloud_in_map_frame_, true);
     pnh_.param<bool>("enable_loop_constraints", enable_loop_constraints_, true);
     pnh_.param<bool>("enable_xy_loop_constraints", enable_xy_loop_constraints_, false);
     pnh_.param<bool>("enable_z_loop_constraints", enable_z_loop_constraints_, true);
     pnh_.param<bool>("publish_optimized_map", publish_optimized_map_, true);
+    pnh_.param<bool>("allow_unsafe_full_output", allow_unsafe_full_output_, false);
 
     pnh_.param<double>("keyframe_min_distance", keyframe_min_distance_, 2.0);
     pnh_.param<double>("keyframe_min_yaw_deg", keyframe_min_yaw_deg_, 8.0);
@@ -518,9 +542,10 @@ class SemanticKeyframePoseGraph
     timer_ = nh_.createTimer(ros::Duration(1.0 / std::max(0.1, publish_rate_)),
                             &SemanticKeyframePoseGraph::timerCb, this);
 
-    ROS_INFO("semantic_keyframe_pose_graph started odom=%s cloud=%s output=%s mode=%s",
+    ROS_INFO("semantic_keyframe_pose_graph started odom=%s cloud=%s output=%s mode=%s orientation=%s unsafe_full=%d",
              odom_topic_.c_str(), cloud_topic_.c_str(), output_odom_topic_.c_str(),
-             output_mode_.c_str());
+             output_mode_.c_str(), output_orientation_mode_.c_str(),
+             allow_unsafe_full_output_ ? 1 : 0);
   }
 
  private:
@@ -1435,10 +1460,11 @@ class SemanticKeyframePoseGraph
 
   Pose4 outputPoseFromGraph(const Pose4& raw, const Pose4& graph) const
   {
-    if (output_mode_ == "full")
+    if (output_mode_ == "full" && allow_unsafe_full_output_)
     {
       return graph;
     }
+    const std::string mode = (output_mode_ == "full") ? std::string("safe") : output_mode_;
 
     const Eigen::Vector2d dxy_graph(graph.x - raw.x, graph.y - raw.y);
     const double dyaw_graph = normalizeAngle(graph.yaw - raw.yaw);
@@ -1460,12 +1486,12 @@ class SemanticKeyframePoseGraph
         dxy_graph.norm() <= std::max(1e-6, max_xy) &&
         std::fabs(dyaw_graph) <= std::max(1e-6, max_yaw);
 
-    if (output_mode_ == "blend" || (output_mode_ == "safe" && safe_xy))
+    if (mode == "blend" || (mode == "safe" && safe_xy))
     {
       dxy = xy_scale * dxy_graph;
       dyaw = yaw_scale * dyaw_graph;
     }
-    else if (output_mode_ == "z_only" || output_mode_ == "safe")
+    else if (mode == "z_only" || mode == "safe")
     {
       dxy.setZero();
       dyaw = 0.0;
@@ -1510,7 +1536,19 @@ class SemanticKeyframePoseGraph
     out.pose.pose.position.x = p.x;
     out.pose.pose.position.y = p.y;
     out.pose.pose.position.z = p.z;
-    out.pose.pose.orientation = quatFromYaw(p.yaw);
+    if (output_orientation_mode_ == "raw")
+    {
+      out.pose.pose.orientation = latest_odom_.pose.pose.orientation;
+    }
+    else if (output_orientation_mode_ == "yaw_only")
+    {
+      out.pose.pose.orientation = quatFromYaw(p.yaw);
+    }
+    else
+    {
+      out.pose.pose.orientation =
+          quatWithRawRollPitchAndYaw(latest_odom_.pose.pose.orientation, p.yaw);
+    }
     const bool xy_passthrough = std::fabs(last_output_dx_) < 1e-6 &&
                                 std::fabs(last_output_dy_) < 1e-6 &&
                                 std::fabs(last_output_dyaw_deg_) < 1e-6;
@@ -1642,6 +1680,8 @@ class SemanticKeyframePoseGraph
     ss << "\"last_opt_max_step\":" << last_opt_max_step_ << ",";
     ss << "\"last_opt_iterations\":" << last_opt_iterations_ << ",";
     ss << "\"output_mode\":\"" << output_mode_ << "\",";
+    ss << "\"output_orientation_mode\":\"" << output_orientation_mode_ << "\",";
+    ss << "\"allow_unsafe_full_output\":" << (allow_unsafe_full_output_ ? 1 : 0) << ",";
     ss << "\"output_dx\":" << last_output_dx_ << ",";
     ss << "\"output_dy\":" << last_output_dy_ << ",";
     ss << "\"output_dz\":" << last_output_dz_ << ",";
@@ -1685,6 +1725,7 @@ class SemanticKeyframePoseGraph
   std::string label_field_;
   std::string label_mode_;
   std::string output_mode_ = "z_only";
+  std::string output_orientation_mode_ = "preserve_roll_pitch";
 
   bool cloud_in_map_frame_ = true;
   bool enable_loop_constraints_ = true;
@@ -1692,6 +1733,7 @@ class SemanticKeyframePoseGraph
   bool enable_xy_loop_constraints_ = false;
   bool enable_z_loop_constraints_ = true;
   bool publish_optimized_map_ = true;
+  bool allow_unsafe_full_output_ = false;
   bool has_odom_ = false;
 
   double keyframe_min_distance_ = 2.0;

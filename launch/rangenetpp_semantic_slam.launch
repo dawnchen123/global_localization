@@ -4,29 +4,31 @@
   <arg name="semantic_slam_config" default="$(find fast_livo2_global_localization)/config/semantic_slam.yaml"/>
   <arg name="pose_graph_config" default="$(find fast_livo2_global_localization)/config/semantic_keyframe_pose_graph.yaml"/>
 
-  <arg name="run_livox_converter" default="true"/>
+  <arg name="run_livox_converter" default="false"/>
   <arg name="livox_custom_topic" default="/livox/mid360/points"/>
   <arg name="converted_cloud_topic" default="/livox/mid360/points_xyzirt"/>
-  <arg name="input_cloud_topic" default="/livox/mid360/points_xyzirt"/>
+  <arg name="input_cloud_topic" default="/hesai/at128/points"/>
   <arg name="output_cloud_topic" default="/rangenet/semantic_points"/>
   <arg name="odom_topic" default="/aft_mapped_to_init"/>
+  <arg name="input_cloud_in_map_frame" default="false"/>
+  <arg name="rangenet_map_frame" default="camera_init"/>
   <arg name="pose_graph_odom_topic" default="/semantic_corrected_odom"/>
   <arg name="rangenetpp_respawn" default="true"/>
   <arg name="rangenetpp_respawn_delay" default="2.0"/>
 
   <!--
-    Default path:
-      /livox/mid360/points (CustomMsg, sensor frame)
-        -> livox_custom_to_pointcloud2_node
-        -> /livox/mid360/points_xyzirt (PointCloud2, sensor frame)
+    i2Nav AT128 default path:
+      /hesai/at128/points (PointCloud2, raw LiDAR frame)
         -> RangeNet++ bridge
-        -> /rangenet/semantic_points (sensor frame)
+        -> /rangenet/semantic_points (raw LiDAR frame)
 
-    Therefore output_cloud_in_map_frame=false by default so
-    semantic_voxel_mapper_node transforms points with odometry. If you feed
-    /cloud_registered instead, set:
-      run_livox_converter:=false input_cloud_topic:=/cloud_registered
-      output_cloud_in_map_frame:=true
+    RangeNet++ only labels the raw scan. semantic_voxel_mapper_node is the single
+    place that transforms LiDAR-frame semantic points into camera_init/map using
+    FAST-LIVO2 odometry and T_body_lidar. Keeping this responsibility in one node
+    avoids raw points being accidentally treated as map-frame points.
+
+    The Livox converter remains available only for old Mid-360 bags:
+      run_livox_converter:=true input_cloud_topic:=/livox/mid360/points_xyzirt input_cloud_in_map_frame:=false
   -->
   <arg name="output_cloud_in_map_frame" default="false"/>
   <arg name="lidar_label_mode" default="semantic_kitti"/>
@@ -58,6 +60,10 @@
     <rosparam file="$(arg rangenetpp_config)" command="load"/>
     <param name="input_cloud_topic" value="$(arg input_cloud_topic)"/>
     <param name="output_cloud_topic" value="$(arg output_cloud_topic)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    <param name="map_frame" value="$(arg rangenet_map_frame)"/>
+    <param name="input_cloud_in_map_frame" value="$(arg input_cloud_in_map_frame)"/>
+    <param name="output_cloud_in_map_frame" value="$(arg output_cloud_in_map_frame)"/>
   </node>
 
   <include file="$(find fast_livo2_global_localization)/launch/semantic_slam.launch">

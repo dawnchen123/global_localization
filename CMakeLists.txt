@@ -127,6 +127,7 @@ catkin_install_python(PROGRAMS
   scripts/projected_semantic_bev_mapper.py
   scripts/sam3_image_mask_service.py
   scripts/rangenetpp_inference_bridge.py
+  scripts/trajectory_ned_recorder.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

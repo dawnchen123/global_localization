@@ -15,7 +15,7 @@
 #   (labels, confidence)
 #   {"labels": labels, "confidence": confidence}
 
-input_cloud_topic: /livox/mid360/points_xyzirt
+input_cloud_topic: /hesai/at128/points
 output_cloud_topic: /rangenet/semantic_points
 
 # Set this to the directory containing your backend wrapper .py file.
@@ -45,16 +45,16 @@ backend_label_space: semantic_kitti
 output_label_mode: semantic_kitti
 confidence_default: 1.0
 
-# Throughput controls. For Livox raw scans, keep stride 1 first;
+# Throughput controls. For AT128 raw scans, keep stride 1 first;
 # increase point_stride or lower max_points only if inference cannot keep up.
 point_stride: 1
-max_points: 120000
+max_points: 180000
 publish_every_n: 1
 subscriber_queue_size: 1
 
 # Range and intensity handling.
 min_range_m: 0.3
-max_range_m: 120.0
+max_range_m: 220.0
 require_intensity: false
 default_intensity: 0.0
 intensity_field_candidates: [intensity, reflectivity]

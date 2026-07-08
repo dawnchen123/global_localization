@@ -81,6 +81,24 @@ struct VoxelState
   }
 };
 
+struct OdomPoseSample
+{
+  ros::Time receipt_stamp;
+  ros::Time header_stamp;
+  Eigen::Isometry3d T_map_body = Eigen::Isometry3d::Identity();
+};
+
+struct PendingSemanticCloud
+{
+  sensor_msgs::PointCloud2ConstPtr msg;
+  double source_weight = 1.0;
+  bool cloud_in_map_frame = false;
+  std::string label_mode;
+  bool publish_static_current_cloud = true;
+  ros::WallTime first_wall;
+  int attempts = 0;
+};
+
 struct OutputPoint
 {
   float x = 0.0f;
@@ -393,6 +411,12 @@ class SemanticVoxelMapper
     pnh_.param<bool>("subscribe_segformer_semantic_cloud", subscribe_image_cloud_, false);
     pnh_.param<bool>("lidar_cloud_in_map_frame", lidar_cloud_in_map_frame_, false);
     pnh_.param<bool>("image_cloud_in_map_frame", image_cloud_in_map_frame_, false);
+    pnh_.param<std::string>("semantic_cloud_odom_match_mode", semantic_cloud_odom_match_mode_, "stamp");
+    pnh_.param<double>("max_semantic_odom_dt_sec", max_semantic_odom_dt_sec_, 0.20);
+    pnh_.param<int>("pending_semantic_cloud_max_queue", pending_semantic_cloud_max_queue_, 80);
+    pnh_.param<double>("pending_semantic_cloud_max_wait_sec", pending_semantic_cloud_max_wait_sec_, 20.0);
+    pnh_.param<int>("pending_semantic_cloud_max_process_per_cycle",
+                    pending_semantic_cloud_max_process_per_cycle_, 4);
     pnh_.param<std::string>("lidar_label_mode", lidar_label_mode_, "semantic_kitti");
     pnh_.param<std::string>("image_label_mode", image_label_mode_, "internal");
     pnh_.param<std::string>("map_frame", map_frame_, "camera_init");
@@ -468,6 +492,7 @@ class SemanticVoxelMapper
     pnh_.param<int>("rebuilt_keyframe_max_points_per_frame", rebuilt_keyframe_max_points_per_frame_, 2500);
     pnh_.param<bool>("rebuilt_keyframe_lidar_only", rebuilt_keyframe_lidar_only_, true);
     pnh_.param<bool>("publish_constraint_debug", publish_constraint_debug_, true);
+    pnh_.param<bool>("constraint_debug_raw_map_frame", constraint_debug_raw_map_frame_, true);
     pnh_.param<int>("constraint_debug_max_pairs", constraint_debug_max_pairs_, 300);
     pnh_.param<std::string>("z_constraint_debug_topic", z_constraint_debug_topic_, "/semantic_slam/z_constraint_debug");
     pnh_.param<std::string>("xy_constraint_debug_topic", xy_constraint_debug_topic_, "/semantic_slam/xy_constraint_debug");
@@ -567,11 +592,18 @@ class SemanticVoxelMapper
              lidar_label_mode_.c_str(), image_label_mode_.c_str(),
              lidar_cloud_in_map_frame_ ? "true" : "false",
              image_cloud_in_map_frame_ ? "true" : "false");
+    ROS_INFO("semantic cloud odom matching: mode=%s max_dt=%.3fs",
+             semantic_cloud_odom_match_mode_.c_str(), max_semantic_odom_dt_sec_);
+    ROS_INFO("pending semantic cloud queue: max_queue=%d max_wait=%.1fs max_process_per_cycle=%d",
+             pending_semantic_cloud_max_queue_,
+             pending_semantic_cloud_max_wait_sec_,
+             pending_semantic_cloud_max_process_per_cycle_);
   }
 
  private:
   void odomCb(const nav_msgs::OdometryConstPtr& msg)
   {
+    const ros::Time receipt_stamp = ros::Time::now();
     latest_T_map_body_ = odomToIsometry(*msg);
     latest_odom_time_ = msg->header.stamp;
     if (!has_z_correction_origin_)
@@ -587,8 +619,75 @@ class SemanticVoxelMapper
     {
       raw_odom_history_.pop_front();
     }
+    OdomPoseSample sample;
+    sample.receipt_stamp = receipt_stamp;
+    sample.header_stamp = msg->header.stamp;
+    sample.T_map_body = latest_T_map_body_;
+    odom_pose_history_.push_back(sample);
+    while (static_cast<int>(odom_pose_history_.size()) > std::max(100, max_history))
+    {
+      odom_pose_history_.pop_front();
+    }
     updateGroundRobotZPrior(msg->header.stamp);
     publishCorrectedOdom(msg->header.stamp);
+    processPendingSemanticClouds(false);
+  }
+
+  bool lookupOdomPoseForSemanticCloud(const ros::Time& semantic_stamp,
+                                      Eigen::Isometry3d& T_map_body,
+                                      double& dt_sec) const
+  {
+    dt_sec = 0.0;
+    if (semantic_cloud_odom_match_mode_ == "latest" || semantic_stamp.isZero())
+    {
+      if (latest_odom_time_.isZero())
+      {
+        return false;
+      }
+      T_map_body = latest_T_map_body_;
+      return true;
+    }
+    if (odom_pose_history_.empty())
+    {
+      return false;
+    }
+
+    const bool match_by_stamp = (semantic_cloud_odom_match_mode_ == "stamp");
+    const bool match_by_receipt = (semantic_cloud_odom_match_mode_ == "receipt");
+    if (!match_by_stamp && !match_by_receipt)
+    {
+      ROS_WARN_THROTTLE(5.0,
+                        "Unsupported semantic_cloud_odom_match_mode=%s. Use stamp, receipt, or latest.",
+                        semantic_cloud_odom_match_mode_.c_str());
+      return false;
+    }
+
+    auto best_it = odom_pose_history_.begin();
+    double best_dt = std::numeric_limits<double>::infinity();
+    for (auto it = odom_pose_history_.begin(); it != odom_pose_history_.end(); ++it)
+    {
+      const ros::Time sample_stamp = match_by_stamp ? it->header_stamp : it->receipt_stamp;
+      if (sample_stamp.isZero())
+      {
+        continue;
+      }
+      const double dt = std::fabs((sample_stamp - semantic_stamp).toSec());
+      if (dt < best_dt)
+      {
+        best_dt = dt;
+        best_it = it;
+      }
+    }
+    if (!std::isfinite(best_dt) ||
+        (max_semantic_odom_dt_sec_ > 0.0 && best_dt > max_semantic_odom_dt_sec_))
+    {
+      dt_sec = best_dt;
+      return false;
+    }
+
+    dt_sec = best_dt;
+    T_map_body = best_it->T_map_body;
+    return true;
   }
 
   uint32_t mapLabel(uint32_t raw_label, const std::string& mode) const
@@ -957,6 +1056,17 @@ class SemanticVoxelMapper
     return out;
   }
 
+  Eigen::Vector3d zAnchorFrameToDebugFrame(const Eigen::Vector3d& p) const
+  {
+    if (!constraint_debug_raw_map_frame_)
+    {
+      return p;
+    }
+    Eigen::Vector3d out = p;
+    out.z() -= zCorrectionAt(p);
+    return out;
+  }
+
   Eigen::Vector3d applySemanticCorrection(const Eigen::Vector3d& p) const
   {
     Eigen::Vector3d out = p;
@@ -1212,14 +1322,14 @@ class SemanticVoxelMapper
   {
     ++lidar_msg_count_;
     last_lidar_input_wall_ = ros::WallTime::now();
-    processCloud(msg, lidar_source_weight_, lidar_cloud_in_map_frame_, lidar_label_mode_, true);
+    enqueueOrProcessCloud(msg, lidar_source_weight_, lidar_cloud_in_map_frame_, lidar_label_mode_, true);
   }
 
   void imageCloudCb(const sensor_msgs::PointCloud2ConstPtr& msg)
   {
     ++image_msg_count_;
     last_image_input_wall_ = ros::WallTime::now();
-    processCloud(msg, image_source_weight_, image_cloud_in_map_frame_, image_label_mode_, false);
+    enqueueOrProcessCloud(msg, image_source_weight_, image_cloud_in_map_frame_, image_label_mode_, false);
   }
 
   static bool isGroundLabel(uint32_t label)
@@ -2063,9 +2173,10 @@ class SemanticVoxelMapper
         const double sample_weight = std::max(0.05, fp.weight) * distance_weight;
         if (debug_pairs.size() < static_cast<std::size_t>(std::max(1, constraint_debug_max_pairs_)))
         {
+          const Eigen::Vector3d target(anchor->mean.x(), anchor->mean.y(), anchor->z);
           ConstraintDebugPair dbg;
-          dbg.source = p;
-          dbg.target = Eigen::Vector3d(anchor->mean.x(), anchor->mean.y(), anchor->z);
+          dbg.source = constraint_debug_raw_map_frame_ ? fp.p : p;
+          dbg.target = zAnchorFrameToDebugFrame(target);
           dbg.label = fp.label;
           dbg.residual = residual;
           dbg.weight = sample_weight;
@@ -2094,9 +2205,10 @@ class SemanticVoxelMapper
           const double residual = mean.z() - anchor->z;
           if (debug_pairs.size() < static_cast<std::size_t>(std::max(1, constraint_debug_max_pairs_)))
           {
+            const Eigen::Vector3d target(anchor->mean.x(), anchor->mean.y(), anchor->z);
             ConstraintDebugPair dbg;
-            dbg.source = mean;
-            dbg.target = Eigen::Vector3d(anchor->mean.x(), anchor->mean.y(), anchor->z);
+            dbg.source = zAnchorFrameToDebugFrame(mean);
+            dbg.target = zAnchorFrameToDebugFrame(target);
             dbg.label = label;
             dbg.residual = residual;
             dbg.weight = object_anchor_weight_;
@@ -2467,7 +2579,7 @@ class SemanticVoxelMapper
     points.swap(filtered);
   }
 
-  void processCloud(const sensor_msgs::PointCloud2ConstPtr& msg,
+  bool processCloud(const sensor_msgs::PointCloud2ConstPtr& msg,
                     double source_weight,
                     bool cloud_in_map_frame,
                     const std::string& label_mode,
@@ -2476,7 +2588,7 @@ class SemanticVoxelMapper
     if (!cloud_in_map_frame && latest_odom_time_.isZero())
     {
       ROS_WARN_THROTTLE(2.0, "Waiting for FAST-LIVO2 odometry on %s before fusing semantic cloud", odom_topic_.c_str());
-      return;
+      return false;
     }
 
     const sensor_msgs::PointField* fx = findField(*msg, "x");
@@ -2490,10 +2602,34 @@ class SemanticVoxelMapper
       ROS_WARN_THROTTLE(3.0,
                         "Semantic cloud needs x/y/z and label fields. topic frame=%s fields=%zu label_field=%s",
                         msg->header.frame_id.c_str(), msg->fields.size(), label_field_name_.c_str());
-      return;
+      return true;
     }
 
-    const Eigen::Isometry3d T_map_lidar = latest_T_map_body_ * T_body_lidar_;
+    Eigen::Isometry3d T_map_body_for_cloud = latest_T_map_body_;
+    double odom_match_dt_sec = 0.0;
+    if (!cloud_in_map_frame)
+    {
+      if (!lookupOdomPoseForSemanticCloud(msg->header.stamp, T_map_body_for_cloud, odom_match_dt_sec))
+      {
+        ROS_WARN_THROTTLE(2.0,
+                          "Deferring semantic cloud because no matched odom pose was found: "
+                          "stamp=%.6f mode=%s best_dt=%.3fs max_dt=%.3fs odom_samples=%zu",
+                          msg->header.stamp.toSec(),
+                          semantic_cloud_odom_match_mode_.c_str(),
+                          odom_match_dt_sec,
+                          max_semantic_odom_dt_sec_,
+                          odom_pose_history_.size());
+        return false;
+      }
+      if (odom_match_dt_sec > 0.20)
+      {
+        ROS_WARN_THROTTLE(2.0,
+                          "Semantic cloud uses delayed odom match: dt=%.3fs mode=%s. "
+                          "If this stays large, increase max_semantic_odom_dt_sec only after checking RViz.",
+                          odom_match_dt_sec, semantic_cloud_odom_match_mode_.c_str());
+      }
+    }
+    const Eigen::Isometry3d T_map_lidar = T_map_body_for_cloud * T_body_lidar_;
     const std::size_t n = static_cast<std::size_t>(msg->width) * static_cast<std::size_t>(msg->height);
     std::vector<OutputPoint> static_points;
     if (publish_static_labeled_cloud_ && publish_static_current_cloud)
@@ -2593,9 +2729,9 @@ class SemanticVoxelMapper
     const bool use_rebuilt_for_this_cloud = use_keyframe_rebuilt_map_ && !cloud_in_map_frame;
     if (use_rebuilt_for_this_cloud)
     {
-      const Eigen::Isometry3d corrected_pose = groundRobotCorrectedPose(latest_T_map_body_);
+      const Eigen::Isometry3d corrected_pose = groundRobotCorrectedPose(T_map_body_for_cloud);
       std::vector<OutputPoint> frame_map_points =
-          rebuildFramePoints(frame_points, latest_T_map_body_, corrected_pose, 0);
+          rebuildFramePoints(frame_points, T_map_body_for_cloud, corrected_pose, 0);
       used = static_cast<int>(frame_map_points.size());
       maybeAddRebuiltKeyframe(frame_points, stamp, publish_static_current_cloud);
       if (publish_static_labeled_cloud_ && publish_static_current_cloud)
@@ -2653,6 +2789,109 @@ class SemanticVoxelMapper
                       used, voxels_.size(), rebuilt_keyframes_.size(), unknown_skipped, dynamic_skipped,
                       instance_dynamic_skipped, instance_noise_skipped,
                       publish_static_current_cloud ? "rangenet" : "segformer");
+    return true;
+  }
+
+  void enqueueOrProcessCloud(const sensor_msgs::PointCloud2ConstPtr& msg,
+                             double source_weight,
+                             bool cloud_in_map_frame,
+                             const std::string& label_mode,
+                             bool publish_static_current_cloud)
+  {
+    if (cloud_in_map_frame || semantic_cloud_odom_match_mode_ == "latest")
+    {
+      processCloud(msg, source_weight, cloud_in_map_frame, label_mode, publish_static_current_cloud);
+      return;
+    }
+
+    PendingSemanticCloud pending;
+    pending.msg = msg;
+    pending.source_weight = source_weight;
+    pending.cloud_in_map_frame = cloud_in_map_frame;
+    pending.label_mode = label_mode;
+    pending.publish_static_current_cloud = publish_static_current_cloud;
+    pending.first_wall = ros::WallTime::now();
+    pending_semantic_clouds_.push_back(std::move(pending));
+
+    while (pending_semantic_cloud_max_queue_ > 0 &&
+           static_cast<int>(pending_semantic_clouds_.size()) > pending_semantic_cloud_max_queue_)
+    {
+      const auto& old = pending_semantic_clouds_.front();
+      ROS_WARN("Dropping oldest pending semantic cloud: stamp=%.6f queue=%zu max_queue=%d",
+               old.msg ? old.msg->header.stamp.toSec() : 0.0,
+               pending_semantic_clouds_.size(),
+               pending_semantic_cloud_max_queue_);
+      pending_semantic_clouds_.pop_front();
+    }
+
+    processPendingSemanticClouds(false);
+  }
+
+  void processPendingSemanticClouds(bool log_if_waiting)
+  {
+    if (pending_semantic_clouds_.empty())
+    {
+      return;
+    }
+
+    const ros::WallTime now = ros::WallTime::now();
+    const int max_process = std::max(1, pending_semantic_cloud_max_process_per_cycle_);
+    int processed = 0;
+    int dropped = 0;
+    for (auto it = pending_semantic_clouds_.begin(); it != pending_semantic_clouds_.end();)
+    {
+      const double wait_sec = (now - it->first_wall).toSec();
+      if (pending_semantic_cloud_max_wait_sec_ > 0.0 && wait_sec > pending_semantic_cloud_max_wait_sec_)
+      {
+        ROS_WARN("Dropping pending semantic cloud after %.2fs without matched odom: "
+                 "stamp=%.6f attempts=%d mode=%s odom_samples=%zu",
+                 wait_sec,
+                 it->msg ? it->msg->header.stamp.toSec() : 0.0,
+                 it->attempts,
+                 semantic_cloud_odom_match_mode_.c_str(),
+                 odom_pose_history_.size());
+        it = pending_semantic_clouds_.erase(it);
+        ++dropped;
+        continue;
+      }
+
+      ++it->attempts;
+      const bool done = processCloud(it->msg,
+                                     it->source_weight,
+                                     it->cloud_in_map_frame,
+                                     it->label_mode,
+                                     it->publish_static_current_cloud);
+      if (done)
+      {
+        it = pending_semantic_clouds_.erase(it);
+        ++processed;
+        if (processed >= max_process)
+        {
+          break;
+        }
+      }
+      else
+      {
+        ++it;
+      }
+    }
+
+    if (processed > 0 || dropped > 0)
+    {
+      ROS_INFO_THROTTLE(1.0,
+                        "pending semantic clouds processed=%d dropped=%d remaining=%zu",
+                        processed, dropped, pending_semantic_clouds_.size());
+    }
+    else if (log_if_waiting)
+    {
+      const auto& oldest = pending_semantic_clouds_.front();
+      ROS_WARN_THROTTLE(3.0,
+                        "pending semantic clouds waiting=%zu oldest_stamp=%.6f oldest_wait=%.2fs odom_samples=%zu",
+                        pending_semantic_clouds_.size(),
+                        oldest.msg ? oldest.msg->header.stamp.toSec() : 0.0,
+                        (now - oldest.first_wall).toSec(),
+                        odom_pose_history_.size());
+    }
   }
 
   void bestLabelAndConfidence(const VoxelState& state, uint32_t& best_label, float& confidence, float& total_votes) const
@@ -2923,6 +3162,7 @@ class SemanticVoxelMapper
     ss << "\"published_points\":" << published_points << ",";
     ss << "\"last_lidar_points\":" << last_lidar_points_ << ",";
     ss << "\"last_image_points\":" << last_image_points_ << ",";
+    ss << "\"pending_semantic_clouds\":" << pending_semantic_clouds_.size() << ",";
     ss << "\"voxel_size\":" << voxel_size_ << ",";
     ss << "\"min_votes\":" << min_votes_ << ",";
     ss << "\"min_confidence\":" << min_confidence_ << ",";
@@ -2988,6 +3228,8 @@ class SemanticVoxelMapper
 
   void maintenanceTimerCb(const ros::TimerEvent&)
   {
+    processPendingSemanticClouds(true);
+
     const ros::Time now = ros::Time::now();
     if (voxel_ttl_sec_ > 0.0)
     {
@@ -3101,6 +3343,7 @@ class SemanticVoxelMapper
   std::string image_label_mode_;
   std::string map_frame_;
   std::string label_field_name_;
+  std::string semantic_cloud_odom_match_mode_ = "stamp";
 
   bool subscribe_lidar_cloud_ = true;
   bool subscribe_image_cloud_ = false;
@@ -3119,6 +3362,7 @@ class SemanticVoxelMapper
   bool enable_ground_robot_roll_pitch_prior_ = true;
   bool rebuilt_keyframe_lidar_only_ = true;
   bool publish_constraint_debug_ = true;
+  bool constraint_debug_raw_map_frame_ = true;
   bool enable_semantic_xy_correction_ = true;
   bool enable_semantic_yaw_correction_ = true;
   bool use_vegetation_xy_anchors_ = false;
@@ -3134,6 +3378,7 @@ class SemanticVoxelMapper
   double voxel_size_ = 0.20;
   double min_range_m_ = 0.5;
   double max_range_m_ = 120.0;
+  double max_semantic_odom_dt_sec_ = 0.20;
   double z_min_map_ = -5.0;
   double z_max_map_ = 25.0;
   double lidar_source_weight_ = 1.0;
@@ -3261,6 +3506,8 @@ class SemanticVoxelMapper
   int local_semantic_max_frames_ = 80;
   int local_semantic_max_points_per_frame_ = 1200;
   int corrected_path_max_poses_ = 12000;
+  int pending_semantic_cloud_max_queue_ = 80;
+  int pending_semantic_cloud_max_process_per_cycle_ = 4;
   int pose_constraint_stale_frames_ = 0;
   int z_constraint_stale_frames_ = 0;
   int last_xy_matches_ = 0;
@@ -3278,9 +3525,12 @@ class SemanticVoxelMapper
   ros::WallTime last_corrected_path_pub_wall_;
   ros::Time last_pose_constraint_time_;
   ros::Time last_rebuilt_keyframe_time_;
+  double pending_semantic_cloud_max_wait_sec_ = 20.0;
+  std::deque<PendingSemanticCloud> pending_semantic_clouds_;
   std::deque<LocalSemanticFrame> local_semantic_frames_;
   std::deque<RebuiltSemanticKeyframe> rebuilt_keyframes_;
   std::deque<nav_msgs::Odometry> raw_odom_history_;
+  std::deque<OdomPoseSample> odom_pose_history_;
 };
 
 int main(int argc, char** argv)

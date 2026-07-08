@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include <ros/ros.h>
+#include <nav_msgs/Odometry.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/PointField.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
@@ -245,9 +247,14 @@ uint32_t internalToSemanticKitti(uint32_t internal_label, uint32_t fallback_raw)
 
 struct CandidatePoint
 {
+  // x/y/z are always LiDAR-frame coordinates used by RangeNet++ and geometry refinement.
   float x = 0.0f;
   float y = 0.0f;
   float z = 0.0f;
+  // out_* keep the coordinate frame to publish. With /cloud_registered input they remain map-frame.
+  float out_x = 0.0f;
+  float out_y = 0.0f;
+  float out_z = 0.0f;
   float intensity = 0.0f;
   float bx = 0.0f;
   float by = 0.0f;
@@ -281,21 +288,26 @@ class RangeNetPPRosNode
  public:
   RangeNetPPRosNode() : nh_(), pnh_("~")
   {
-    pnh_.param<std::string>("input_cloud_topic", input_topic_, "/livox/mid360/points_xyzirt");
+    pnh_.param<std::string>("input_cloud_topic", input_topic_, "/hesai/at128/points");
     pnh_.param<std::string>("output_cloud_topic", output_topic_, "/rangenet/semantic_points");
+    pnh_.param<std::string>("odom_topic", odom_topic_, "/aft_mapped_to_init");
+    pnh_.param<std::string>("map_frame", map_frame_, "camera_init");
     pnh_.param<std::string>("model_dir", model_dir_, "/home/dawn/models/rangenetpp");
     pnh_.param<std::string>("backend", backend_, "tensorrt");
+    pnh_.param<bool>("input_cloud_in_map_frame", input_cloud_in_map_frame_, false);
+    pnh_.param<bool>("output_cloud_in_map_frame", output_cloud_in_map_frame_, false);
+    pnh_.param<bool>("restamp_output_with_receipt_time", restamp_output_with_receipt_time_, true);
     pnh_.param<bool>("verbose", verbose_, false);
     pnh_.param<int>("subscriber_queue_size", subscriber_queue_size_, 1);
     pnh_.param<int>("point_stride", point_stride_, 1);
-    pnh_.param<int>("max_points", max_points_, 120000);
+    pnh_.param<int>("max_points", max_points_, 180000);
     pnh_.param<int>("publish_every_n", publish_every_n_, 1);
     pnh_.param<double>("min_inference_interval_sec", min_inference_interval_sec_, 0.0);
     pnh_.param<double>("min_range_m", min_range_m_, 0.3);
-    pnh_.param<double>("max_range_m", max_range_m_, 120.0);
+    pnh_.param<double>("max_range_m", max_range_m_, 220.0);
     pnh_.param<bool>("enable_pitch_filter", enable_pitch_filter_, true);
     pnh_.param<double>("min_pitch_deg", min_pitch_deg_, -25.0);
-    pnh_.param<double>("max_pitch_deg", max_pitch_deg_, 3.0);
+    pnh_.param<double>("max_pitch_deg", max_pitch_deg_, 15.0);
     pnh_.param<bool>("preserve_out_of_fov_points", preserve_out_of_fov_points_, true);
     pnh_.param<bool>("require_intensity", require_intensity_, false);
     pnh_.param<double>("default_intensity", default_intensity_, 0.0);
@@ -341,8 +353,12 @@ class RangeNetPPRosNode
     net_ = cl::make_net(model_dir_, backend_);
     net_->verbosity(verbose_);
     label_map_ = net_->getLabelMap();
-    ROS_INFO("RangeNet++ loaded labels=%zu input=%s output=%s stride=%d max_points=%d pitch_filter=%s[%.1f,%.1f]deg preserve_oof=%s intensity_scale=%.3f geometry_refine=%s",
+    ROS_INFO("RangeNet++ loaded labels=%zu input=%s output=%s input_in_map=%s output_in_map=%s restamp=%s map_frame=%s odom=%s stride=%d max_points=%d pitch_filter=%s[%.1f,%.1f]deg preserve_oof=%s intensity_scale=%.3f geometry_refine=%s",
              label_map_.size(), input_topic_.c_str(), output_topic_.c_str(),
+             input_cloud_in_map_frame_ ? "true" : "false",
+             output_cloud_in_map_frame_ ? "true" : "false",
+             restamp_output_with_receipt_time_ ? "true" : "false",
+             map_frame_.c_str(), odom_topic_.c_str(),
              point_stride_, max_points_,
              enable_pitch_filter_ ? "true" : "false", min_pitch_deg_, max_pitch_deg_,
              preserve_out_of_fov_points_ ? "true" : "false",
@@ -350,11 +366,157 @@ class RangeNetPPRosNode
 
     pub_ = nh_.advertise<sensor_msgs::PointCloud2>(output_topic_, 1);
     sub_ = nh_.subscribe(input_topic_, subscriber_queue_size_, &RangeNetPPRosNode::cloudCb, this);
+    if (input_cloud_in_map_frame_ || output_cloud_in_map_frame_)
+    {
+      odom_sub_ = nh_.subscribe(odom_topic_, 200, &RangeNetPPRosNode::odomCb, this);
+    }
     diagnostic_timer_ = nh_.createWallTimer(
         ros::WallDuration(3.0), &RangeNetPPRosNode::diagnosticTimerCb, this);
   }
 
  private:
+  using Mat4 = std::array<double, 16>;
+
+  static Mat4 identityMatrix()
+  {
+    Mat4 T{};
+    T[0] = 1.0;
+    T[5] = 1.0;
+    T[10] = 1.0;
+    T[15] = 1.0;
+    return T;
+  }
+
+  static Mat4 multiplyMatrix(const Mat4& A, const Mat4& B)
+  {
+    Mat4 C{};
+    for (int r = 0; r < 4; ++r)
+    {
+      for (int c = 0; c < 4; ++c)
+      {
+        double v = 0.0;
+        for (int k = 0; k < 4; ++k)
+        {
+          v += A[static_cast<std::size_t>(4 * r + k)] * B[static_cast<std::size_t>(4 * k + c)];
+        }
+        C[static_cast<std::size_t>(4 * r + c)] = v;
+      }
+    }
+    return C;
+  }
+
+  static Mat4 invertRigid(const Mat4& T)
+  {
+    Mat4 I = identityMatrix();
+    I[0] = T[0];
+    I[1] = T[4];
+    I[2] = T[8];
+    I[4] = T[1];
+    I[5] = T[5];
+    I[6] = T[9];
+    I[8] = T[2];
+    I[9] = T[6];
+    I[10] = T[10];
+
+    const double tx = T[3];
+    const double ty = T[7];
+    const double tz = T[11];
+    I[3] = -(I[0] * tx + I[1] * ty + I[2] * tz);
+    I[7] = -(I[4] * tx + I[5] * ty + I[6] * tz);
+    I[11] = -(I[8] * tx + I[9] * ty + I[10] * tz);
+    return I;
+  }
+
+  static void transformPoint(const Mat4& T,
+                             double x, double y, double z,
+                             double& ox, double& oy, double& oz)
+  {
+    ox = T[0] * x + T[1] * y + T[2] * z + T[3];
+    oy = T[4] * x + T[5] * y + T[6] * z + T[7];
+    oz = T[8] * x + T[9] * y + T[10] * z + T[11];
+  }
+
+  Mat4 bodyLidarMatrix() const
+  {
+    Mat4 T{};
+    for (std::size_t i = 0; i < 16; ++i)
+    {
+      T[i] = T_body_lidar_[i];
+    }
+    return T;
+  }
+
+  void odomCb(const nav_msgs::Odometry::ConstPtr& msg)
+  {
+    if (!msg)
+    {
+      return;
+    }
+
+    const auto& q = msg->pose.pose.orientation;
+    const auto& t = msg->pose.pose.position;
+    double qx = q.x;
+    double qy = q.y;
+    double qz = q.z;
+    double qw = q.w;
+    const double qn = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+    if (qn < 1e-12)
+    {
+      qx = 0.0;
+      qy = 0.0;
+      qz = 0.0;
+      qw = 1.0;
+    }
+    else
+    {
+      qx /= qn;
+      qy /= qn;
+      qz /= qn;
+      qw /= qn;
+    }
+
+    const double xx = qx * qx;
+    const double yy = qy * qy;
+    const double zz = qz * qz;
+    const double xy = qx * qy;
+    const double xz = qx * qz;
+    const double yz = qy * qz;
+    const double wx = qw * qx;
+    const double wy = qw * qy;
+    const double wz = qw * qz;
+
+    Mat4 T = identityMatrix();
+    T[0] = 1.0 - 2.0 * (yy + zz);
+    T[1] = 2.0 * (xy - wz);
+    T[2] = 2.0 * (xz + wy);
+    T[4] = 2.0 * (xy + wz);
+    T[5] = 1.0 - 2.0 * (xx + zz);
+    T[6] = 2.0 * (yz - wx);
+    T[8] = 2.0 * (xz - wy);
+    T[9] = 2.0 * (yz + wx);
+    T[10] = 1.0 - 2.0 * (xx + yy);
+    T[3] = t.x;
+    T[7] = t.y;
+    T[11] = t.z;
+
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    latest_T_map_body_ = T;
+    latest_odom_stamp_ = msg->header.stamp;
+    have_odom_ = true;
+  }
+
+  bool latestLidarMapTransforms(Mat4& T_map_lidar, Mat4& T_lidar_map)
+  {
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    if (!have_odom_)
+    {
+      return false;
+    }
+    T_map_lidar = multiplyMatrix(latest_T_map_body_, bodyLidarMatrix());
+    T_lidar_map = invertRigid(T_map_lidar);
+    return true;
+  }
+
   void loadBodyLidarParam()
   {
     T_body_lidar_[0] = 1.0;
@@ -377,12 +539,16 @@ class RangeNetPPRosNode
     }
   }
 
-  CandidatePoint makeCandidate(float x, float y, float z, float intensity) const
+  CandidatePoint makeCandidate(float x, float y, float z, float intensity,
+                               float out_x, float out_y, float out_z) const
   {
     CandidatePoint p;
     p.x = x;
     p.y = y;
     p.z = z;
+    p.out_x = out_x;
+    p.out_y = out_y;
+    p.out_z = out_z;
     p.intensity = intensity;
     p.bx = static_cast<float>(T_body_lidar_[0] * x + T_body_lidar_[1] * y + T_body_lidar_[2] * z + T_body_lidar_[3]);
     p.by = static_cast<float>(T_body_lidar_[4] * x + T_body_lidar_[5] * y + T_body_lidar_[6] * z + T_body_lidar_[7]);
@@ -499,7 +665,7 @@ class RangeNetPPRosNode
         height >= static_cast<float>(structure_min_height_) &&
         vertical_span >= static_cast<float>(structure_min_vertical_span_);
     if (has_vertical_support &&
-        (internal == 0 || internal == 3 || internal == 4 || internal == 6 || confidence < 0.65f))
+        (internal == 0 || internal == 6 || confidence < 0.45f))
     {
       structure_override = raw_label != 50 && raw_label != 51 && raw_label != 52;
       return 50;
@@ -513,6 +679,7 @@ class RangeNetPPRosNode
     std::lock_guard<std::mutex> lock(inference_mutex_);
     ++input_msg_count_;
     last_input_wall_ = ros::WallTime::now();
+    const ros::Time receipt_stamp = ros::Time::now();
     if (!msg)
     {
       return;
@@ -559,6 +726,19 @@ class RangeNetPPRosNode
     std::vector<uint32_t> inference_candidate_indices;
     inference_candidate_indices.reserve(std::min<std::size_t>(total_points, static_cast<std::size_t>(max_points_)));
     uint32_t pitch_out_of_fov = 0;
+    Mat4 T_map_lidar = identityMatrix();
+    Mat4 T_lidar_map = identityMatrix();
+    if ((input_cloud_in_map_frame_ || output_cloud_in_map_frame_) &&
+        !latestLidarMapTransforms(T_map_lidar, T_lidar_map))
+    {
+      ROS_WARN_THROTTLE(2.0,
+                        "RangeNet++ needs odometry on %s for input/output map-frame conversion "
+                        "(input_cloud_in_map_frame=%s output_cloud_in_map_frame=%s).",
+                        odom_topic_.c_str(),
+                        input_cloud_in_map_frame_ ? "true" : "false",
+                        output_cloud_in_map_frame_ ? "true" : "false");
+      return;
+    }
     for (std::size_t i = 0; i < total_points; i += static_cast<std::size_t>(point_stride_))
     {
       if (max_points_ > 0 && candidates.size() >= static_cast<std::size_t>(max_points_))
@@ -566,12 +746,19 @@ class RangeNetPPRosNode
         break;
       }
 
-      const double x = readFieldAsDouble(*msg, *fx, i);
-      const double y = readFieldAsDouble(*msg, *fy, i);
-      const double z = readFieldAsDouble(*msg, *fz, i);
-      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+      const double in_x = readFieldAsDouble(*msg, *fx, i);
+      const double in_y = readFieldAsDouble(*msg, *fy, i);
+      const double in_z = readFieldAsDouble(*msg, *fz, i);
+      if (!std::isfinite(in_x) || !std::isfinite(in_y) || !std::isfinite(in_z))
       {
         continue;
+      }
+      double x = in_x;
+      double y = in_y;
+      double z = in_z;
+      if (input_cloud_in_map_frame_)
+      {
+        transformPoint(T_lidar_map, in_x, in_y, in_z, x, y, z);
       }
       const double r2 = x * x + y * y + z * z;
       if (r2 < min_range2_ || r2 > max_range2_)
@@ -602,10 +789,36 @@ class RangeNetPPRosNode
       {
         intensity = readFieldAsDouble(*msg, *fint, i);
       }
+      double out_x = in_x;
+      double out_y = in_y;
+      double out_z = in_z;
+      if (output_cloud_in_map_frame_)
+      {
+        if (input_cloud_in_map_frame_)
+        {
+          out_x = in_x;
+          out_y = in_y;
+          out_z = in_z;
+        }
+        else
+        {
+          transformPoint(T_map_lidar, x, y, z, out_x, out_y, out_z);
+        }
+      }
+      else if (input_cloud_in_map_frame_)
+      {
+        out_x = x;
+        out_y = y;
+        out_z = z;
+      }
+
       const CandidatePoint candidate = makeCandidate(static_cast<float>(x),
                                                      static_cast<float>(y),
                                                      static_cast<float>(z),
-                                                     normalizeIntensity(intensity));
+                                                     normalizeIntensity(intensity),
+                                                     static_cast<float>(out_x),
+                                                     static_cast<float>(out_y),
+                                                     static_cast<float>(out_z));
       const uint32_t candidate_index = static_cast<uint32_t>(candidates.size());
       candidates.push_back(candidate);
       candidates.back().in_model_fov = in_model_fov;
@@ -664,6 +877,14 @@ class RangeNetPPRosNode
 
     sensor_msgs::PointCloud2 out;
     out.header = msg->header;
+    if (restamp_output_with_receipt_time_)
+    {
+      out.header.stamp = receipt_stamp;
+    }
+    if (output_cloud_in_map_frame_)
+    {
+      out.header.frame_id = map_frame_;
+    }
     out.height = 1;
     out.is_bigendian = false;
     out.is_dense = false;
@@ -774,9 +995,9 @@ class RangeNetPPRosNode
           break;
       }
 
-      *iter_x = candidates[i].x;
-      *iter_y = candidates[i].y;
-      *iter_z = candidates[i].z;
+      *iter_x = candidates[i].out_x;
+      *iter_y = candidates[i].out_y;
+      *iter_z = candidates[i].out_z;
       *iter_i = candidates[i].intensity;
       *iter_rgb = internalLabelRgb(internal);
       *iter_label = raw_label;
@@ -795,11 +1016,13 @@ class RangeNetPPRosNode
     ++output_msg_count_;
     last_output_wall_ = ros::WallTime::now();
     ROS_INFO_THROTTLE(2.0,
-                      "real RangeNet++ output=%u infer=%u geom_only=%u road=%u sidewalk=%u building=%u vegetation=%u dynamic=%u other=%u unknown=%u pitch_oof=%u geom_ground=%u geom_structure=%u frame=%s",
+                      "real RangeNet++ output=%u infer=%u geom_only=%u road=%u sidewalk=%u building=%u vegetation=%u dynamic=%u other=%u unknown=%u pitch_oof=%u geom_ground=%u geom_structure=%u frame=%s input_in_map=%s output_in_map=%s",
                       output_n, inference_n, geometry_only,
                       road, sidewalk, building, vegetation, dynamic, other, unknown,
                       pitch_out_of_fov, ground_overrides, structure_overrides,
-                      out.header.frame_id.c_str());
+                      out.header.frame_id.c_str(),
+                      input_cloud_in_map_frame_ ? "true" : "false",
+                      output_cloud_in_map_frame_ ? "true" : "false");
   }
 
   void diagnosticTimerCb(const ros::WallTimerEvent&)
@@ -808,8 +1031,10 @@ class RangeNetPPRosNode
     if (input_msg_count_ == 0)
     {
       ROS_WARN("rangenetpp_ros_node has not received input PointCloud2 on %s. "
-               "For Livox CustomMsg, start livox_custom_to_pointcloud2_node first and feed %s.",
-               input_topic_.c_str(), input_topic_.c_str());
+               "Current i2Nav AT128 setup expects raw /hesai/at128/points with input_cloud_in_map_frame=false. "
+               "Do not use /cloud_registered for RangeNet++ inference unless you intentionally convert map-frame points back to LiDAR frame. "
+               "For legacy Livox CustomMsg, start livox_custom_to_pointcloud2_node first.",
+               input_topic_.c_str());
       return;
     }
     if ((now - last_input_wall_).toSec() > 3.0)
@@ -833,6 +1058,7 @@ class RangeNetPPRosNode
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;
   ros::Subscriber sub_;
+  ros::Subscriber odom_sub_;
   ros::Publisher pub_;
   ros::WallTimer diagnostic_timer_;
   std::unique_ptr<cl::Net> net_;
@@ -840,18 +1066,23 @@ class RangeNetPPRosNode
   std::vector<std::string> intensity_field_candidates_{"intensity", "reflectivity", "remission"};
   std::string input_topic_;
   std::string output_topic_;
+  std::string odom_topic_;
+  std::string map_frame_ = "camera_init";
   std::string model_dir_;
   std::string backend_;
+  bool input_cloud_in_map_frame_ = false;
+  bool output_cloud_in_map_frame_ = false;
+  bool restamp_output_with_receipt_time_ = true;
   bool verbose_ = false;
   bool require_intensity_ = false;
   int subscriber_queue_size_ = 1;
   int point_stride_ = 1;
-  int max_points_ = 120000;
+  int max_points_ = 180000;
   int publish_every_n_ = 1;
   double min_range_m_ = 0.3;
-  double max_range_m_ = 120.0;
+  double max_range_m_ = 220.0;
   double min_pitch_deg_ = -25.0;
-  double max_pitch_deg_ = 3.0;
+  double max_pitch_deg_ = 15.0;
   double min_inference_interval_sec_ = 0.0;
   double intensity_scale_ = 255.0;
   double geometry_grid_resolution_ = 0.6;
@@ -865,7 +1096,7 @@ class RangeNetPPRosNode
   double min_range2_ = 0.09;
   double max_range2_ = 14400.0;
   double min_pitch_rad_ = -25.0 * M_PI / 180.0;
-  double max_pitch_rad_ = 3.0 * M_PI / 180.0;
+  double max_pitch_rad_ = 15.0 * M_PI / 180.0;
   double default_intensity_ = 0.0;
   bool enable_pitch_filter_ = true;
   bool preserve_out_of_fov_points_ = true;
@@ -873,6 +1104,9 @@ class RangeNetPPRosNode
   bool enable_geometry_refinement_ = true;
   int structure_min_points_ = 5;
   double T_body_lidar_[16] = {0.0};
+  Mat4 latest_T_map_body_ = identityMatrix();
+  ros::Time latest_odom_stamp_;
+  bool have_odom_ = false;
   uint64_t frame_count_ = 0;
   uint64_t input_msg_count_ = 0;
   uint64_t output_msg_count_ = 0;
@@ -880,6 +1114,7 @@ class RangeNetPPRosNode
   ros::WallTime last_output_wall_;
   ros::WallTime last_inference_wall_;
   std::mutex inference_mutex_;
+  std::mutex odom_mutex_;
 };
 
 int main(int argc, char** argv)

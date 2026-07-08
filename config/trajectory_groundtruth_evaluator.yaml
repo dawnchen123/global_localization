@@ -52,4 +52,4 @@ publish_paths: true
 max_path_points: 20000
 
 record_csv: true
-record_dir: /tmp/trajectory_eval
+record_dir: /home/dawn/tmp/trajectory_eval

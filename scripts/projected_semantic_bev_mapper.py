@@ -177,6 +177,9 @@ class ProjectedSemanticBEVMapper(object):
         self.semantic_cloud_frame = rospy.get_param("~semantic_cloud_frame", "camera_init")
         self.publish_projected_points = bool(rospy.get_param("~publish_projected_points", True))
         self.projected_points_topic = rospy.get_param("~projected_points_topic", "/sam3/projected_semantic_points")
+        self.publish_lidar_frame_projected_points = bool(rospy.get_param("~publish_lidar_frame_projected_points", False))
+        self.lidar_frame_projected_points_topic = rospy.get_param(
+            "~lidar_frame_projected_points_topic", "/sam3/projected_semantic_points_lidar")
         self.semantic_cloud_output_label_mode = rospy.get_param("~semantic_cloud_output_label_mode", "sam3").strip().lower()
         if self.semantic_cloud_output_label_mode not in ("sam3", "internal"):
             rospy.logwarn("unknown semantic_cloud_output_label_mode=%s, fallback to sam3",
@@ -213,6 +216,7 @@ class ProjectedSemanticBEVMapper(object):
         self.semantic_cloud_pub = rospy.Publisher(self.semantic_cloud_topic, PointCloud2, queue_size=1)
         self.semantic_cloud_stats_pub = rospy.Publisher(rospy.get_param("~semantic_cloud_stats_topic", "/semantic_cloud_map/stats"), String, queue_size=1)
         self.projected_points_pub = rospy.Publisher(self.projected_points_topic, PointCloud2, queue_size=1)
+        self.lidar_frame_projected_points_pub = rospy.Publisher(self.lidar_frame_projected_points_topic, PointCloud2, queue_size=1)
 
         self.semantic_batches = deque()  # list of dict: {time, pts_map, labels, weights}
         self.latest_T_map_body = np.eye(4)
@@ -221,9 +225,10 @@ class ProjectedSemanticBEVMapper(object):
         self.last_queue_wait_log = 0.0
 
         rospy.Timer(rospy.Duration(0.2), self.timer_cb)
-        rospy.loginfo("v29 projected_semantic_bev_mapper started queue=%s projected_points=%s semantic_cloud=%s voxel=%.2fm output_label_mode=%s",
+        rospy.loginfo("v30 projected_semantic_bev_mapper started queue=%s projected_points=%s semantic_cloud=%s voxel=%.2fm output_label_mode=%s lidar_debug=%s",
                       str(self.queue_dir), self.projected_points_topic, self.semantic_cloud_topic,
-                      self.semantic_cloud_voxel_size, self.semantic_cloud_output_label_mode)
+                      self.semantic_cloud_voxel_size, self.semantic_cloud_output_label_mode,
+                      self.lidar_frame_projected_points_topic if self.publish_lidar_frame_projected_points else "disabled")
 
     def read_result(self, result_path):
         with open(str(result_path), "r") as f:
@@ -531,22 +536,49 @@ class ProjectedSemanticBEVMapper(object):
         data = np.load(str(cloud_path))
         xyz = data["xyz"].astype(np.float64)
         K = data["K"].astype(np.float64)
+        cloud_in_map_frame = bool(meta.get("cloud_in_map_frame", False))
+        if not cloud_in_map_frame and "cloud_in_map_frame" in data.files:
+            try:
+                cloud_in_map_frame = bool(data["cloud_in_map_frame"])
+            except Exception:
+                cloud_in_map_frame = False
+        odom_diag = meta.get("odom_diag", {}) or {}
+        receipt_age = odom_diag.get("odom_receipt_age_sec", None)
+        if receipt_age is not None and abs(float(receipt_age)) > 0.50:
+            rospy.logwarn_throttle(
+                2.0,
+                "SAM3 projected mapper is using an old odom for id=%s: receipt_age=%.3fs stamp_dt=%.3fs. "
+                "Map-frame semantic points can look rotated/scattered.",
+                req_id, float(receipt_age), float(odom_diag.get("odom_stamp_dt", 0.0)))
         T_map_body = np.asarray(meta["T_map_body"], dtype=np.float64).reshape(4, 4)
         self.latest_T_map_body = T_map_body.copy()
         T_map_lidar = T_map_body.dot(self.T_body_lidar)
 
-        # p_cam = T_cam_lidar * p_lidar
+        # RangeNet/SAM3 can now consume FAST-LIVO2 /cloud_registered. Those points
+        # are already in map/camera_init, so project by first converting them back
+        # to the current LiDAR frame; publish/fuse them in their original map frame.
         n = xyz.shape[0]
         xyz_h = np.ones((n, 4), dtype=np.float64)
         xyz_h[:, :3] = xyz
-        p_cam = (self.T_cam_lidar.dot(xyz_h.T)).T[:, :3]
+        if cloud_in_map_frame:
+            T_lidar_map = np.linalg.inv(T_map_lidar)
+            xyz_lidar = (T_lidar_map.dot(xyz_h.T)).T[:, :3]
+            xyz_lidar_h = np.ones((n, 4), dtype=np.float64)
+            xyz_lidar_h[:, :3] = xyz_lidar
+            pts_map_all = xyz.astype(np.float32)
+        else:
+            xyz_lidar = xyz
+            xyz_lidar_h = xyz_h
+            pts_map_all = (T_map_lidar.dot(xyz_h.T)).T[:, :3].astype(np.float32)
+
+        # p_cam = T_cam_lidar * p_lidar
+        p_cam = (self.T_cam_lidar.dot(xyz_lidar_h.T)).T[:, :3]
         z = p_cam[:, 2]
         valid = z > self.min_project_depth_m
         if valid.sum() < 50:
             raise RuntimeError("too few points in front of camera. Check T_cam_lidar direction/order.")
 
         p_cam_v = p_cam[valid]
-        xyz_h_v = xyz_h[valid]
 
         h, w = label_img.shape[:2]
         D = data["D"].astype(np.float64) if "D" in data.files else np.zeros((0,), dtype=np.float64)
@@ -634,8 +666,8 @@ class ProjectedSemanticBEVMapper(object):
         depth_score_sem = depth_score_inside[sem_mask].astype(np.float32) if depth_score_inside is not None else np.ones(labels.shape, dtype=np.float32)
         range_score_sem = range_score_inside[sem_mask].astype(np.float32) if range_score_inside is not None else np.ones(labels.shape, dtype=np.float32)
 
-        pts_map_all = (T_map_lidar.dot(xyz_h.T)).T[:, :3].astype(np.float32)
         pts_map = pts_map_all[sem_orig_idx]
+        pts_lidar = xyz_lidar[sem_orig_idx].astype(np.float32)
 
         grid_stats = self.build_lidar_grid_stats(pts_map_all)
         geom_score, geom_keep, geom_info = self.semantic_geometry_scores(pts_map, labels, grid_stats)
@@ -644,6 +676,7 @@ class ProjectedSemanticBEVMapper(object):
         labels = labels[geom_keep]
         instance_ids = instance_ids[geom_keep]
         pts_map = pts_map[geom_keep]
+        pts_lidar = pts_lidar[geom_keep]
         support_sem = support_sem[geom_keep]
         depth_score_sem = depth_score_sem[geom_keep]
         range_score_sem = range_score_sem[geom_keep]
@@ -669,6 +702,13 @@ class ProjectedSemanticBEVMapper(object):
             confidence = np.clip(weights, 0.05, 1.0).astype(np.float32)
             msg = self.semantic_points_to_msg(pts_map, labels, confidence, msg_stamp, instance_ids)
             self.projected_points_pub.publish(msg)
+            if self.publish_lidar_frame_projected_points:
+                lidar_frame = "current_lidar" if cloud_in_map_frame else meta.get("lidar_frame_id", "")
+                if not lidar_frame:
+                    lidar_frame = "lidar"
+                lidar_msg = self.semantic_points_to_msg(
+                    pts_lidar, labels, confidence, msg_stamp, instance_ids, frame_id=lidar_frame)
+                self.lidar_frame_projected_points_pub.publish(lidar_msg)
 
         self.semantic_batches.append({"time": t, "pts": pts_map, "labels": labels, "weights": weights})
         self.trim_batches(t)
@@ -680,8 +720,9 @@ class ProjectedSemanticBEVMapper(object):
             pass
 
         counts = {int(k): int((labels == k).sum()) for k in np.unique(labels)}
-        rospy.loginfo("semantic projected id=%s raw_pts=%d in_img=%d sem_pts=%d refined=%d counts=%s geom=%s",
-                      req_id, n, int(inside.sum()), int(sem_mask.sum()), int(labels.shape[0]), counts, geom_info)
+        rospy.loginfo("semantic projected id=%s raw_pts=%d in_img=%d sem_pts=%d refined=%d cloud_frame=%s counts=%s geom=%s",
+                      req_id, n, int(inside.sum()), int(sem_mask.sum()), int(labels.shape[0]),
+                      "map" if cloud_in_map_frame else "lidar", counts, geom_info)
 
     def trim_batches(self, current_t):
         while self.semantic_batches and current_t - self.semantic_batches[0]["time"] > self.accumulation_window_sec:
@@ -768,7 +809,7 @@ class ProjectedSemanticBEVMapper(object):
             "counts": counts,
         }
 
-    def semantic_points_to_msg(self, pts, labels, confidence, stamp, instance_ids=None):
+    def semantic_points_to_msg(self, pts, labels, confidence, stamp, instance_ids=None, frame_id=None):
         if self.semantic_cloud_output_label_mode == "internal":
             labels_msg = np.zeros_like(labels, dtype=np.uint32)
             for sam3_label, internal_label in SAM3_TO_INTERNAL_LABEL.items():
@@ -804,7 +845,7 @@ class ProjectedSemanticBEVMapper(object):
             arr["instance_id"] = instance_ids
 
         msg = PointCloud2()
-        msg.header = Header(stamp=stamp, frame_id=self.semantic_cloud_frame)
+        msg.header = Header(stamp=stamp, frame_id=frame_id or self.semantic_cloud_frame)
         msg.height = 1
         msg.width = n
         fields = [
@@ -1113,10 +1154,18 @@ class ProjectedSemanticBEVMapper(object):
                 pending = len(list((self.queue_dir / "input").glob("ready_*.json")))
                 segmented = len(list((self.queue_dir / "segmented").glob("ready_*.json")))
                 failed = len(list((self.queue_dir / "failed_sam3").glob("ready_*.json")))
-                rospy.logwarn(
-                    "semantic mapper waiting for SAM3 results: output/result_*.json=0 input_ready=%d segmented=%d failed_sam3=%d. "
-                    "Start sam3_image_mask_service.py in the sam3 environment.",
-                    pending, segmented, failed)
+                if pending > 0 or segmented > 0:
+                    rospy.logwarn(
+                        "semantic mapper has no completed SAM3 result right now: output/result_*.json=0 "
+                        "input_ready=%d segmented=%d failed_sam3=%d. SAM3 is slower than the exporter or is still "
+                        "processing backlog; this is normal while the queue drains.",
+                        pending, segmented, failed)
+                else:
+                    rospy.logwarn(
+                        "semantic mapper waiting for SAM3 results: output/result_*.json=0 "
+                        "input_ready=%d segmented=%d failed_sam3=%d. Start camera_lidar_queue_exporter and "
+                        "sam3_image_mask_service.py in the sam3 environment.",
+                        pending, segmented, failed)
                 self.last_queue_wait_log = now_log
         for rp in results[:5]:
             try:
