@@ -29,6 +29,10 @@ struct SparseVisualMapOptions
   double cy = 624.6878;
   std::array<double, 5> distortion{{-0.1516, 0.0942, 0.000169,
                                     -0.000142, -0.0229}};
+  // Set only for raw radial-tangential images.  The street00 compressed
+  // stream is rectified upstream, so applying the calibration a second time
+  // would bias both landmark seeding and the direct-pose Jacobian.
+  bool apply_distortion = false;
   Eigen::Matrix3d body_from_camera_rotation = Eigen::Matrix3d::Identity();
   Eigen::Vector3d body_from_camera_translation = Eigen::Vector3d::Zero();
   double image_scale = 0.5;

@@ -52,6 +52,9 @@ int main()
   options.ground_min_points = 1;
   options.max_features_per_keyframe = 5000;
   options.loop_min_index_gap = 3;
+  options.loop_min_time_separation_sec = 0.0;
+  options.loop_min_support = 1;
+  options.loop_minimum_interval_sec = 0.0;
   options.loop_search_radius = 8.0;
   options.loop_max_candidates = 3;
   options.descriptor_min_similarity = 0.05;
@@ -76,9 +79,17 @@ int main()
   options.enable_visual_loop_factors = true;
   options.visual_loop_max_time_offset = 0.1;
   options.visual_loop_min_index_gap = 3;
+  options.visual_loop_min_time_separation_sec = 0.0;
   options.visual_loop_min_quality = 0.4;
   options.visual_loop_max_translation_disagreement = 3.0;
   options.visual_loop_max_rotation_disagreement_deg = 8.0;
+  options.visual_loop_refine_z_with_ground = true;
+  options.visual_loop_ground_z_candidate_residual_gate = 1.0;
+  options.visual_loop_ground_z_inlier_residual_gate = 0.12;
+  options.visual_loop_ground_z_min_inliers = 20;
+  options.visual_loop_ground_z_max_mad = 0.08;
+  options.visual_loop_ground_z_max_correction = 1.0;
+  options.visual_loop_ground_z_sigma = 0.10;
   options.semantic_submap_observations = 1;
   options.semantic_observation_min_index_gap = 1;
   options.semantic_observation_max_index_gap = 1;
@@ -149,8 +160,8 @@ int main()
     }
   }
 
-  if (!graph.addVisualLoopConstraint(
-          0.0, 4.0, truth.front().inverse() * truth.back(), 0.90))
+  const Eigen::Isometry3d biased_visual_loop = pose(0.0, 0.0, 0.60, 0.0);
+  if (!graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.90))
   {
     std::cerr << "failed to add synthetic non-adjacent visual loop\n";
     return 10;
@@ -172,6 +183,106 @@ int main()
               << stats.visual_loop_rejections << " factors="
               << stats.visual_loop_factors << '\n';
     return 11;
+  }
+  if (stats.visual_loop_ground_z_refinements != 1 ||
+      std::abs(stats.last_visual_loop_ground_z_correction + 0.60) > 0.05 ||
+      stats.last_visual_loop_ground_z_inliers < 20 ||
+      !stats.last_visual_loop_ground_z_accepted ||
+      !stats.last_visual_loop_z_constrained ||
+      stats.visual_loop_z_without_ground_suppressed != 0)
+  {
+    std::cerr << "visual loop ground-Z refinement regression: refinements="
+              << stats.visual_loop_ground_z_refinements << " correction="
+              << stats.last_visual_loop_ground_z_correction << " inliers="
+              << stats.last_visual_loop_ground_z_inliers << '\n';
+    return 12;
+  }
+
+  hybrid_localization::SemanticPoseGraphOptions visual_only_options = options;
+  visual_only_options.enable_xy_loops = false;
+  visual_only_options.enable_z_loops = false;
+  visual_only_options.visual_loop_require_lidar_geometry = false;
+  visual_only_options.visual_loop_refine_z_with_ground = false;
+  visual_only_options.visual_loop_allow_pnp_z_without_ground = false;
+  hybrid_localization::SemanticPoseGraph visual_only_graph(visual_only_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!visual_only_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add visual-only regression keyframe " << i << '\n';
+      return 13;
+    }
+  }
+  if (!visual_only_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.90))
+  {
+    std::cerr << "failed to add visual-only regression loop\n";
+    return 14;
+  }
+  if (visual_only_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.90))
+  {
+    std::cerr << "visual loop factor limit regression\n";
+    return 15;
+  }
+  const hybrid_localization::SemanticPoseGraphStats visual_only_stats =
+      visual_only_graph.stats();
+  if (visual_only_stats.last_visual_loop_ground_z_accepted ||
+      visual_only_stats.last_visual_loop_z_constrained ||
+      visual_only_stats.visual_loop_z_without_ground_suppressed != 1 ||
+      visual_only_stats.visual_loop_factors != 1 ||
+      visual_only_stats.visual_loop_factor_limit_rejections != 1)
+  {
+    std::cerr << "visual-only Z suppression regression: accepted="
+              << visual_only_stats.last_visual_loop_ground_z_accepted
+              << " constrained=" << visual_only_stats.last_visual_loop_z_constrained
+              << " suppressed=" << visual_only_stats.visual_loop_z_without_ground_suppressed
+              << '\n';
+    return 16;
+  }
+
+  // A sub-threshold PnP quality is admissible only when an independent
+  // LiDAR structural registration validates the same non-adjacent pair.
+  hybrid_localization::SemanticPoseGraphOptions lidar_validated_options = options;
+  lidar_validated_options.enable_xy_loops = false;
+  lidar_validated_options.enable_z_loops = false;
+  lidar_validated_options.visual_loop_require_lidar_geometry = true;
+  lidar_validated_options.visual_loop_min_quality = 0.85;
+  lidar_validated_options.visual_loop_min_quality_with_lidar_geometry = 0.55;
+  lidar_validated_options.visual_loop_lidar_max_pnp_xy_disagreement = 0.50;
+  lidar_validated_options.visual_loop_lidar_max_pnp_yaw_disagreement_deg = 2.0;
+  hybrid_localization::SemanticPoseGraph lidar_validated_graph(lidar_validated_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!lidar_validated_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add LiDAR-validated regression keyframe " << i << '\n';
+      return 17;
+    }
+  }
+  if (!lidar_validated_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.60))
+  {
+    std::cerr << "failed to add LiDAR-validated visual loop\n";
+    return 18;
+  }
+  const hybrid_localization::SemanticPoseGraphStats lidar_validated_stats =
+      lidar_validated_graph.stats();
+  if (lidar_validated_stats.visual_loop_lidar_geometry_validations != 1 ||
+      lidar_validated_stats.visual_loop_lidar_geometry_rejections != 0 ||
+      !lidar_validated_stats.last_visual_loop_lidar_accepted ||
+      lidar_validated_stats.last_visual_loop_lidar_inliers < 25 ||
+      lidar_validated_stats.visual_loop_factors != 1)
+  {
+    std::cerr << "LiDAR-validated visual loop regression: checks="
+              << lidar_validated_stats.visual_loop_lidar_geometry_validations
+              << " rejected=" << lidar_validated_stats.visual_loop_lidar_geometry_rejections
+              << " inliers=" << lidar_validated_stats.last_visual_loop_lidar_inliers
+              << " factors=" << lidar_validated_stats.visual_loop_factors << '\n';
+    return 19;
   }
   if (stats.semantic_observation_factors < 1 ||
       stats.semantic_observation_xy_factors < 1)

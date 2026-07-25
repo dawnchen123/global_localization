@@ -100,7 +100,19 @@ struct SemanticPoseGraphOptions
   double semantic_observation_huber_k = 1.345;
 
   int loop_min_index_gap = 30;
+  // A geometric descriptor match is only a loop candidate after this true
+  // temporal separation. This prevents adjacent passes over a repetitive
+  // streetscape from becoming correlated global constraints.
+  double loop_min_time_separation_sec = 90.0;
   int loop_max_candidates = 6;
+  // Several adjacent keyframes must reproduce the same reference neighborhood
+  // before a single geometric loop factor reaches iSAM.
+  int loop_min_support = 3;
+  int loop_support_reference_neighborhood = 12;
+  int loop_support_current_max_gap = 5;
+  double loop_minimum_interval_sec = 120.0;
+  int loop_max_factors = 4;
+  bool loop_require_xy_for_z = true;
   double loop_search_radius = 18.0;
   double loop_max_yaw_difference_deg = 35.0;
   double coarse_xy_radius = 5.0;
@@ -169,15 +181,46 @@ struct SemanticPoseGraphOptions
 
   double visual_loop_max_time_offset = 0.65;
   int visual_loop_min_index_gap = 20;
+  double visual_loop_min_time_separation_sec = 45.0;
   double visual_loop_min_quality = 0.40;
+  // A visual loop can use a lower PnP quality threshold only after an
+  // independent LiDAR structural registration verifies the same keyframe pair.
+  // This keeps image retrieval as a proposal mechanism rather than a direct
+  // global pose measurement.
+  bool visual_loop_require_lidar_geometry = false;
+  double visual_loop_min_quality_with_lidar_geometry = 0.55;
+  double visual_loop_lidar_max_pnp_xy_disagreement = 1.20;
+  double visual_loop_lidar_max_pnp_yaw_disagreement_deg = 3.0;
   double visual_loop_max_translation_disagreement = 3.0;
   double visual_loop_max_rotation_disagreement_deg = 10.0;
+  // A loop event spans neighboring keyframes. Insert one independent factor
+  // per event instead of accumulating highly correlated PnP constraints.
+  double visual_loop_minimum_interval_sec = 180.0;
+  int visual_loop_reference_neighborhood = 16;
+  int visual_loop_max_factors = 1;
   double visual_loop_sigma_roll_pitch_deg = 2.0;
   double visual_loop_sigma_yaw_deg = 1.0;
   double visual_loop_sigma_xy = 0.25;
   double visual_loop_sigma_z = 0.35;
   double visual_loop_quality_sigma_scale = 1.5;
   double visual_loop_huber_k = 1.345;
+  // Gravity comes from the LiDAR/IMU frontend. A monocular PnP loop may
+  // validate yaw and translation while still having biased roll/pitch, so it
+  // does not constrain those axes unless this is explicitly requested.
+  bool visual_loop_constrain_roll_pitch = false;
+  // Refine the visual PnP loop's height from mutually matched LiDAR ground
+  // features. This path is evaluated only after the visual loop has passed
+  // descriptor, PnP and pose-consistency gates.
+  bool visual_loop_refine_z_with_ground = true;
+  // Do not let a visual-only depth estimate pull the vertical graph when the
+  // independent ground correspondence test is unavailable or rejected.
+  bool visual_loop_allow_pnp_z_without_ground = false;
+  double visual_loop_ground_z_candidate_residual_gate = 1.50;
+  double visual_loop_ground_z_inlier_residual_gate = 0.16;
+  int visual_loop_ground_z_min_inliers = 70;
+  double visual_loop_ground_z_max_mad = 0.08;
+  double visual_loop_ground_z_max_correction = 1.50;
+  double visual_loop_ground_z_sigma = 0.15;
 
   double isam_relinearize_threshold = 0.05;
   int isam_relinearize_skip = 1;
@@ -241,9 +284,28 @@ struct SemanticPoseGraphStats
   int visual_loop_attempts = 0;
   int visual_loop_rejections = 0;
   int visual_loop_factors = 0;
+  int visual_loop_ground_z_refinements = 0;
+  int visual_loop_cooldown_rejections = 0;
+  int visual_loop_factor_limit_rejections = 0;
+  int visual_loop_z_without_ground_suppressed = 0;
+  int visual_loop_lidar_geometry_validations = 0;
+  int visual_loop_lidar_geometry_rejections = 0;
+  int last_visual_loop_ground_z_candidates = 0;
+  int last_visual_loop_ground_z_inliers = 0;
+  int last_visual_loop_lidar_candidates = 0;
+  int last_visual_loop_lidar_inliers = 0;
+  bool last_visual_loop_ground_z_accepted = false;
+  bool last_visual_loop_z_constrained = false;
+  bool last_visual_loop_lidar_accepted = false;
   int loop_attempts = 0;
   int loop_rejections = 0;
   int loop_factors = 0;
+  int loop_support_confirmations = 0;
+  int loop_cooldown_rejections = 0;
+  int loop_factor_limit_rejections = 0;
+  int last_loop_support = 0;
+  int last_loop_reference_id = -1;
+  int last_loop_current_id = -1;
   int xy_loop_factors = 0;
   int z_loop_factors = 0;
   int semantic_keyframes = 0;
@@ -271,6 +333,11 @@ struct SemanticPoseGraphStats
   double last_semantic_yaw_correction_deg = 0.0;
   double last_semantic_z_median = 0.0;
   double last_semantic_z_mad = 0.0;
+  double last_visual_loop_ground_z_correction = 0.0;
+  double last_visual_loop_ground_z_mad = 0.0;
+  double last_visual_loop_lidar_rmse = 0.0;
+  double last_visual_loop_lidar_spread = 0.0;
+  double last_loop_time_separation_sec = 0.0;
   double last_optimization_ms = 0.0;
 };
 

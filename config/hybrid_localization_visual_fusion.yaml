@@ -1,0 +1,116 @@
+# Conservative runtime profile for the LiDAR-depth direct visual ESKF. It is
+# loaded only when visual_fusion_profile:=true is passed to a sensor launch.
+# The defaults keep the diagnostic/observation-only behavior unchanged.
+
+measurement_scheduler:
+  # Four image updates per second retain temporal coverage without starving the
+  # point-to-plane frontend on the street00 replay.
+  camera_observation_interval_sec: 0.25
+  max_events_per_tick: 3
+  max_queue: 500
+
+# Long-baseline retrieval remains independent from the high-rate direct ESKF.
+# Raw yaw is not a reliable loop cue on a return pass, while the later PnP,
+# coverage and pose-consistency gates remain mandatory.
+visual_loop:
+  minimum_time_separation_sec: 90.0
+  search_radius: 40.0
+  maximum_yaw_difference_deg: 180.0
+  maximum_retrieval_candidates: 60
+  maximum_geometric_candidates: 8
+
+visual_frontend:
+  enabled: true
+  observation_only: false
+  update_interval_sec: 0.25
+  # Require a spatially distributed, high-consistency direct alignment before
+  # allowing an image measurement to change the 18-state ESKF.
+  min_landmarks: 45
+  min_residuals: 1000
+  minimum_ncc: 0.78
+  min_mean_ncc: 0.82
+  max_rmse: 0.65
+  max_translation_step: 0.10
+  max_rotation_step_deg: 1.0
+  eskf_max_iterations: 4
+  solver_damping: 0.000001
+
+graph:
+  # The generic LiDAR geometry loop remains experimental. On street00, even
+  # multi-frame candidates can be correlated by repeated streetscape geometry,
+  # so it is not allowed to alter the default trajectory until independently
+  # validated for a dataset.
+  enable_xy_loops: false
+  enable_z_loops: false
+  enable_sequential_ground_z: false
+  loop_min_index_gap: 80
+  loop_min_time_separation_sec: 180.0
+  loop_max_candidates: 8
+  loop_min_support: 3
+  loop_support_reference_neighborhood: 16
+  loop_support_current_max_gap: 5
+  loop_minimum_interval_sec: 180.0
+  loop_max_factors: 3
+  loop_require_xy_for_z: true
+  loop_search_radius: 35.0
+  loop_max_yaw_difference_deg: 180.0
+  max_xy_correction: 1.50
+  max_yaw_correction_deg: 3.0
+  z_candidate_residual_gate: 1.50
+  z_inlier_residual_gate: 0.16
+  min_z_inliers: 70
+  max_z_mad: 0.08
+  max_z_correction: 1.50
+  graph_consistency_max_xy: 1.50
+  graph_consistency_max_yaw_deg: 3.0
+  graph_consistency_max_z: 1.50
+  sequential_ground_sigma_z: 0.10
+
+  # KLT/PnP remains a diagnostic observation by default. On street00, adding
+  # every short-baseline PnP rotation to iSAM accumulated correlated yaw bias.
+  # The LiDAR-depth direct ESKF is the only short-baseline visual fusion path.
+  # Set this true explicitly only for a controlled graph-factor experiment.
+  enable_visual_rotation_factors: false
+  enable_visual_translation_factors: false
+  visual_max_angular_disagreement_deg: 3.0
+  visual_sigma_roll_pitch_deg: 0.90
+  visual_sigma_yaw_deg: 0.65
+  visual_huber_k: 1.8
+
+  # PnP proposes a loop, but the graph only consumes its independently
+  # validated LiDAR structural registration. This permits a moderate PnP score
+  # while retaining mutual-NN, RANSAC and Huber as the decisive gate.
+  enable_visual_loop_factors: true
+  visual_loop_sigma_roll_pitch_deg: 1.0
+  visual_loop_sigma_yaw_deg: 0.55
+  visual_loop_sigma_xy: 0.15
+  visual_loop_sigma_z: 0.25
+  visual_loop_quality_sigma_scale: 0.75
+  visual_loop_huber_k: 3.0
+  visual_loop_min_time_separation_sec: 90.0
+  visual_loop_min_quality: 0.65
+  visual_loop_require_lidar_geometry: true
+  visual_loop_min_quality_with_lidar_geometry: 0.55
+  visual_loop_lidar_max_pnp_xy_disagreement: 1.20
+  visual_loop_lidar_max_pnp_yaw_disagreement_deg: 3.0
+  visual_loop_minimum_interval_sec: 180.0
+  visual_loop_reference_neighborhood: 16
+  visual_loop_max_factors: 1
+  visual_loop_constrain_roll_pitch: false
+  visual_loop_refine_z_with_ground: true
+  visual_loop_allow_pnp_z_without_ground: false
+  visual_loop_ground_z_candidate_residual_gate: 1.50
+  visual_loop_ground_z_inlier_residual_gate: 0.16
+  visual_loop_ground_z_min_inliers: 70
+  visual_loop_ground_z_max_mad: 0.08
+  visual_loop_ground_z_max_correction: 1.50
+  visual_loop_ground_z_sigma: 0.12
+
+  # Frontend scan-match errors are temporally correlated. These graph sigmas
+  # prevent a long chain of locally confident edges from overwhelming a
+  # verified loop closure.
+  odom_sigma_roll_pitch: 0.012
+  odom_sigma_yaw: 0.010
+  odom_sigma_xy_base: 0.050
+  odom_sigma_xy_per_meter: 0.015
+  odom_sigma_z_base: 0.060

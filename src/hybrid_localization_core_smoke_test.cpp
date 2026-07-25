@@ -166,10 +166,39 @@ int main()
   }
   const LidarOdometryResult second_scan = lidar_odometry.processScan(second_body_points, 1.1);
   assert(second_scan.accepted);
+  assert(second_scan.observable_directions >= 3);
+  assert(std::isfinite(second_scan.mean_normalized_residual));
+  assert(std::isfinite(second_scan.measurement_condition));
   const Eigen::Matrix<double, 6, 1> registration_error =
       logSE3(expected_pose.inverse() * second_scan.pose);
   assert(registration_error.head<3>().norm() < 0.03);
   assert(registration_error.tail<3>().norm() < 0.10);
+
+  // A single horizontal plane only observes roll, pitch, and height. The
+  // scan update must expose that degeneracy rather than reporting a fully
+  // constrained six-DoF registration.
+  PointVector planar_points;
+  for (int ix = -25; ix <= 25; ++ix)
+  {
+    for (int iy = -25; iy <= 25; ++iy)
+    {
+      planar_points.emplace_back(0.20 * ix, 0.20 * iy, 0.0);
+    }
+  }
+  LidarOdometryOptions planar_options = odometry_options;
+  planar_options.min_observable_directions = 3;
+  planar_options.map_insertion_min_observable_directions = 3;
+  planar_options.max_mean_normalized_residual = 5.0;
+  planar_options.map_insertion_max_mean_normalized_residual = 5.0;
+  LidarOdometry planar_odometry(planar_options);
+  assert(planar_odometry.processScan(planar_points, 1.5).accepted);
+  const LidarOdometryResult planar_scan =
+      planar_odometry.processScan(planar_points, 1.6);
+  assert(planar_scan.accepted);
+  assert(planar_scan.degenerate);
+  assert(planar_scan.observable_directions >= 3);
+  assert(planar_scan.observable_directions < 6);
+  assert(std::isfinite(planar_scan.mean_normalized_residual));
 
   // Exercise the FAST-LIO-style sample KNN plane path used as a fallback in
   // sparse parts of the rolling voxel map.
@@ -326,6 +355,10 @@ int main()
   loss_options.lidar_loss_max_horizontal_speed = 1.0;
   loss_options.lidar_loss_max_horizontal_step = 0.10;
   loss_options.lidar_loss_velocity_decay = 0.95;
+  loss_options.strong_support_min_correspondences = 100;
+  loss_options.strong_support_min_azimuth_sectors = 1;
+  loss_options.strong_support_max_rmse = 0.50;
+  loss_options.recovery_map_insert_min_consecutive_strong_support = 2;
   LidarOdometry loss_odometry(loss_options);
   for (int index = 0; index <= 400; ++index)
   {
@@ -365,6 +398,35 @@ int main()
   assert(loss_result.consecutive_rejections >= 3);
   assert((loss_result.pose.translation() - loss_reference_position).norm() < 1e-9);
   assert(std::abs(loss_result.velocity.z()) < 1e-9);
+
+  // Recovery matches can be geometrically plausible before the vehicle has
+  // re-entered stable support. They may update the state, but must not seed a
+  // new local map until enough consecutive strong scans confirm the recovery.
+  for (int frame = 1; frame <= 2; ++frame)
+  {
+    for (int substep = 1; substep <= 20; ++substep)
+    {
+      ImuSample sample;
+      sample.stamp = 32.8 + 0.1 * static_cast<double>(frame - 1) +
+          0.005 * static_cast<double>(substep);
+      sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+      sample.angular_velocity = known_gyro_bias;
+      loss_odometry.addImuSample(sample);
+    }
+    loss_result = loss_odometry.processScan(
+        world_points, 32.8 + 0.1 * static_cast<double>(frame));
+    assert(loss_result.accepted);
+    assert(loss_result.strong_support);
+    if (frame == 1)
+    {
+      assert(!loss_result.map_updated);
+      assert(loss_result.map_update_deferred);
+    }
+    else
+    {
+      assert(loss_result.map_updated);
+    }
+  }
 
   std::cout << "hybrid_localization_core_smoke_test: PASS\n";
   return 0;

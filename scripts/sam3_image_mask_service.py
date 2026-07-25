@@ -12,8 +12,12 @@ Output queue:
   output/result_<id>.json
   output/label_<id>.png       mono8 label image: 0 unknown, 1 road, 2 building, 3 tree, 4 grass, 5 dynamic
   output/instance_<id>.png    uint16 connected-instance image, 0 unknown/no-instance
-  output/color_<id>.png       bgr color label image
-  output/debug_<id>.png
+  output/color_<id>.png       optional bgr color label image
+  output/debug_<id>.png       optional overlay image
+
+Color/debug PNGs are written only with --save_visualizations.  The mapper
+needs only label/instance images and removes consumed queue payloads when its
+cleanup_processed_queue_files parameter is enabled.
 
 This service only segments the camera image. Projection to LiDAR and BEV
 accumulation is done by projected_semantic_bev_mapper.py in ROS Python.
@@ -328,7 +332,8 @@ class Sam3ImageMaskService(object):
         for d in [self.input_dir, self.output_dir, self.failed_dir, self.done_dir, self.stale_dir]:
             d.mkdir(parents=True, exist_ok=True)
         self.sam3 = SAM3Wrapper(args)
-        print("[INFO] v23 SAM3 image mask service ready queue=%s backend=%s" % (str(self.queue_dir), args.backend))
+        print("[INFO] v24 SAM3 image mask service ready queue=%s backend=%s save_visualizations=%s" %
+              (str(self.queue_dir), args.backend, str(args.save_visualizations)))
 
     @staticmethod
     def _sanitize_session_component(value):
@@ -431,20 +436,14 @@ class Sam3ImageMaskService(object):
             raise RuntimeError("cannot read image %s" % image_path)
         label = self.segment_image(image)
         instance = self.build_instance_image(label)
-        color = colorize_label(label)
-        debug = cv2.addWeighted(image, 0.55, color, 0.45, 0.0)
         if not self.request_is_active(meta):
             self.archive_stale_request(meta_path, request_session_id, "session_changed_during_segmentation")
             return False
 
         label_path = self.output_dir / ("label_%s.png" % req_id)
         instance_path = self.output_dir / ("instance_%s.png" % req_id)
-        color_path = self.output_dir / ("color_%s.png" % req_id)
-        debug_path = self.output_dir / ("debug_%s.png" % req_id)
         label_tmp = self.output_dir / ("label_%s.tmp.png" % req_id)
         instance_tmp = self.output_dir / ("instance_%s.tmp.png" % req_id)
-        color_tmp = self.output_dir / ("color_%s.tmp.png" % req_id)
-        debug_tmp = self.output_dir / ("debug_%s.tmp.png" % req_id)
         result_tmp = self.output_dir / ("result_%s.json.tmp" % req_id)
         result_path = self.output_dir / ("result_%s.json" % req_id)
         # v25: copy request meta to output. The mapper may run after this service
@@ -456,12 +455,21 @@ class Sam3ImageMaskService(object):
             json.dump(meta, f, indent=2)
         os.replace(str(meta_copy_tmp), str(meta_copy_path))
 
-        image_outputs = (
+        image_outputs = [
             (label_tmp, label_path, label),
             (instance_tmp, instance_path, instance),
-            (color_tmp, color_path, color),
-            (debug_tmp, debug_path, debug),
-        )
+        ]
+        if self.args.save_visualizations:
+            color = colorize_label(label)
+            debug = cv2.addWeighted(image, 0.55, color, 0.45, 0.0)
+            color_path = self.output_dir / ("color_%s.png" % req_id)
+            debug_path = self.output_dir / ("debug_%s.png" % req_id)
+            color_tmp = self.output_dir / ("color_%s.tmp.png" % req_id)
+            debug_tmp = self.output_dir / ("debug_%s.tmp.png" % req_id)
+            image_outputs.extend([
+                (color_tmp, color_path, color),
+                (debug_tmp, debug_path, debug),
+            ])
         for tmp_path, final_path, image in image_outputs:
             if not cv2.imwrite(str(tmp_path), image):
                 raise RuntimeError("failed to write SAM3 output image: %s" % tmp_path)
@@ -474,8 +482,6 @@ class Sam3ImageMaskService(object):
             "original_meta_path": str(meta_path),
             "label_path": str(label_path),
             "instance_path": str(instance_path),
-            "color_path": str(color_path),
-            "debug_path": str(debug_path),
             "road_px": int((label == LABEL_ROAD).sum()),
             "building_px": int((label == LABEL_BUILDING).sum()),
             "tree_px": int((label == LABEL_TREE).sum()),
@@ -485,6 +491,9 @@ class Sam3ImageMaskService(object):
             "instances": int(instance.max()),
             "processing_sec": float(time.time() - process_start),
         }
+        if self.args.save_visualizations:
+            stats["color_path"] = str(color_path)
+            stats["debug_path"] = str(debug_path)
         with open(str(result_tmp), "w") as f:
             json.dump(stats, f, indent=2)
         os.replace(str(result_tmp), str(result_path))
@@ -528,6 +537,8 @@ def parse_args():
     p.add_argument("--min_mask_area", type=int, default=120)
     p.add_argument("--sleep_sec", type=float, default=0.2)
     p.add_argument("--max_batch", type=int, default=3)
+    p.add_argument("--save_visualizations", action="store_true",
+                   help="also save color/debug PNGs for every request; disabled by default to keep the queue bounded")
     return p.parse_args()
 
 

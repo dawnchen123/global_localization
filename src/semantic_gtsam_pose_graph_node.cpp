@@ -84,6 +84,15 @@ struct VisualCloudSample
   VisualLidarPointVector points;
 };
 
+// Semantic point clouds can be delivered before their frontend odometry on a
+// separate ROS connection. Keep the source timestamp with the message so the
+// graph can associate it deterministically once odometry catches up.
+struct PendingSemanticCloud
+{
+  double stamp = 0.0;
+  sensor_msgs::PointCloud2ConstPtr message;
+};
+
 Eigen::Isometry3d poseFromMessage(const geometry_msgs::Pose &message)
 {
   Eigen::Quaterniond quaternion(message.orientation.w, message.orientation.x,
@@ -112,6 +121,13 @@ geometry_msgs::Pose poseMessage(const Eigen::Isometry3d &pose)
   message.orientation.z = quaternion.z();
   message.orientation.w = quaternion.w();
   return message;
+}
+
+double rotationDegrees(const Eigen::Matrix3d &rotation)
+{
+  const double cosine = std::max(-1.0, std::min(1.0,
+      0.5 * (rotation.trace() - 1.0)));
+  return std::acos(cosine) * 180.0 / std::acos(-1.0);
 }
 
 sensor_msgs::Image imageMessage(const cv::Mat &image, double stamp,
@@ -384,6 +400,7 @@ private:
                                    "/hybrid/semantic_cloud");
     private_nh_.param<std::string>("wheel_topic", wheel_topic_,
                                    "/insprobe/ranger/odometer");
+    private_nh_.param("wheel_time_offset", wheel_time_offset_, 0.0);
     private_nh_.param<std::string>("camera_topic", camera_topic_,
                                    "/avt_camera/left/image/compressed");
     private_nh_.param<std::string>("output_odom_topic", output_odom_topic_,
@@ -437,6 +454,10 @@ private:
     private_nh_.param("max_registered_points", max_registered_points_, 8000);
     private_nh_.param("max_pending_registered_clouds",
                       max_pending_registered_clouds_, 100);
+    private_nh_.param("max_pending_semantic_clouds",
+                      max_pending_semantic_clouds_, 240);
+    private_nh_.param("max_semantic_process_per_tick",
+                      max_semantic_process_per_tick_, 2);
     private_nh_.param("max_semantic_points", max_semantic_points_, 6000);
     private_nh_.param("max_debug_pairs", max_debug_pairs_, 500);
     private_nh_.param("path_publish_rate", path_publish_rate_, 0.5);
@@ -446,6 +467,9 @@ private:
     private_nh_.param("semantic_map_publish_rate", semantic_map_publish_rate_, 0.20);
     private_nh_.param("semantic_map_voxel_size", semantic_map_voxel_size_, 0.30);
     private_nh_.param("semantic_map_max_points", semantic_map_max_points_, 120000);
+
+    max_pending_semantic_clouds_ = std::max(1, max_pending_semantic_clouds_);
+    max_semantic_process_per_tick_ = std::max(1, max_semantic_process_per_tick_);
 
     private_nh_.param("graph/enabled", options_.enabled, true);
     private_nh_.param("graph/enable_xy_loops", options_.enable_xy_loops, false);
@@ -538,7 +562,18 @@ private:
     private_nh_.param("graph/semantic_observation_huber_k",
                       options_.semantic_observation_huber_k, 1.345);
     private_nh_.param("graph/loop_min_index_gap", options_.loop_min_index_gap, 30);
+    private_nh_.param("graph/loop_min_time_separation_sec",
+                      options_.loop_min_time_separation_sec, 90.0);
     private_nh_.param("graph/loop_max_candidates", options_.loop_max_candidates, 6);
+    private_nh_.param("graph/loop_min_support", options_.loop_min_support, 3);
+    private_nh_.param("graph/loop_support_reference_neighborhood",
+                      options_.loop_support_reference_neighborhood, 12);
+    private_nh_.param("graph/loop_support_current_max_gap",
+                      options_.loop_support_current_max_gap, 5);
+    private_nh_.param("graph/loop_minimum_interval_sec",
+                      options_.loop_minimum_interval_sec, 120.0);
+    private_nh_.param("graph/loop_max_factors", options_.loop_max_factors, 4);
+    private_nh_.param("graph/loop_require_xy_for_z", options_.loop_require_xy_for_z, true);
     private_nh_.param("graph/loop_search_radius", options_.loop_search_radius, 18.0);
     private_nh_.param("graph/loop_max_yaw_difference_deg", options_.loop_max_yaw_difference_deg, 35.0);
     private_nh_.param("graph/coarse_xy_radius", options_.coarse_xy_radius, 5.0);
@@ -607,12 +642,28 @@ private:
                       options_.visual_loop_max_time_offset, 0.65);
     private_nh_.param("graph/visual_loop_min_index_gap",
                       options_.visual_loop_min_index_gap, 20);
+    private_nh_.param("graph/visual_loop_min_time_separation_sec",
+                      options_.visual_loop_min_time_separation_sec, 45.0);
     private_nh_.param("graph/visual_loop_min_quality",
                       options_.visual_loop_min_quality, 0.40);
+    private_nh_.param("graph/visual_loop_require_lidar_geometry",
+                      options_.visual_loop_require_lidar_geometry, false);
+    private_nh_.param("graph/visual_loop_min_quality_with_lidar_geometry",
+                      options_.visual_loop_min_quality_with_lidar_geometry, 0.55);
+    private_nh_.param("graph/visual_loop_lidar_max_pnp_xy_disagreement",
+                      options_.visual_loop_lidar_max_pnp_xy_disagreement, 1.20);
+    private_nh_.param("graph/visual_loop_lidar_max_pnp_yaw_disagreement_deg",
+                      options_.visual_loop_lidar_max_pnp_yaw_disagreement_deg, 3.0);
     private_nh_.param("graph/visual_loop_max_translation_disagreement",
                       options_.visual_loop_max_translation_disagreement, 3.0);
     private_nh_.param("graph/visual_loop_max_rotation_disagreement_deg",
                       options_.visual_loop_max_rotation_disagreement_deg, 10.0);
+    private_nh_.param("graph/visual_loop_minimum_interval_sec",
+                      options_.visual_loop_minimum_interval_sec, 180.0);
+    private_nh_.param("graph/visual_loop_reference_neighborhood",
+                      options_.visual_loop_reference_neighborhood, 16);
+    private_nh_.param("graph/visual_loop_max_factors",
+                      options_.visual_loop_max_factors, 1);
     private_nh_.param("graph/visual_loop_sigma_roll_pitch_deg",
                       options_.visual_loop_sigma_roll_pitch_deg, 2.0);
     private_nh_.param("graph/visual_loop_sigma_yaw_deg",
@@ -625,6 +676,24 @@ private:
                       options_.visual_loop_quality_sigma_scale, 1.5);
     private_nh_.param("graph/visual_loop_huber_k",
                       options_.visual_loop_huber_k, 1.345);
+    private_nh_.param("graph/visual_loop_constrain_roll_pitch",
+                      options_.visual_loop_constrain_roll_pitch, false);
+    private_nh_.param("graph/visual_loop_refine_z_with_ground",
+                      options_.visual_loop_refine_z_with_ground, true);
+    private_nh_.param("graph/visual_loop_allow_pnp_z_without_ground",
+                      options_.visual_loop_allow_pnp_z_without_ground, false);
+    private_nh_.param("graph/visual_loop_ground_z_candidate_residual_gate",
+                      options_.visual_loop_ground_z_candidate_residual_gate, 1.50);
+    private_nh_.param("graph/visual_loop_ground_z_inlier_residual_gate",
+                      options_.visual_loop_ground_z_inlier_residual_gate, 0.16);
+    private_nh_.param("graph/visual_loop_ground_z_min_inliers",
+                      options_.visual_loop_ground_z_min_inliers, 70);
+    private_nh_.param("graph/visual_loop_ground_z_max_mad",
+                      options_.visual_loop_ground_z_max_mad, 0.08);
+    private_nh_.param("graph/visual_loop_ground_z_max_correction",
+                      options_.visual_loop_ground_z_max_correction, 1.50);
+    private_nh_.param("graph/visual_loop_ground_z_sigma",
+                      options_.visual_loop_ground_z_sigma, 0.15);
     private_nh_.param("graph/isam_relinearize_threshold", options_.isam_relinearize_threshold, 0.05);
     private_nh_.param("graph/isam_relinearize_skip", options_.isam_relinearize_skip, 1);
 
@@ -751,6 +820,8 @@ private:
                       visual_loop_options_.keyframe_interval_sec, 1.0);
     private_nh_.param("visual_loop/minimum_index_gap",
                       visual_loop_options_.minimum_index_gap, 25);
+    private_nh_.param("visual_loop/minimum_time_separation_sec",
+                      visual_loop_options_.minimum_time_separation_sec, 45.0);
     private_nh_.param("visual_loop/search_radius",
                       visual_loop_options_.search_radius, 25.0);
     private_nh_.param("visual_loop/maximum_yaw_difference_deg",
@@ -811,6 +882,38 @@ private:
     return true;
   }
 
+  void publishCorrectedOdometry(const OdomSample &sample)
+  {
+    if (!graph_) return;
+    const Eigen::Isometry3d optimized = graph_->correctedPose(sample.pose);
+    nav_msgs::Odometry output = sample.message;
+    const ros::Time stamp = sample.message.header.stamp.isZero() ?
+        ros::Time(sample.stamp) : sample.message.header.stamp;
+    output.header.stamp = stamp;
+    output.header.frame_id = map_frame_;
+    output.child_frame_id = body_frame_;
+    output.pose.pose = poseMessage(optimized);
+    odom_pub_.publish(output);
+    last_corrected_pose_ = optimized;
+    last_stamp_ = stamp;
+    have_output_ = true;
+    if (!broadcast_tf_) return;
+
+    geometry_msgs::TransformStamped transform;
+    transform.header.stamp = stamp;
+    transform.header.frame_id = map_frame_;
+    transform.child_frame_id = body_frame_;
+    transform.transform.translation.x = optimized.translation().x();
+    transform.transform.translation.y = optimized.translation().y();
+    transform.transform.translation.z = optimized.translation().z();
+    const Eigen::Quaterniond quaternion(optimized.rotation());
+    transform.transform.rotation.x = quaternion.x();
+    transform.transform.rotation.y = quaternion.y();
+    transform.transform.rotation.z = quaternion.z();
+    transform.transform.rotation.w = quaternion.w();
+    tf_broadcaster_.sendTransform(transform);
+  }
+
   void odomCallback(const nav_msgs::OdometryConstPtr &message)
   {
     const double stamp = message->header.stamp.isZero() ? ros::Time::now().toSec()
@@ -825,53 +928,78 @@ private:
       odom_history_.pop_front();
     }
     graph_->addOdometrySample(stamp, sample.pose);
-    const Eigen::Isometry3d optimized = graph_->correctedPose(sample.pose);
-    nav_msgs::Odometry output = *message;
-    output.header.frame_id = map_frame_;
-    output.child_frame_id = body_frame_;
-    output.pose.pose = poseMessage(optimized);
-    odom_pub_.publish(output);
-    last_corrected_pose_ = optimized;
-    last_stamp_ = message->header.stamp.isZero() ? ros::Time(stamp) : message->header.stamp;
-    have_output_ = true;
-    if (broadcast_tf_)
-    {
-      geometry_msgs::TransformStamped transform;
-      transform.header.stamp = last_stamp_;
-      transform.header.frame_id = map_frame_;
-      transform.child_frame_id = body_frame_;
-      transform.transform.translation.x = optimized.translation().x();
-      transform.transform.translation.y = optimized.translation().y();
-      transform.transform.translation.z = optimized.translation().z();
-      const Eigen::Quaterniond quaternion(optimized.rotation());
-      transform.transform.rotation.x = quaternion.x();
-      transform.transform.rotation.y = quaternion.y();
-      transform.transform.rotation.z = quaternion.z();
-      transform.transform.rotation.w = quaternion.w();
-      tf_broadcaster_.sendTransform(transform);
-    }
+    publishCorrectedOdometry(sample);
     processPendingClouds();
+    processPendingSemanticClouds();
   }
 
   void semanticCallback(const sensor_msgs::PointCloud2ConstPtr &message)
   {
-    SemanticGraphPointVector semantic_points = decodeCloud(
-        *message, max_semantic_points_, true, label_field_, confidence_field_);
+    if (!message) return;
     const double stamp = message->header.stamp.isZero() ? ros::Time::now().toSec()
                                                        : message->header.stamp.toSec();
     ++semantic_messages_received_;
-    semantic_points_received_ += static_cast<std::uint64_t>(semantic_points.size());
-    if (semantic_points.empty())
+    if (!std::isfinite(stamp))
     {
       ++semantic_empty_messages_;
       return;
     }
-    OdomSample odom;
-    if (!lookupOdom(stamp, &odom))
+    const auto insertion = std::upper_bound(
+        pending_semantic_clouds_.begin(), pending_semantic_clouds_.end(), stamp,
+        [](double value, const PendingSemanticCloud &candidate)
+        {
+          return value < candidate.stamp;
+        });
+    pending_semantic_clouds_.insert(insertion, PendingSemanticCloud{stamp, message});
+    while (pending_semantic_clouds_.size() >
+           static_cast<std::size_t>(max_pending_semantic_clouds_))
     {
-      ++semantic_age_rejections_;
-      ROS_WARN_THROTTLE(5.0,
-          "[semantic_gtsam] semantic observation has no frontend pose near %.6f", stamp);
+      pending_semantic_clouds_.pop_back();
+      ++semantic_queue_drops_;
+    }
+    processPendingSemanticClouds();
+  }
+
+  void processPendingSemanticClouds()
+  {
+    int processed = 0;
+    while (processed < max_semantic_process_per_tick_ &&
+           !pending_semantic_clouds_.empty() && !odom_history_.empty())
+    {
+      const PendingSemanticCloud &pending = pending_semantic_clouds_.front();
+      // Match the registered-cloud ordering contract: a semantic observation
+      // is only consumed after a frontend sample reaches its source time.
+      if (odom_history_.back().stamp + 1e-9 < pending.stamp)
+      {
+        return;
+      }
+      OdomSample odom;
+      if (!lookupOdom(pending.stamp, &odom))
+      {
+        ++semantic_age_rejections_;
+        ROS_WARN_THROTTLE(5.0,
+            "[semantic_gtsam] semantic observation has no frontend pose near %.6f",
+            pending.stamp);
+        pending_semantic_clouds_.pop_front();
+        continue;
+      }
+      const sensor_msgs::PointCloud2ConstPtr message = pending.message;
+      const double stamp = pending.stamp;
+      pending_semantic_clouds_.pop_front();
+      processSemanticCloud(message, stamp, odom);
+      ++processed;
+    }
+  }
+
+  void processSemanticCloud(const sensor_msgs::PointCloud2ConstPtr &message,
+                            double stamp, const OdomSample &odom)
+  {
+    SemanticGraphPointVector semantic_points = decodeCloud(
+        *message, max_semantic_points_, true, label_field_, confidence_field_);
+    semantic_points_received_ += static_cast<std::uint64_t>(semantic_points.size());
+    if (semantic_points.empty())
+    {
+      ++semantic_empty_messages_;
       return;
     }
     latest_semantic_age_ = std::abs(odom.stamp - stamp);
@@ -883,8 +1011,23 @@ private:
         point.point = local_from_map * point.point;
       }
     }
+    const SemanticPoseGraphStats before = graph_->stats();
     if (graph_->addSemanticObservation(stamp, odom.pose, semantic_points))
     {
+      const SemanticPoseGraphStats after = graph_->stats();
+      if (after.semantic_observation_factors > before.semantic_observation_factors)
+      {
+        const SemanticLoopDebug &debug = graph_->lastSemanticDebug();
+        ROS_INFO("[semantic_gtsam] semantic factor applied: total=%d xy=%d z=%d "
+                 "ref=%d cur=%d xy_inliers=%d z_inliers=%d xy_rmse=%.3f",
+                 after.semantic_observation_factors,
+                 after.semantic_observation_xy_factors,
+                 after.semantic_observation_z_factors,
+                 debug.reference_id, debug.current_id,
+                 after.last_semantic_xy_inliers,
+                 after.last_semantic_z_inliers,
+                 after.last_semantic_xy_rmse);
+      }
       ++semantic_clouds_used_;
       semantic_points_used_ += static_cast<std::uint64_t>(semantic_points.size());
       publishDebug();
@@ -905,7 +1048,7 @@ private:
     const double stamp = !message->header.stamp.isZero() ? message->header.stamp.toSec()
         : std::isfinite(message->unixtime) && message->unixtime > 0.0
             ? message->unixtime : ros::Time::now().toSec();
-    graph_->addWheelSample(stamp, 0.5 * (speeds[1] + speeds[2]));
+    graph_->addWheelSample(stamp + wheel_time_offset_, 0.5 * (speeds[1] + speeds[2]));
   }
 
   void publishVisualDebug(const VisualRotationEstimate &estimate)
@@ -1013,12 +1156,32 @@ private:
     }
     if (!result.accepted) return;
     ++visual_loop_detector_accepts_;
+    last_accepted_visual_loop_reference_id_ = result.reference_id;
+    last_accepted_visual_loop_current_id_ = result.current_id;
+    last_accepted_visual_loop_matches_ = result.descriptor_matches;
+    last_accepted_visual_loop_inliers_ = result.pnp_inliers;
+    last_accepted_visual_loop_quality_ = result.quality;
+    last_accepted_visual_loop_reprojection_rmse_ = result.reprojection_rmse;
+    last_accepted_visual_loop_time_separation_sec_ = result.temporal_separation_sec;
+    last_accepted_visual_loop_xy_separation_ = result.raw_xy_separation;
+    last_accepted_visual_loop_z_separation_ = result.raw_z_separation;
+    const Eigen::Isometry3d pose_before_loop = graph_->correctedPose(odom.pose);
     if (graph_->addVisualLoopConstraint(
             result.reference_stamp, result.current_stamp,
             result.reference_from_current, result.quality))
     {
       ++visual_loop_graph_applied_;
       last_visual_loop_reason_ = "visual_loop_applied";
+      const Eigen::Isometry3d pose_after_loop = graph_->correctedPose(odom.pose);
+      const Eigen::Isometry3d correction = pose_before_loop.inverse() * pose_after_loop;
+      last_visual_loop_correction_translation_ = correction.translation().norm();
+      last_visual_loop_correction_rotation_deg_ = rotationDegrees(correction.rotation());
+      // The factor is inserted from the image/cloud queue, after this sample
+      // may already have been published by odomCallback. Re-emit it so the
+      // live odometry and path reflect the iSAM2 update immediately.
+      publishCorrectedOdometry(odom);
+      publishPath();
+      publishSemanticMap(false);
       publishStats();
     }
     else
@@ -1376,6 +1539,40 @@ private:
            << ",\"visual_loop_attempts\":" << stats.visual_loop_attempts
            << ",\"visual_loop_rejections\":" << stats.visual_loop_rejections
            << ",\"visual_loop_factors\":" << stats.visual_loop_factors
+           << ",\"visual_loop_ground_z_refinements\":"
+           << stats.visual_loop_ground_z_refinements
+           << ",\"visual_loop_cooldown_rejections\":"
+           << stats.visual_loop_cooldown_rejections
+           << ",\"visual_loop_factor_limit_rejections\":"
+           << stats.visual_loop_factor_limit_rejections
+           << ",\"visual_loop_z_without_ground_suppressed\":"
+           << stats.visual_loop_z_without_ground_suppressed
+           << ",\"visual_loop_lidar_geometry_validations\":"
+           << stats.visual_loop_lidar_geometry_validations
+           << ",\"visual_loop_lidar_geometry_rejections\":"
+           << stats.visual_loop_lidar_geometry_rejections
+           << ",\"visual_loop_lidar_candidates\":"
+           << stats.last_visual_loop_lidar_candidates
+           << ",\"visual_loop_lidar_inliers\":"
+           << stats.last_visual_loop_lidar_inliers
+           << ",\"visual_loop_lidar_accepted\":"
+           << (stats.last_visual_loop_lidar_accepted ? "true" : "false")
+           << ",\"visual_loop_lidar_rmse\":"
+           << metric(stats.last_visual_loop_lidar_rmse)
+           << ",\"visual_loop_lidar_spread\":"
+           << metric(stats.last_visual_loop_lidar_spread)
+           << ",\"visual_loop_ground_z_candidates\":"
+           << stats.last_visual_loop_ground_z_candidates
+           << ",\"visual_loop_ground_z_inliers\":"
+           << stats.last_visual_loop_ground_z_inliers
+           << ",\"visual_loop_ground_z_accepted\":"
+           << (stats.last_visual_loop_ground_z_accepted ? "true" : "false")
+           << ",\"visual_loop_z_constrained\":"
+           << (stats.last_visual_loop_z_constrained ? "true" : "false")
+           << ",\"visual_loop_ground_z_correction\":"
+           << metric(stats.last_visual_loop_ground_z_correction)
+           << ",\"visual_loop_ground_z_mad\":"
+           << metric(stats.last_visual_loop_ground_z_mad)
            << ",\"visual_loop_keyframes\":" << visual_loop_keyframes_
            << ",\"visual_loop_candidates\":" << visual_loop_candidates_
            << ",\"visual_loop_detector_accepts\":" << visual_loop_detector_accepts_
@@ -1387,6 +1584,28 @@ private:
            << ",\"visual_loop_quality\":" << metric(last_visual_loop_quality_)
            << ",\"visual_loop_reprojection_rmse\":"
            << metric(last_visual_loop_reprojection_rmse_)
+           << ",\"visual_loop_correction_translation\":"
+           << metric(last_visual_loop_correction_translation_)
+           << ",\"visual_loop_correction_rotation_deg\":"
+           << metric(last_visual_loop_correction_rotation_deg_)
+           << ",\"visual_loop_last_accepted_reference_id\":"
+           << last_accepted_visual_loop_reference_id_
+           << ",\"visual_loop_last_accepted_current_id\":"
+           << last_accepted_visual_loop_current_id_
+           << ",\"visual_loop_last_accepted_matches\":"
+           << last_accepted_visual_loop_matches_
+           << ",\"visual_loop_last_accepted_inliers\":"
+           << last_accepted_visual_loop_inliers_
+           << ",\"visual_loop_last_accepted_quality\":"
+           << metric(last_accepted_visual_loop_quality_)
+           << ",\"visual_loop_last_accepted_reprojection_rmse\":"
+           << metric(last_accepted_visual_loop_reprojection_rmse_)
+           << ",\"visual_loop_last_accepted_time_separation_sec\":"
+           << metric(last_accepted_visual_loop_time_separation_sec_)
+           << ",\"visual_loop_last_accepted_xy_separation\":"
+           << metric(last_accepted_visual_loop_xy_separation_)
+           << ",\"visual_loop_last_accepted_z_separation\":"
+           << metric(last_accepted_visual_loop_z_separation_)
            << ",\"visual_loop_reason\":\"" << last_visual_loop_reason_ << "\""
            << ",\"visual_observation_only\":"
            << (visual_observation_only_ ? "true" : "false")
@@ -1419,6 +1638,15 @@ private:
            << ",\"loop_attempts\":" << stats.loop_attempts
            << ",\"loop_rejections\":" << stats.loop_rejections
            << ",\"loop_factors\":" << stats.loop_factors
+           << ",\"loop_support_confirmations\":" << stats.loop_support_confirmations
+           << ",\"loop_cooldown_rejections\":" << stats.loop_cooldown_rejections
+           << ",\"loop_factor_limit_rejections\":"
+           << stats.loop_factor_limit_rejections
+           << ",\"loop_last_support\":" << stats.last_loop_support
+           << ",\"loop_last_accepted_reference_id\":" << stats.last_loop_reference_id
+           << ",\"loop_last_accepted_current_id\":" << stats.last_loop_current_id
+           << ",\"loop_last_accepted_time_separation_sec\":"
+           << metric(stats.last_loop_time_separation_sec)
            << ",\"xy_loop_factors\":" << stats.xy_loop_factors
            << ",\"z_loop_factors\":" << stats.z_loop_factors
            << ",\"semantic_keyframes\":" << stats.semantic_keyframes
@@ -1433,6 +1661,8 @@ private:
            << registered_cloud_queue_drops_
            << ",\"registered_cloud_pose_drops\":"
            << registered_cloud_pose_drops_
+           << ",\"semantic_pending\":" << pending_semantic_clouds_.size()
+           << ",\"semantic_queue_drops\":" << semantic_queue_drops_
            << ",\"semantic_messages\":" << semantic_messages_received_
            << ",\"semantic_points_received\":" << semantic_points_received_
            << ",\"semantic_empty_messages\":" << semantic_empty_messages_
@@ -1564,6 +1794,7 @@ private:
   std::string registered_cloud_topic_;
   std::string semantic_cloud_topic_;
   std::string wheel_topic_;
+  double wheel_time_offset_ = 0.0;
   std::string camera_topic_;
   std::string output_odom_topic_;
   std::string output_path_topic_;
@@ -1604,6 +1835,8 @@ private:
   double latest_semantic_age_ = -1.0;
   int max_registered_points_ = 8000;
   int max_pending_registered_clouds_ = 100;
+  int max_pending_semantic_clouds_ = 240;
+  int max_semantic_process_per_tick_ = 2;
   int max_semantic_points_ = 6000;
   int semantic_map_max_points_ = 120000;
   int semantic_map_points_ = 0;
@@ -1625,6 +1858,10 @@ private:
   int visual_loop_pose_drops_ = 0;
   int last_visual_loop_matches_ = 0;
   int last_visual_loop_inliers_ = 0;
+  int last_accepted_visual_loop_reference_id_ = -1;
+  int last_accepted_visual_loop_current_id_ = -1;
+  int last_accepted_visual_loop_matches_ = 0;
+  int last_accepted_visual_loop_inliers_ = 0;
   int last_visual_tracks_ = 0;
   int last_visual_inliers_ = 0;
   int last_pnp_correspondences_ = 0;
@@ -1638,6 +1875,7 @@ private:
   std::uint64_t semantic_clouds_used_ = 0U;
   std::uint64_t semantic_points_used_ = 0U;
   std::uint64_t semantic_age_rejections_ = 0U;
+  std::uint64_t semantic_queue_drops_ = 0U;
   double last_visual_quality_ = 0.0;
   double last_pnp_reprojection_rmse_ = 0.0;
   double visual_pnp_quality_sum_ = 0.0;
@@ -1646,6 +1884,19 @@ private:
   double visual_pnp_translation_sum_ = 0.0;
   double last_visual_loop_quality_ = 0.0;
   double last_visual_loop_reprojection_rmse_ =
+      std::numeric_limits<double>::quiet_NaN();
+  double last_visual_loop_correction_translation_ =
+      std::numeric_limits<double>::quiet_NaN();
+  double last_visual_loop_correction_rotation_deg_ =
+      std::numeric_limits<double>::quiet_NaN();
+  double last_accepted_visual_loop_quality_ = 0.0;
+  double last_accepted_visual_loop_reprojection_rmse_ =
+      std::numeric_limits<double>::quiet_NaN();
+  double last_accepted_visual_loop_time_separation_sec_ =
+      std::numeric_limits<double>::quiet_NaN();
+  double last_accepted_visual_loop_xy_separation_ =
+      std::numeric_limits<double>::quiet_NaN();
+  double last_accepted_visual_loop_z_separation_ =
       std::numeric_limits<double>::quiet_NaN();
   std::string last_visual_reason_ = "not_received";
   std::string last_visual_loop_reason_ = "not_received";
@@ -1658,6 +1909,7 @@ private:
   std::unique_ptr<VisualLoopDetector> visual_loop_detector_;
   OdomDeque odom_history_;
   std::deque<sensor_msgs::PointCloud2ConstPtr> pending_registered_clouds_;
+  std::deque<PendingSemanticCloud> pending_semantic_clouds_;
   std::deque<VisualImageSample> visual_image_queue_;
   std::deque<VisualCloudSample, Eigen::aligned_allocator<VisualCloudSample>>
       visual_cloud_queue_;

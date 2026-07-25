@@ -56,6 +56,68 @@ double huberWeight(double residual, double delta)
   return magnitude <= delta || magnitude < kSmall ? 1.0 : delta / magnitude;
 }
 
+bool radialTangentialProjection(const Eigen::Vector3d &camera_point,
+                                const std::array<double, 5> &distortion,
+                                bool apply_distortion,
+                                Eigen::Vector2d *normalized_pixel,
+                                Eigen::Matrix2d *normalized_jacobian = nullptr)
+{
+  if (normalized_pixel == nullptr || !camera_point.allFinite() ||
+      std::abs(camera_point.z()) < kSmall)
+  {
+    return false;
+  }
+  const double x = camera_point.x() / camera_point.z();
+  const double y = camera_point.y() / camera_point.z();
+  if (!apply_distortion)
+  {
+    *normalized_pixel = Eigen::Vector2d(x, y);
+    if (normalized_jacobian != nullptr)
+    {
+      normalized_jacobian->setIdentity();
+    }
+    return normalized_pixel->allFinite();
+  }
+  const double k1 = distortion[0];
+  const double k2 = distortion[1];
+  const double p1 = distortion[2];
+  const double p2 = distortion[3];
+  const double k3 = distortion[4];
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(k1) ||
+      !std::isfinite(k2) || !std::isfinite(p1) || !std::isfinite(p2) ||
+      !std::isfinite(k3))
+  {
+    return false;
+  }
+  const double radius_squared = x * x + y * y;
+  const double radius_fourth = radius_squared * radius_squared;
+  const double radius_sixth = radius_fourth * radius_squared;
+  const double radial = 1.0 + k1 * radius_squared + k2 * radius_fourth +
+      k3 * radius_sixth;
+  normalized_pixel->x() = x * radial + 2.0 * p1 * x * y +
+      p2 * (radius_squared + 2.0 * x * x);
+  normalized_pixel->y() = y * radial + p1 * (radius_squared + 2.0 * y * y) +
+      2.0 * p2 * x * y;
+  if (!normalized_pixel->allFinite()) return false;
+  if (normalized_jacobian != nullptr)
+  {
+    const double radial_gradient = k1 + 2.0 * k2 * radius_squared +
+        3.0 * k3 * radius_fourth;
+    const double radial_x = 2.0 * x * radial_gradient;
+    const double radial_y = 2.0 * y * radial_gradient;
+    (*normalized_jacobian)(0, 0) = radial + x * radial_x +
+        2.0 * p1 * y + 6.0 * p2 * x;
+    (*normalized_jacobian)(0, 1) = x * radial_y + 2.0 * p1 * x +
+        2.0 * p2 * y;
+    (*normalized_jacobian)(1, 0) = y * radial_x + 2.0 * p1 * x +
+        2.0 * p2 * y;
+    (*normalized_jacobian)(1, 1) = radial + y * radial_y +
+        6.0 * p1 * y + 2.0 * p2 * x;
+    if (!normalized_jacobian->allFinite()) return false;
+  }
+  return true;
+}
+
 struct VoxelKey
 {
   int x = 0;
@@ -304,13 +366,20 @@ bool SparseVisualMap::project(
   {
     return false;
   }
+  Eigen::Vector2d normalized_pixel;
+  if (!radialTangentialProjection(point_camera, options_.distortion,
+                                  options_.apply_distortion,
+                                  &normalized_pixel))
+  {
+    return false;
+  }
   const double scale = options_.image_scale;
   if (pixel != nullptr)
   {
-    pixel->x = static_cast<float>(options_.fx * scale * point_camera.x() /
-                                 point_camera.z() + options_.cx * scale);
-    pixel->y = static_cast<float>(options_.fy * scale * point_camera.y() /
-                                 point_camera.z() + options_.cy * scale);
+    pixel->x = static_cast<float>(options_.fx * scale * normalized_pixel.x() +
+                                 options_.cx * scale);
+    pixel->y = static_cast<float>(options_.fy * scale * normalized_pixel.y() +
+                                 options_.cy * scale);
   }
   if (camera_point != nullptr) *camera_point = point_camera;
   if (body_point != nullptr) *body_point = point_body;
@@ -542,9 +611,21 @@ VisualPoseLinearization SparseVisualMap::linearize(
     const double x = projection.camera_point.x();
     const double y = projection.camera_point.y();
     const double z = projection.camera_point.z();
-    Eigen::Matrix<double, 2, 3> projection_jacobian;
-    projection_jacobian << fx / z, 0.0, -fx * x / (z * z),
-                           0.0, fy / z, -fy * y / (z * z);
+    Eigen::Vector2d normalized_pixel;
+    Eigen::Matrix2d distortion_jacobian;
+    if (!radialTangentialProjection(projection.camera_point, options_.distortion,
+                                    options_.apply_distortion,
+                                    &normalized_pixel, &distortion_jacobian))
+    {
+      continue;
+    }
+    Eigen::Matrix<double, 2, 3> normalized_projection_jacobian;
+    normalized_projection_jacobian << 1.0 / z, 0.0, -x / (z * z),
+                                      0.0, 1.0 / z, -y / (z * z);
+    const Eigen::Matrix2d scaled_intrinsics =
+        (Eigen::Vector2d(fx, fy)).asDiagonal();
+    const Eigen::Matrix<double, 2, 3> projection_jacobian =
+        scaled_intrinsics * distortion_jacobian * normalized_projection_jacobian;
     Eigen::Matrix<double, 3, 6> point_jacobian;
     point_jacobian.block<3, 3>(0, 0) =
         camera_from_body * skew(projection.body_point);

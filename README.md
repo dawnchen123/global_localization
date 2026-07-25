@@ -52,6 +52,11 @@ python3 ~/workspace/fast_livo2_global_ws/src/fast_livo2_global_localization/scri
 
 服务会对每张图只计算一次 image backbone，并在同一 state 上执行文本 prompt。`--backend heuristic` 只用于检查 topic/队列链路，不能用于精度评估。
 
+默认不再为每帧写 `color_*.png` 和 `debug_*.png`，避免长 bag 产生数 GB 的队列
+文件；只有短时人工检查时才在上述命令追加 `--save_visualizations`。Hesai/Mid360
+配置中的 `cleanup_processed_queue_files: true` 会在 mapper 已发布该帧的投影语义点后
+清理该请求的图像、NPZ、标签和结果 JSON。它不会自动删除以前实验留下的旧队列目录。
+
 ## 3. Hesai AT128 完整启动
 
 终端 2：
@@ -286,6 +291,26 @@ OUTPUT_ROOT=/data/result/street00_ablation \
 | `sam3_hesai.yaml` | AT128 相机投影、队列等待、BEV 和 PLY |
 | `sam3_mid360.yaml` | Mid360 相机投影、队列等待、BEV 和 PLY |
 
+前端鲁棒性参数：
+
+| 参数 | 说明 |
+|---|---|
+| `imu_time_offset` / `lidar_time_offset` / `camera_time_offset` | 统一时钟偏移，采用 `corrected_stamp = message_stamp + offset`；应由离线时间标定给出，i2Nav 默认均为 0。 |
+| `strict_sensor_frame_validation` | 启动时校验 `body_from_lidar`、`body_from_imu` 和相机外参是否为有限的 SO(3) 刚体变换。 |
+| `lidar_odometry/observability_eigen_ratio` | 点面 Hessian 的可观性特征值比例；不可观方向不会写入当前扫描校正。 |
+| `lidar_odometry/max_mean_normalized_residual` | Huber 后扫描创新量门限，超限扫描不更新 ESKF 或局部地图。 |
+| `lidar_odometry/map_insertion_*` | 比状态更新更严格的局部地图插入门限，避免弱约束或高残差帧污染地图。 |
+| `semantic_lidar_filter/enabled` | 将 SAM3 相机标签投影到原始 LiDAR；动态点不参与扫描匹配、注册点云和局部地图插入。 |
+| `semantic_lidar_filter/sync_tolerance_sec` | 光流传播标签与扫描末端的最大时间差。 |
+| `semantic_lidar_filter/max_source_age_sec` | 原始 SAM3 标签的最大年龄，代码会限制在 `sam3_cache_duration_sec` 内。 |
+
+当 `enable_sam3_semantics:=true` 时，Hesai/Mid360 launch 默认将
+`enable_sam3_lidar_filter` 设为同一值，并自动订阅相机以提供动态 LiDAR 筛选。
+在 `/hybrid/status` 中检查 `sensor_frame_contract`、`lio_observable_directions`、
+`lio_mean_normalized_residual`、`sam3_lidar_mask_scans` 和
+`sam3_lidar_dynamic_rejections`；若掩码持续不可用，应先检查相机标签 topic、
+`sam3_source_age`、相机时间偏移及相机外参。
+
 主要语义参数：
 
 | 参数 | 说明 |
@@ -305,6 +330,9 @@ OUTPUT_ROOT=/data/result/street00_ablation \
 | `queue_jpeg_quality` | JPEG 队列图像质量，默认 95 |
 | `opencv_num_threads` | exporter/mapper 的 OpenCV 线程数，默认 1，避免与 LIO/SAM3 过度争抢 CPU |
 | `accumulation_window_sec` | `/sam3/semantic_cloud_map` 的滑动时间窗口；它是局部语义地图，不是永久全局点云 |
+| `semantic_batch_voxel_size` | 单帧投影语义点进入全局累计前的按类别体素压缩尺寸；保留空间覆盖并限制长回放内存 |
+| `mapper_max_results_per_cycle` | mapper 每个轮询周期最多处理的已完成 SAM3 请求；默认 1，避免积压时瞬时大内存分配 |
+| `cleanup_processed_queue_files` | 成功发布投影语义点后删除该请求的临时队列文件；默认配置启用，旧实验目录不会被追溯删除 |
 | `measurement_scheduler/process_rate_hz` | 主线程检查待处理事件的墙钟频率 |
 | `measurement_scheduler/max_events_per_tick` | 每轮最多处理的 LiDAR/Image 事件数，避免饿死状态和图后端回调 |
 | `measurement_scheduler/reorder_window_sec` | LiDAR/Image 跨传感器重排序水位 |

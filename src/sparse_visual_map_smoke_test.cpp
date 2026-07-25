@@ -94,6 +94,61 @@ int main()
   weighted_map.commitFrame(reference, pose, false);
   assert(weighted_map.landmarkCount() == 0U);
 
+  // Render texture only at the radial-tangential projections.  A pinhole-only
+  // projection cannot seed these landmarks reliably away from the principal
+  // point, while the calibrated model must reproduce the same reference view.
+  SparseVisualMapOptions distorted_options = options;
+  distorted_options.distortion = {{-0.15, 0.09, 0.001, -0.001, -0.02}};
+  distorted_options.apply_distortion = true;
+  SparseVisualMap distorted_map(distorted_options);
+  cv::Mat distorted_image(image.size(), CV_8U, cv::Scalar(0));
+  PointVector distorted_points;
+  const auto distort = [&distorted_options](double x, double y)
+  {
+    const double r2 = x * x + y * y;
+    const double radial = 1.0 + distorted_options.distortion[0] * r2 +
+        distorted_options.distortion[1] * r2 * r2 +
+        distorted_options.distortion[4] * r2 * r2 * r2;
+    return cv::Point2d(
+        x * radial + 2.0 * distorted_options.distortion[2] * x * y +
+            distorted_options.distortion[3] * (r2 + 2.0 * x * x),
+        y * radial + distorted_options.distortion[2] * (r2 + 2.0 * y * y) +
+            2.0 * distorted_options.distortion[3] * x * y);
+  };
+  for (int row = 30; row < image.rows - 30; row += 30)
+  {
+    for (int col = 30; col < image.cols - 30; col += 30)
+    {
+      const double x = (static_cast<double>(col) - options.cx) / options.fx;
+      const double y = (static_cast<double>(row) - options.cy) / options.fy;
+      const cv::Point2d projected = distort(x, y);
+      const int u = static_cast<int>(std::lround(
+          distorted_options.fx * projected.x + distorted_options.cx));
+      const int v = static_cast<int>(std::lround(
+          distorted_options.fy * projected.y + distorted_options.cy));
+      if (u < 8 || v < 8 || u >= image.cols - 8 || v >= image.rows - 8) continue;
+      distorted_points.emplace_back(x * depth, y * depth, depth);
+      for (int dy = -5; dy <= 5; ++dy)
+      {
+        for (int dx = -5; dx <= 5; ++dx)
+        {
+          distorted_image.at<uint8_t>(v + dy, u + dx) = static_cast<uint8_t>(
+              30 + (19 * (dx + 5) + 37 * (dy + 5) + 11 * row + col) % 220);
+        }
+      }
+    }
+  }
+  distorted_map.addLidarFrame(2.0, pose, distorted_points);
+  const SparseVisualFrame distorted_reference = distorted_map.prepareFrame(
+      2.0, distorted_image);
+  distorted_map.commitFrame(distorted_reference, pose, false);
+  assert(distorted_map.landmarkCount() > 20U);
+  const VisualPoseLinearization distorted_linearization = distorted_map.linearize(
+      distorted_map.prepareFrame(2.1, distorted_image), pose);
+  assert(distorted_linearization.valid);
+  assert(distorted_linearization.landmarks > 20);
+  assert(distorted_linearization.rmse < 1e-5);
+
   std::cout << "sparse_visual_map_smoke_test: PASS landmarks="
             << visual_map.landmarkCount() << "\n";
   return 0;

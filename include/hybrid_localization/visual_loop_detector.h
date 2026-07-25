@@ -39,6 +39,9 @@ struct VisualLoopDetectorOptions
   double keyframe_distance = 0.75;
   double keyframe_interval_sec = 1.0;
   int minimum_index_gap = 25;
+  // Index gaps vary with image cadence; keep a true revisit time gate as well
+  // so short local PnP matches cannot consume the loop-factor budget.
+  double minimum_time_separation_sec = 45.0;
   double search_radius = 25.0;
   double maximum_yaw_difference_deg = 70.0;
   int maximum_retrieval_candidates = 40;
@@ -79,6 +82,9 @@ struct VisualLoopResult
   double reprojection_rmse = std::numeric_limits<double>::infinity();
   double translation_disagreement = std::numeric_limits<double>::infinity();
   double rotation_disagreement_deg = std::numeric_limits<double>::infinity();
+  double temporal_separation_sec = 0.0;
+  double raw_xy_separation = 0.0;
+  double raw_z_separation = 0.0;
   double quality = 0.0;
   Eigen::Isometry3d reference_from_current = Eigen::Isometry3d::Identity();
   cv::Mat debug_image;

@@ -3,10 +3,12 @@
 #include <Eigen/SVD>
 
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core/ocl.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -64,11 +66,53 @@ Eigen::Isometry3d cleanPose(const Eigen::Isometry3d &pose)
   return result;
 }
 
+void configureOpenCvForVisualLoop()
+{
+  static std::once_flag once;
+  std::call_once(once, []()
+  {
+    // The graph process can inherit a TBB runtime unrelated to ROS OpenCV.
+    // Keep visual matching on OpenCV's deterministic serial path instead.
+    cv::ocl::setUseOpenCL(false);
+    cv::setNumThreads(1);
+  });
+}
+
+bool validBinaryDescriptors(const cv::Mat &descriptors,
+                            std::size_t keypoint_count)
+{
+  return !descriptors.empty() && descriptors.type() == CV_8UC1 &&
+         descriptors.rows > 0 && descriptors.cols > 0 &&
+         descriptors.rows == static_cast<int>(keypoint_count) &&
+         descriptors.isContinuous();
+}
+
+bool validKeyframeFeatures(const cv::Mat &descriptors,
+                           const std::vector<cv::KeyPoint> &keypoints,
+                           const VisualLidarPointVector &depth_points,
+                           const std::vector<uint8_t> &has_depth)
+{
+  return validBinaryDescriptors(descriptors, keypoints.size()) &&
+         depth_points.size() == keypoints.size() &&
+         has_depth.size() == keypoints.size();
+}
+
+bool validFeatureIndex(const std::vector<cv::KeyPoint> &keypoints,
+                       const VisualLidarPointVector &depth_points,
+                       const std::vector<uint8_t> &has_depth, int index)
+{
+  return index >= 0 && static_cast<std::size_t>(index) <
+         keypoints.size() && static_cast<std::size_t>(index) <
+         depth_points.size() && static_cast<std::size_t>(index) <
+         has_depth.size();
+}
+
 }  // namespace
 
 VisualLoopDetector::VisualLoopDetector(
     const VisualLoopDetectorOptions &options) : options_(options)
 {
+  configureOpenCvForVisualLoop();
   options_.image_scale = clampValue(options_.image_scale, 0.1, 1.0);
   options_.maximum_features = std::max(200, options_.maximum_features);
   options_.minimum_depth_features = std::max(10, options_.minimum_depth_features);
@@ -157,6 +201,14 @@ VisualLoopDetector::Keyframe VisualLoopDetector::buildKeyframe(
   keyframe.gray = gray.clone();
   orb_->detectAndCompute(keyframe.gray, mask, keyframe.keypoints,
                          keyframe.descriptors, false);
+  if (!validBinaryDescriptors(keyframe.descriptors, keyframe.keypoints.size()))
+  {
+    keyframe.keypoints.clear();
+    keyframe.descriptors.release();
+    return keyframe;
+  }
+  // Own a compact, continuous descriptor buffer for retained database entries.
+  keyframe.descriptors = keyframe.descriptors.clone();
   associateDepth(&keyframe, body_points);
   return keyframe;
 }
@@ -250,10 +302,33 @@ VisualLoopDetector::RetrievalCandidate VisualLoopDetector::retrieve(
 {
   RetrievalCandidate candidate;
   candidate.database_index = database_index;
-  if (reference.descriptors.empty() || current.descriptors.empty()) return candidate;
+  if (!validKeyframeFeatures(reference.descriptors, reference.keypoints,
+                             reference.depth_points, reference.has_depth) ||
+      !validKeyframeFeatures(current.descriptors, current.keypoints,
+                             current.depth_points, current.has_depth) ||
+      reference.descriptors.rows < 2)
+  {
+    return candidate;
+  }
+
+  // Isolate the matcher from buffers retained by the keyframe database.
+  const cv::Mat query_descriptors = current.descriptors.clone();
+  const cv::Mat reference_descriptors = reference.descriptors.clone();
+  if (!validBinaryDescriptors(query_descriptors, current.keypoints.size()) ||
+      !validBinaryDescriptors(reference_descriptors, reference.keypoints.size()))
+  {
+    return candidate;
+  }
   cv::BFMatcher matcher(cv::NORM_HAMMING, false);
   std::vector<std::vector<cv::DMatch>> nearest;
-  matcher.knnMatch(current.descriptors, reference.descriptors, nearest, 2);
+  try
+  {
+    matcher.knnMatch(query_descriptors, reference_descriptors, nearest, 2);
+  }
+  catch (const cv::Exception &)
+  {
+    return candidate;
+  }
   std::vector<cv::DMatch> filtered;
   filtered.reserve(nearest.size());
   for (const auto &pair : nearest)
@@ -261,8 +336,11 @@ VisualLoopDetector::RetrievalCandidate VisualLoopDetector::retrieve(
     if (pair.size() < 2U || pair[0].distance >=
         options_.descriptor_ratio * pair[1].distance) continue;
     const int reference_index = pair[0].trainIdx;
-    if (reference_index < 0 || static_cast<std::size_t>(reference_index) >=
-        reference.has_depth.size() || !reference.has_depth[reference_index]) continue;
+    if (!validFeatureIndex(current.keypoints, current.depth_points,
+                           current.has_depth, pair[0].queryIdx) ||
+        !validFeatureIndex(reference.keypoints, reference.depth_points,
+                           reference.has_depth, reference_index) ||
+        !reference.has_depth[static_cast<std::size_t>(reference_index)]) continue;
     filtered.push_back(pair[0]);
   }
   std::sort(filtered.begin(), filtered.end(),
@@ -295,8 +373,17 @@ VisualLoopResult VisualLoopDetector::verify(
   result.current_id = current.id;
   result.reference_stamp = reference.stamp;
   result.current_stamp = current.stamp;
+  result.temporal_separation_sec = current.stamp - reference.stamp;
   result.descriptor_matches = candidate.matches;
   result.descriptor_score = candidate.score;
+  if (!validKeyframeFeatures(reference.descriptors, reference.keypoints,
+                             reference.depth_points, reference.has_depth) ||
+      !validKeyframeFeatures(current.descriptors, current.keypoints,
+                             current.depth_points, current.has_depth))
+  {
+    result.reason = "visual_loop_invalid_keyframe_features";
+    return result;
+  }
   if (candidate.matches < options_.minimum_descriptor_matches)
   {
     result.reason = "visual_loop_insufficient_descriptor_matches";
@@ -309,12 +396,23 @@ VisualLoopResult VisualLoopDetector::verify(
   image_points.reserve(candidate.correspondences.size());
   for (const cv::DMatch &match : candidate.correspondences)
   {
+    if (!validFeatureIndex(reference.keypoints, reference.depth_points,
+                           reference.has_depth, match.trainIdx) ||
+        !validFeatureIndex(current.keypoints, current.depth_points,
+                           current.has_depth, match.queryIdx) ||
+        !reference.has_depth[static_cast<std::size_t>(match.trainIdx)]) continue;
     const Eigen::Vector3d &point = reference.depth_points[
         static_cast<std::size_t>(match.trainIdx)];
+    if (!point.allFinite()) continue;
     object_points.emplace_back(static_cast<float>(point.x()),
                                static_cast<float>(point.y()),
                                static_cast<float>(point.z()));
     image_points.push_back(current.keypoints[static_cast<std::size_t>(match.queryIdx)].pt);
+  }
+  if (static_cast<int>(object_points.size()) < options_.minimum_descriptor_matches)
+  {
+    result.reason = "visual_loop_invalid_correspondences";
+    return result;
   }
   const double scale = options_.image_scale;
   const cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
@@ -327,10 +425,19 @@ VisualLoopResult VisualLoopDetector::verify(
   cv::Mat rotation_vector;
   cv::Mat translation_vector;
   cv::Mat inliers;
-  const bool solved = cv::solvePnPRansac(
-      object_points, image_points, camera_matrix, distortion, rotation_vector,
-      translation_vector, false, options_.pnp_iterations,
-      options_.pnp_reprojection_error, 0.999, inliers, cv::SOLVEPNP_EPNP);
+  bool solved = false;
+  try
+  {
+    solved = cv::solvePnPRansac(
+        object_points, image_points, camera_matrix, distortion, rotation_vector,
+        translation_vector, false, options_.pnp_iterations,
+        options_.pnp_reprojection_error, 0.999, inliers, cv::SOLVEPNP_EPNP);
+  }
+  catch (const cv::Exception &)
+  {
+    result.reason = "visual_loop_pnp_exception";
+    return result;
+  }
   if (!solved || inliers.empty())
   {
     result.reason = "visual_loop_pnp_failed";
@@ -418,6 +525,8 @@ VisualLoopResult VisualLoopDetector::verify(
       body_current_from_body_reference.inverse());
   const Eigen::Isometry3d raw_relative = cleanPose(
       reference.raw_pose.inverse() * current.raw_pose);
+  result.raw_xy_separation = raw_relative.translation().head<2>().norm();
+  result.raw_z_separation = raw_relative.translation().z();
   const Eigen::Isometry3d disagreement = cleanPose(
       raw_relative.inverse() * result.reference_from_current);
   result.translation_disagreement = disagreement.translation().norm();
@@ -519,6 +628,8 @@ VisualLoopResult VisualLoopDetector::process(
   {
     const Keyframe &reference = keyframes_[index];
     if (current.id - reference.id < options_.minimum_index_gap) continue;
+    if (current.stamp - reference.stamp <
+        std::max(0.0, options_.minimum_time_separation_sec)) continue;
     const double distance = (reference.raw_pose.translation() -
                              current.raw_pose.translation()).head<2>().norm();
     const double yaw_difference = std::abs(wrapAngle(

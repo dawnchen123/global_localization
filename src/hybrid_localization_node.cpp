@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -47,6 +48,7 @@
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -107,6 +109,14 @@ struct LocalFrame
   std::vector<BevPoint, Eigen::aligned_allocator<BevPoint>> points;
 };
 
+// SAM3 results arrive asynchronously and can precede the frontend state that
+// owns their source timestamp during a fast rosbag replay.
+struct PendingSemanticCloud
+{
+  double stamp = 0.0;
+  sensor_msgs::PointCloud2ConstPtr message;
+};
+
 struct ObjectState
 {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -141,6 +151,53 @@ struct CachedCameraFrame
   double stamp = 0.0;
   cv::Mat gray;
 };
+
+struct CameraProjectionModel
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  bool valid = false;
+  double fx = 0.0;
+  double fy = 0.0;
+  double cx = 0.0;
+  double cy = 0.0;
+  int image_width = 1600;
+  int image_height = 1200;
+  std::array<double, 5> distortion{{0.0, 0.0, 0.0, 0.0, 0.0}};
+  Eigen::Isometry3d body_from_camera = Eigen::Isometry3d::Identity();
+};
+
+bool validateRigidTransform(const Eigen::Isometry3d &transform,
+                            double *orthogonality_error,
+                            std::string *reason)
+{
+  if (orthogonality_error != nullptr)
+  {
+    *orthogonality_error = std::numeric_limits<double>::infinity();
+  }
+  if (!transform.matrix().allFinite())
+  {
+    if (reason != nullptr) *reason = "non_finite";
+    return false;
+  }
+  const Eigen::Matrix3d rotation = transform.rotation();
+  const double error = (rotation.transpose() * rotation -
+                        Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff();
+  if (orthogonality_error != nullptr) *orthogonality_error = error;
+  const double determinant = rotation.determinant();
+  if (!std::isfinite(error) || !std::isfinite(determinant) ||
+      error > 1e-3 || std::abs(determinant - 1.0) > 1e-3)
+  {
+    if (reason != nullptr)
+    {
+      std::ostringstream stream;
+      stream << "rotation_not_so3(error=" << error << ",det=" << determinant << ")";
+      *reason = stream.str();
+    }
+    return false;
+  }
+  if (reason != nullptr) *reason = "valid";
+  return true;
+}
 
 const sensor_msgs::PointField *findField(const sensor_msgs::PointCloud2 &cloud,
                                          const std::vector<std::string> &names)
@@ -272,6 +329,50 @@ std::vector<CloudPoint> decodeCloud(const sensor_msgs::PointCloud2 &cloud, const
     points.push_back(point);
   }
   return points;
+}
+
+double estimateLidarScanEndStamp(const sensor_msgs::PointCloud2 &cloud,
+                                 const std::string &point_time_mode,
+                                 double point_time_scale,
+                                 bool stamp_is_end,
+                                 double lidar_time_offset)
+{
+  const double header_stamp = cloud.header.stamp.isZero() ? ros::Time::now().toSec() :
+                                                            cloud.header.stamp.toSec();
+  if (point_time_mode == "none" || cloud.point_step == 0U ||
+      !std::isfinite(point_time_scale))
+  {
+    return header_stamp + lidar_time_offset;
+  }
+  const CloudFieldView fields = makeFieldView(cloud, "");
+  if (fields.time == nullptr || cloud.data.empty())
+  {
+    return header_stamp + lidar_time_offset;
+  }
+  const std::size_t declared_count = static_cast<std::size_t>(cloud.width) *
+      static_cast<std::size_t>(cloud.height);
+  const std::size_t available_count = std::min(
+      declared_count, cloud.data.size() / static_cast<std::size_t>(cloud.point_step));
+  double maximum_point_time = -std::numeric_limits<double>::infinity();
+  for (std::size_t index = 0U; index < available_count; ++index)
+  {
+    const uint8_t *data = cloud.data.data() + index * cloud.point_step;
+    const double point_time = readField(data, fields.time) * point_time_scale;
+    if (std::isfinite(point_time))
+    {
+      maximum_point_time = std::max(maximum_point_time, point_time);
+    }
+  }
+  if (!std::isfinite(maximum_point_time))
+  {
+    return header_stamp + lidar_time_offset;
+  }
+  const bool looks_absolute = maximum_point_time > 1.0e8 &&
+      std::abs(maximum_point_time - header_stamp) < 10.0;
+  const bool use_absolute_time = point_time_mode == "absolute" || looks_absolute;
+  const double scan_end_stamp = use_absolute_time ? maximum_point_time :
+      (stamp_is_end ? header_stamp : header_stamp + maximum_point_time);
+  return scan_end_stamp + lidar_time_offset;
 }
 
 geometry_msgs::Pose poseMessage(const Eigen::Isometry3d &pose)
@@ -425,6 +526,47 @@ std_msgs::ColorRGBA colorForState(const std::string &state)
   return color;
 }
 
+std::string normalizeTrajectoryCoordinateMode(std::string mode)
+{
+  std::transform(mode.begin(), mode.end(), mode.begin(),
+                 [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+  if (mode.empty() || mode == "as_is" || mode == "ros_enu" || mode == "enu")
+  {
+    return "as_is";
+  }
+  if (mode == "enu_to_ned" || mode == "ros_enu_to_ned")
+  {
+    return "enu_to_ned";
+  }
+  if (mode == "enu_flu_to_ned_frd" || mode == "ros_enu_flu_to_ned_frd" ||
+      mode == "local_ned" || mode == "ned")
+  {
+    return "enu_flu_to_ned_frd";
+  }
+  return std::string();
+}
+
+Eigen::Isometry3d trajectoryPoseInCoordinateMode(
+    const Eigen::Isometry3d &pose, const std::string &mode)
+{
+  if (mode == "as_is") return pose;
+  Eigen::Matrix3d ned_from_enu;
+  ned_from_enu << 0.0, 1.0, 0.0,
+                  1.0, 0.0, 0.0,
+                  0.0, 0.0, -1.0;
+  Eigen::Isometry3d converted = Eigen::Isometry3d::Identity();
+  converted.translation() = ned_from_enu * pose.translation();
+  converted.linear() = ned_from_enu * pose.rotation();
+  if (mode == "enu_flu_to_ned_frd")
+  {
+    Eigen::Matrix3d frd_from_flu = Eigen::Matrix3d::Identity();
+    frd_from_flu(1, 1) = -1.0;
+    frd_from_flu(2, 2) = -1.0;
+    converted.linear() *= frd_from_flu;
+  }
+  return converted;
+}
+
 class HybridLocalizationNode
 {
 public:
@@ -438,6 +580,7 @@ public:
       trajectory_stream_.open(trajectory_save_path_.c_str(), std::ios::out | std::ios::trunc);
       if (trajectory_stream_.is_open())
       {
+        trajectory_stream_ << "# coordinate_mode=" << trajectory_coordinate_mode_ << "\n";
         trajectory_stream_ << "timestamp,x,y,z,qx,qy,qz,qw\n";
         trajectory_stream_.flush();
       }
@@ -506,10 +649,15 @@ private:
   bool propagateSemanticLabels(const cv::Mat &current_gray,
                                double current_stamp);
   void cacheCameraFrame(const cv::Mat &gray, double stamp);
+  bool currentLidarDynamicLabels(double scan_stamp, cv::Mat *labels,
+                                 double *sync_dt) const;
+  bool isDynamicLidarPoint(const Eigen::Vector3d &body_point,
+                           const cv::Mat &labels) const;
   void processImageMessage(const sensor_msgs::CompressedImageConstPtr &message,
                            double corrected_stamp);
   void processLidarMessage(const sensor_msgs::PointCloud2ConstPtr &message);
   void semanticCallback(const sensor_msgs::PointCloud2ConstPtr &message);
+  void processPendingSemanticClouds();
   void visualFactorCallback(const geometry_msgs::PoseWithCovarianceStampedConstPtr &message);
   void priorGridCallback(const nav_msgs::OccupancyGridConstPtr &message);
   void priorCloudCallback(const sensor_msgs::PointCloud2ConstPtr &message);
@@ -518,7 +666,8 @@ private:
 
   void handleLidarOdometry(const LidarOdometryResult &result);
   void handleVisualUpdate(const VisualUpdateResult &result);
-  void processSemanticCloud(const sensor_msgs::PointCloud2ConstPtr &message);
+  void processSemanticCloud(const sensor_msgs::PointCloud2ConstPtr &message,
+                            double stamp, const Eigen::Isometry3d &odom_pose);
   Eigen::Isometry3d lookupOdomPose(double stamp, bool *ok) const;
   uint8_t normalizeLabel(uint8_t label) const;
   void appendLocalFrame(double stamp,
@@ -622,6 +771,7 @@ private:
   std::string lidar_point_time_mode_;
   std::string prior_pcd_path_;
   std::string trajectory_save_path_;
+  std::string trajectory_coordinate_mode_ = "as_is";
   std::string object_save_path_;
 
   bool subscribe_imu_ = true;
@@ -648,12 +798,17 @@ private:
   bool visual_observation_only_ = true;
   bool publish_visual_direct_debug_ = true;
   bool visual_use_sam3_ = false;
+  bool strict_sensor_frame_validation_ = true;
+  bool sensor_frame_contract_valid_ = true;
+  bool semantic_lidar_filter_enabled_ = false;
 
   int max_lidar_points_ = 10000;
   int max_semantic_points_ = 10000;
   int max_local_points_ = 18000;
   int max_local_semantic_points_ = 60000;
   int max_semantic_output_points_ = 12000;
+  int max_pending_semantic_clouds_ = 240;
+  int max_semantic_process_per_tick_ = 2;
   int max_objects_ = 1000;
   int dynamic_label_ = 5;
   int traversable_label_max_ = 2;
@@ -664,6 +819,7 @@ private:
   double keyframe_angle_deg_ = 8.0;
   double keyframe_interval_sec_ = 0.5;
   double max_odom_lookup_dt_ = 0.15;
+  double odom_history_sec_ = 600.0;
   double local_map_window_sec_ = 12.0;
   double local_map_resolution_ = 0.25;
   double local_map_size_m_ = 80.0;
@@ -688,9 +844,17 @@ private:
   double status_rate_ = 1.0;
   double lidar_point_time_scale_ = 1.0;
   double lidar_imu_wait_sec_ = 0.0;
+  // Every sensor timestamp is brought onto the IMU/LiDAR estimator clock by
+  // corrected_stamp = message_stamp + sensor_time_offset.
+  double imu_time_offset_ = 0.0;
+  double lidar_time_offset_ = 0.0;
+  double wheel_time_offset_ = 0.0;
   double camera_time_offset_ = 0.0;
+  double sensor_time_offset_limit_sec_ = 1.0;
   double camera_imu_wait_sec_ = 0.01;
   double camera_observation_interval_sec_ = 0.20;
+  double visual_update_interval_sec_ = 0.50;
+  double measurement_max_image_lag_sec_ = 0.50;
   double measurement_reorder_window_sec_ = 0.02;
   double measurement_scheduler_process_rate_hz_ = 200.0;
   int measurement_scheduler_max_events_per_tick_ = 2;
@@ -701,6 +865,7 @@ private:
   double latest_enqueued_image_stamp_ =
       -std::numeric_limits<double>::infinity();
   double last_camera_stamp_ = -std::numeric_limits<double>::infinity();
+  double last_visual_update_stamp_ = -std::numeric_limits<double>::infinity();
   int max_measurement_queue_ = 200;
   int sam3_max_cached_frames_ = 80;
   int sam3_max_replay_frames_ = 40;
@@ -709,10 +874,20 @@ private:
   double sam3_label_sync_tolerance_sec_ = 0.08;
   double sam3_max_source_age_sec_ = 3.0;
   double sam3_max_flow_pixels_ = 80.0;
+  double semantic_lidar_filter_sync_tolerance_sec_ = 0.30;
+  double semantic_lidar_filter_max_source_age_sec_ = 6.0;
+  double semantic_lidar_filter_min_depth_ = 0.20;
+  double semantic_lidar_filter_min_dynamic_support_ratio_ = 0.55;
+  int semantic_lidar_filter_support_radius_px_ = 1;
   double last_wheel_speed_ = 0.0;
   int wheel_samples_ = 0;
   Eigen::Isometry3d body_from_lidar_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d body_from_imu_ = Eigen::Isometry3d::Identity();
+  CameraProjectionModel lidar_mask_camera_;
+  double body_from_lidar_rotation_error_ = 0.0;
+  double body_from_imu_rotation_error_ = 0.0;
+  double body_from_camera_rotation_error_ = 0.0;
+  std::string sensor_frame_contract_reason_ = "valid";
 
   SlidingWindowOptimizer optimizer_;
   LidarOdometry lidar_odometry_;
@@ -723,6 +898,7 @@ private:
   std::deque<LocalFrame> local_frames_;
   std::deque<LocalFrame> semantic_frames_;
   std::deque<std::pair<double, Eigen::Isometry3d>> odom_history_;
+  std::deque<PendingSemanticCloud> pending_semantic_clouds_;
   mutable std::mutex measurement_mutex_;
   std::deque<MeasurementEvent> measurement_queue_;
   mutable std::mutex pending_imu_mutex_;
@@ -762,7 +938,9 @@ private:
   std::uint64_t processed_image_events_ = 0U;
   std::uint64_t measurement_queue_drops_ = 0U;
   std::uint64_t measurement_image_queue_drops_ = 0U;
+  std::uint64_t measurement_image_lag_drops_ = 0U;
   std::uint64_t camera_observation_interval_drops_ = 0U;
+  std::uint64_t visual_update_interval_drops_ = 0U;
   std::uint64_t measurement_stale_drops_ = 0U;
   std::uint64_t camera_decode_failures_ = 0U;
   std::uint64_t pending_imu_queue_drops_ = 0U;
@@ -778,29 +956,48 @@ private:
   std::uint64_t sam3_dynamic_pixels_ = 0U;
   double sam3_source_stamp_ = -std::numeric_limits<double>::infinity();
   double sam3_propagated_stamp_ = -std::numeric_limits<double>::infinity();
+  int last_camera_image_width_ = 0;
+  int last_camera_image_height_ = 0;
+  std::uint64_t sam3_lidar_mask_scans_ = 0U;
+  std::uint64_t sam3_lidar_mask_unavailable_scans_ = 0U;
+  std::uint64_t sam3_lidar_projected_points_ = 0U;
+  std::uint64_t sam3_lidar_dynamic_rejections_ = 0U;
+  int last_sam3_lidar_dynamic_rejections_ = 0;
+  double last_sam3_lidar_mask_sync_dt_ =
+      std::numeric_limits<double>::infinity();
   cv::Mat propagated_semantic_labels_;
   cv::Mat semantic_propagation_gray_;
   double visual_update_rmse_ = std::numeric_limits<double>::infinity();
   double visual_update_ncc_ = 0.0;
+  double visual_update_correction_translation_ = 0.0;
+  double visual_update_correction_rotation_deg_ = 0.0;
   int visual_update_landmarks_ = 0;
   int visual_update_residuals_ = 0;
   int visual_update_iterations_ = 0;
   std::string visual_update_reason_ = "not_received";
   std::uint64_t semantic_clouds_received_ = 0U;
   std::uint64_t semantic_points_received_ = 0U;
+  std::uint64_t semantic_cloud_queue_drops_ = 0U;
+  std::uint64_t semantic_pose_drops_ = 0U;
   int lidar_registration_attempts_ = 0;
   int lidar_registration_accepts_ = 0;
   int lidar_registration_iterations_ = 0;
   double lidar_registration_rmse_ = std::numeric_limits<double>::infinity();
   double lidar_registration_inlier_ratio_ = 0.0;
+  double lidar_mean_normalized_residual_ =
+      std::numeric_limits<double>::infinity();
+  double lidar_measurement_condition_ =
+      std::numeric_limits<double>::infinity();
   double lidar_processing_ms_ = 0.0;
   int lidar_scan_points_ = 0;
+  int lidar_observable_directions_ = 0;
   int lidar_correspondence_sectors_ = 0;
   int lidar_point_knn_fallback_queries_ = 0;
   int lidar_point_knn_fallback_matches_ = 0;
   bool lidar_registration_degenerate_ = false;
   bool lidar_registration_used_imu_ = false;
   bool lidar_registration_used_wheel_ = false;
+  bool lidar_map_update_deferred_ = false;
   bool lidar_strong_support_ = false;
   bool lidar_recovery_mode_ = false;
   bool lidar_loss_limited_ = false;
@@ -866,7 +1063,16 @@ void HybridLocalizationNode::loadParameters()
   private_nh_.param<std::string>("lidar_point_time_mode", lidar_point_time_mode_, "none");
   private_nh_.param<std::string>("prior_pcd_path", prior_pcd_path_, "");
   private_nh_.param<std::string>("trajectory_save_path", trajectory_save_path_, "");
+  private_nh_.param<std::string>("trajectory_coordinate_mode",
+                                 trajectory_coordinate_mode_, "as_is");
   private_nh_.param<std::string>("object_save_path", object_save_path_, "");
+  trajectory_coordinate_mode_ =
+      normalizeTrajectoryCoordinateMode(trajectory_coordinate_mode_);
+  if (trajectory_coordinate_mode_.empty())
+  {
+    ROS_WARN("[hybrid_localization] unsupported trajectory_coordinate_mode; using as_is");
+    trajectory_coordinate_mode_ = "as_is";
+  }
 
   private_nh_.param("subscribe_imu", subscribe_imu_, true);
   private_nh_.param("subscribe_wheel", subscribe_wheel_, false);
@@ -895,6 +1101,12 @@ void HybridLocalizationNode::loadParameters()
   private_nh_.param("visual_frontend/publish_debug",
                     publish_visual_direct_debug_, true);
   private_nh_.param("visual_frontend/use_sam3", visual_use_sam3_, false);
+  private_nh_.param("visual_frontend/update_interval_sec",
+                    visual_update_interval_sec_, 0.50);
+  private_nh_.param("strict_sensor_frame_validation",
+                    strict_sensor_frame_validation_, true);
+  private_nh_.param("semantic_lidar_filter/enabled",
+                    semantic_lidar_filter_enabled_, false);
   private_nh_.param("visual_frontend/sam3_flow_scale", sam3_flow_scale_, 0.5);
   private_nh_.param("visual_frontend/sam3_cache_duration_sec",
                     sam3_cache_duration_sec_, 6.0);
@@ -922,6 +1134,8 @@ void HybridLocalizationNode::loadParameters()
   private_nh_.param("max_local_points", max_local_points_, 18000);
   private_nh_.param("max_local_semantic_points", max_local_semantic_points_, 60000);
   private_nh_.param("max_semantic_output_points", max_semantic_output_points_, 12000);
+  private_nh_.param("max_pending_semantic_clouds", max_pending_semantic_clouds_, 240);
+  private_nh_.param("max_semantic_process_per_tick", max_semantic_process_per_tick_, 2);
   private_nh_.param("max_objects", max_objects_, 1000);
   private_nh_.param("dynamic_label", dynamic_label_, 5);
   private_nh_.param("traversable_label_max", traversable_label_max_, 2);
@@ -932,6 +1146,7 @@ void HybridLocalizationNode::loadParameters()
   private_nh_.param("keyframe_angle_deg", keyframe_angle_deg_, 8.0);
   private_nh_.param("keyframe_interval_sec", keyframe_interval_sec_, 0.5);
   private_nh_.param("max_pose_lookup_dt", max_odom_lookup_dt_, 0.15);
+  private_nh_.param("odom_history_sec", odom_history_sec_, 600.0);
   private_nh_.param("local_map_window_sec", local_map_window_sec_, 12.0);
   private_nh_.param("local_map_resolution", local_map_resolution_, 0.25);
   private_nh_.param("local_map_size_m", local_map_size_m_, 80.0);
@@ -956,11 +1171,28 @@ void HybridLocalizationNode::loadParameters()
   private_nh_.param("status_rate", status_rate_, 1.0);
   private_nh_.param("lidar_point_time_scale", lidar_point_time_scale_, 1.0);
   private_nh_.param("lidar_imu_wait_sec", lidar_imu_wait_sec_, 0.0);
+  private_nh_.param("imu_time_offset", imu_time_offset_, 0.0);
+  private_nh_.param("lidar_time_offset", lidar_time_offset_, 0.0);
+  private_nh_.param("wheel_time_offset", wheel_time_offset_, 0.0);
   private_nh_.param("camera_time_offset", camera_time_offset_, 0.0);
+  private_nh_.param("sensor_time_offset_limit_sec",
+                    sensor_time_offset_limit_sec_, 1.0);
+  private_nh_.param("semantic_lidar_filter/sync_tolerance_sec",
+                    semantic_lidar_filter_sync_tolerance_sec_, 0.30);
+  private_nh_.param("semantic_lidar_filter/max_source_age_sec",
+                    semantic_lidar_filter_max_source_age_sec_, 6.0);
+  private_nh_.param("semantic_lidar_filter/min_project_depth",
+                    semantic_lidar_filter_min_depth_, 0.20);
+  private_nh_.param("semantic_lidar_filter/support_radius_px",
+                    semantic_lidar_filter_support_radius_px_, 1);
+  private_nh_.param("semantic_lidar_filter/min_dynamic_support_ratio",
+                    semantic_lidar_filter_min_dynamic_support_ratio_, 0.55);
   private_nh_.param("measurement_scheduler/camera_imu_wait_sec",
                     camera_imu_wait_sec_, 0.01);
   private_nh_.param("measurement_scheduler/camera_observation_interval_sec",
                     camera_observation_interval_sec_, 0.20);
+  private_nh_.param("measurement_scheduler/max_image_lag_sec",
+                    measurement_max_image_lag_sec_, 0.50);
   private_nh_.param("measurement_scheduler/reorder_window_sec",
                     measurement_reorder_window_sec_, 0.02);
   private_nh_.param("measurement_scheduler/process_rate_hz",
@@ -972,12 +1204,31 @@ void HybridLocalizationNode::loadParameters()
   camera_imu_wait_sec_ = std::max(0.0, camera_imu_wait_sec_);
   camera_observation_interval_sec_ = std::max(0.0,
                                                camera_observation_interval_sec_);
+  visual_update_interval_sec_ = std::max(0.0, visual_update_interval_sec_);
+  measurement_max_image_lag_sec_ = std::max(0.0, measurement_max_image_lag_sec_);
   measurement_reorder_window_sec_ = std::max(0.0, measurement_reorder_window_sec_);
   measurement_scheduler_process_rate_hz_ = std::max(
       10.0, measurement_scheduler_process_rate_hz_);
   measurement_scheduler_max_events_per_tick_ = std::max(
       1, measurement_scheduler_max_events_per_tick_);
   max_measurement_queue_ = std::max(10, max_measurement_queue_);
+  max_pending_semantic_clouds_ = std::max(1, max_pending_semantic_clouds_);
+  max_semantic_process_per_tick_ = std::max(1, max_semantic_process_per_tick_);
+  odom_history_sec_ = std::max(max_odom_lookup_dt_, odom_history_sec_);
+  sensor_time_offset_limit_sec_ = std::max(0.0, sensor_time_offset_limit_sec_);
+  semantic_lidar_filter_sync_tolerance_sec_ = std::max(
+      0.005, semantic_lidar_filter_sync_tolerance_sec_);
+  semantic_lidar_filter_max_source_age_sec_ = std::max(
+      semantic_lidar_filter_sync_tolerance_sec_,
+      semantic_lidar_filter_max_source_age_sec_);
+  semantic_lidar_filter_max_source_age_sec_ = std::min(
+      sam3_cache_duration_sec_, semantic_lidar_filter_max_source_age_sec_);
+  semantic_lidar_filter_min_depth_ = std::max(
+      0.01, semantic_lidar_filter_min_depth_);
+  semantic_lidar_filter_support_radius_px_ = std::max(
+      0, std::min(8, semantic_lidar_filter_support_radius_px_));
+  semantic_lidar_filter_min_dynamic_support_ratio_ = std::max(
+      0.0, std::min(1.0, semantic_lidar_filter_min_dynamic_support_ratio_));
 
   const auto load_extrinsic = [this](const std::string &name, Eigen::Isometry3d &transform)
   {
@@ -998,6 +1249,41 @@ void HybridLocalizationNode::loadParameters()
   };
   load_extrinsic("body_from_lidar", body_from_lidar_);
   load_extrinsic("body_from_imu", body_from_imu_);
+  const auto validate_sensor_transform = [this](const char *name,
+                                                const Eigen::Isometry3d &transform,
+                                                double *rotation_error)
+  {
+    std::string reason;
+    if (validateRigidTransform(transform, rotation_error, &reason)) return true;
+    sensor_frame_contract_valid_ = false;
+    sensor_frame_contract_reason_ = std::string(name) + ":" + reason;
+    return false;
+  };
+  const bool lidar_transform_valid = validate_sensor_transform(
+      "body_from_lidar", body_from_lidar_, &body_from_lidar_rotation_error_);
+  const bool imu_transform_valid = validate_sensor_transform(
+      "body_from_imu", body_from_imu_, &body_from_imu_rotation_error_);
+  const bool time_offsets_valid = std::isfinite(imu_time_offset_) &&
+      std::isfinite(lidar_time_offset_) && std::isfinite(wheel_time_offset_) &&
+      std::isfinite(camera_time_offset_) &&
+      std::max(std::max(std::abs(imu_time_offset_), std::abs(lidar_time_offset_)),
+               std::max(std::abs(wheel_time_offset_), std::abs(camera_time_offset_))) <=
+          sensor_time_offset_limit_sec_;
+  if (!time_offsets_valid)
+  {
+    sensor_frame_contract_valid_ = false;
+    sensor_frame_contract_reason_ = "time_offset_out_of_range";
+  }
+  if (!lidar_transform_valid || !imu_transform_valid || !time_offsets_valid)
+  {
+    ROS_ERROR("[hybrid_localization] invalid sensor frame/time contract: %s",
+              sensor_frame_contract_reason_.c_str());
+    if (strict_sensor_frame_validation_)
+    {
+      throw std::runtime_error("invalid sensor frame/time contract: " +
+                               sensor_frame_contract_reason_);
+    }
+  }
   optimizer_ = SlidingWindowOptimizer(static_cast<std::size_t>(std::max(2, keyframe_max_states_)));
   local_bev_.reset(static_cast<int>(local_map_size_m_ / local_map_resolution_),
                    static_cast<int>(local_map_size_m_ / local_map_resolution_),
@@ -1021,6 +1307,8 @@ void HybridLocalizationNode::configureLidarOdometry()
   private_nh_.param("lidar_odometry/lidar_beam_noise", options.lidar_beam_noise, 0.0015);
   private_nh_.param("lidar_odometry/lidar_measurement_noise",
                     options.lidar_measurement_noise, 0.05);
+  private_nh_.param("lidar_odometry/use_directional_lidar_covariance",
+                    options.use_directional_lidar_covariance, false);
   private_nh_.param("lidar_odometry/huber_delta", options.huber_delta, 0.20);
   private_nh_.param("lidar_odometry/max_rmse", options.max_rmse, 0.35);
   private_nh_.param("lidar_odometry/min_inlier_ratio", options.min_inlier_ratio, 0.18);
@@ -1030,6 +1318,18 @@ void HybridLocalizationNode::configureLidarOdometry()
                     options.convergence_rotation_deg, 0.05);
   private_nh_.param("lidar_odometry/degeneracy_eigen_ratio",
                     options.degeneracy_eigen_ratio, 1e-4);
+  private_nh_.param("lidar_odometry/observability_eigen_ratio",
+                    options.observability_eigen_ratio, 1e-4);
+  private_nh_.param("lidar_odometry/min_observable_directions",
+                    options.min_observable_directions, 3);
+  private_nh_.param("lidar_odometry/max_mean_normalized_residual",
+                    options.max_mean_normalized_residual, 10.0);
+  private_nh_.param("lidar_odometry/map_insertion_min_observable_directions",
+                    options.map_insertion_min_observable_directions, 3);
+  private_nh_.param("lidar_odometry/map_insertion_max_mean_normalized_residual",
+                    options.map_insertion_max_mean_normalized_residual, 8.0);
+  private_nh_.param("lidar_odometry/preserve_unobservable_covariance",
+                    options.preserve_unobservable_covariance, true);
   private_nh_.param("lidar_odometry/solver_damping", options.solver_damping, 1e-5);
   private_nh_.param("lidar_odometry/max_translation_per_scan",
                     options.max_translation_per_scan, 3.0);
@@ -1097,6 +1397,17 @@ void HybridLocalizationNode::configureLidarOdometry()
   private_nh_.param("lidar_odometry/wheel_huber_delta", options.wheel_huber_delta, 1.5);
   private_nh_.param("lidar_odometry/wheel_buffer_duration",
                     options.wheel_buffer_duration, 5.0);
+  std::vector<double> wheel_lever_arm;
+  private_nh_.param<std::vector<double>>("lidar_odometry/wheel_lever_arm",
+                                         wheel_lever_arm, std::vector<double>());
+  if (wheel_lever_arm.size() == 3U)
+  {
+    options.wheel_lever_arm = Eigen::Vector3d(wheel_lever_arm[0],
+                                              wheel_lever_arm[1],
+                                              wheel_lever_arm[2]);
+  }
+  private_nh_.param("lidar_odometry/wheel_compensate_angular_velocity",
+                    options.wheel_compensate_angular_velocity, true);
   private_nh_.param("lidar_odometry/max_iterations", options.max_iterations, 10);
   private_nh_.param("lidar_odometry/min_scan_points", options.min_scan_points, 150);
   private_nh_.param("lidar_odometry/min_correspondences", options.min_correspondences, 80);
@@ -1133,6 +1444,9 @@ void HybridLocalizationNode::configureLidarOdometry()
                     options.recovery_max_lidar_correction_translation, 0.0);
   private_nh_.param("lidar_odometry/recovery_max_lidar_correction_rotation_deg",
                     options.recovery_max_lidar_correction_rotation_deg, 0.0);
+  private_nh_.param(
+      "lidar_odometry/recovery_map_insert_min_consecutive_strong_support",
+      options.recovery_map_insert_min_consecutive_strong_support, 0);
   private_nh_.param("lidar_odometry/min_voxel_plane_points",
                     options.min_voxel_plane_points, 8);
   private_nh_.param("lidar_odometry/max_voxel_points", options.max_voxel_points, 120);
@@ -1146,6 +1460,8 @@ void HybridLocalizationNode::configureLidarOdometry()
   private_nh_.param("visual_frontend/min_residuals",
                     options.visual_min_residuals, 240);
   private_nh_.param("visual_frontend/max_rmse", options.visual_max_rmse, 1.20);
+  private_nh_.param("visual_frontend/min_mean_ncc",
+                    options.visual_min_mean_ncc, 0.72);
   private_nh_.param("visual_frontend/max_translation_step",
                     options.visual_max_translation_step, 0.35);
   private_nh_.param("visual_frontend/max_rotation_step_deg",
@@ -1167,6 +1483,8 @@ void HybridLocalizationNode::configureVisualMap()
   private_nh_.param("visual_frontend/fy", options.fy, 1065.2546);
   private_nh_.param("visual_frontend/cx", options.cx, 801.4049);
   private_nh_.param("visual_frontend/cy", options.cy, 624.6878);
+  private_nh_.param("visual_frontend/apply_distortion",
+                    options.apply_distortion, false);
   private_nh_.param("visual_frontend/image_scale", options.image_scale, 0.5);
   private_nh_.param("visual_frontend/patch_half_size", options.patch_half_size, 3);
   private_nh_.param("visual_frontend/grid_size_pixels", options.grid_size_pixels, 24);
@@ -1233,6 +1551,44 @@ void HybridLocalizationNode::configureVisualMap()
       }
       options.body_from_camera_translation(row) =
           body_from_camera[static_cast<std::size_t>(row * 4 + 3)];
+    }
+  }
+  private_nh_.param("visual_frontend/image_width",
+                    lidar_mask_camera_.image_width, 1600);
+  private_nh_.param("visual_frontend/image_height",
+                    lidar_mask_camera_.image_height, 1200);
+  lidar_mask_camera_.fx = options.fx;
+  lidar_mask_camera_.fy = options.fy;
+  lidar_mask_camera_.cx = options.cx;
+  lidar_mask_camera_.cy = options.cy;
+  lidar_mask_camera_.distortion = options.distortion;
+  lidar_mask_camera_.body_from_camera.setIdentity();
+  lidar_mask_camera_.body_from_camera.linear() = options.body_from_camera_rotation;
+  lidar_mask_camera_.body_from_camera.translation() =
+      options.body_from_camera_translation;
+  std::string camera_transform_reason;
+  const bool camera_transform_valid = validateRigidTransform(
+      lidar_mask_camera_.body_from_camera, &body_from_camera_rotation_error_,
+      &camera_transform_reason);
+  const bool camera_intrinsics_valid = std::isfinite(lidar_mask_camera_.fx) &&
+      std::isfinite(lidar_mask_camera_.fy) && std::isfinite(lidar_mask_camera_.cx) &&
+      std::isfinite(lidar_mask_camera_.cy) && lidar_mask_camera_.fx > 1.0 &&
+      lidar_mask_camera_.fy > 1.0 && lidar_mask_camera_.image_width > 0 &&
+      lidar_mask_camera_.image_height > 0;
+  lidar_mask_camera_.valid = camera_transform_valid && camera_intrinsics_valid;
+  if (!lidar_mask_camera_.valid &&
+      (visual_frontend_enabled_ || semantic_lidar_filter_enabled_))
+  {
+    sensor_frame_contract_valid_ = false;
+    sensor_frame_contract_reason_ = camera_transform_valid ?
+        std::string("visual_camera_invalid_intrinsics") :
+        std::string("body_from_camera:") + camera_transform_reason;
+    ROS_ERROR("[hybrid_localization] invalid camera frame/intrinsics contract: %s",
+              sensor_frame_contract_reason_.c_str());
+    if (strict_sensor_frame_validation_)
+    {
+      throw std::runtime_error("invalid camera frame/intrinsics contract: " +
+                               sensor_frame_contract_reason_);
     }
   }
   sparse_visual_map_ = SparseVisualMap(options);
@@ -1312,8 +1668,9 @@ void HybridLocalizationNode::initializeRos()
           camera_topic_, 20, &HybridLocalizationNode::cameraCallback, this);
     }
   }
-  if (subscribe_camera_frontend_ && visual_frontend_enabled_ &&
-      visual_use_sam3_ && !sam3_camera_label_topic_.empty())
+  if (subscribe_camera_frontend_ &&
+      (visual_use_sam3_ || semantic_lidar_filter_enabled_) &&
+      !sam3_camera_label_topic_.empty())
   {
     if (measurement_scheduler_enabled_)
     {
@@ -1394,14 +1751,20 @@ HybridLocalizationNode::~HybridLocalizationNode()
     std::ofstream output(trajectory_save_path_.c_str());
     if (output.is_open())
     {
+      output << "# coordinate_mode=" << trajectory_coordinate_mode_ << "\n";
       output << "timestamp,x,y,z,qx,qy,qz,qw\n";
       for (const geometry_msgs::PoseStamped &pose : output_path_.poses)
       {
+        const Eigen::Isometry3d saved_pose = trajectoryPoseInCoordinateMode(
+            poseFromMessage(pose.pose), trajectory_coordinate_mode_);
+        Eigen::Quaterniond saved_q(saved_pose.rotation());
+        saved_q.normalize();
         output << std::fixed << pose.header.stamp.toSec() << ","
-               << pose.pose.position.x << "," << pose.pose.position.y << ","
-               << pose.pose.position.z << "," << pose.pose.orientation.x << ","
-               << pose.pose.orientation.y << "," << pose.pose.orientation.z << ","
-               << pose.pose.orientation.w << "\n";
+               << saved_pose.translation().x() << ","
+               << saved_pose.translation().y() << ","
+               << saved_pose.translation().z() << "," << saved_q.x() << ","
+               << saved_q.y() << "," << saved_q.z() << "," << saved_q.w()
+               << "\n";
       }
     }
   }
@@ -1605,7 +1968,7 @@ uint8_t HybridLocalizationNode::normalizeLabel(uint8_t label) const
 void HybridLocalizationNode::imuCallback(const sensor_msgs::ImuConstPtr &message)
 {
   if (!message) return;
-  const double stamp = message->header.stamp.toSec();
+  const double stamp = message->header.stamp.toSec() + imu_time_offset_;
   const Eigen::Matrix3d body_from_imu_rotation = body_from_imu_.rotation();
   const Eigen::Vector3d acceleration = body_from_imu_rotation * Eigen::Vector3d(
       message->linear_acceleration.x, message->linear_acceleration.y,
@@ -1675,6 +2038,7 @@ void HybridLocalizationNode::wheelCallback(const nav_msgs::OdometryConstPtr &mes
   WheelSample sample;
   sample.stamp = message->header.stamp.isZero() ? ros::Time::now().toSec()
                                                 : message->header.stamp.toSec();
+  sample.stamp += wheel_time_offset_;
   sample.forward_speed = message->twist.twist.linear.x;
   lidar_odometry_.addWheelSample(sample);
   last_wheel_speed_ = sample.forward_speed;
@@ -1698,6 +2062,7 @@ void HybridLocalizationNode::rangerWheelCallback(
   sample.stamp = !message->header.stamp.isZero() ? message->header.stamp.toSec()
       : std::isfinite(message->unixtime) && message->unixtime > 0.0
           ? message->unixtime : ros::Time::now().toSec();
+  sample.stamp += wheel_time_offset_;
   sample.forward_speed = 0.5 * (speeds[1] + speeds[2]);
   lidar_odometry_.addWheelSample(sample);
   last_wheel_speed_ = sample.forward_speed;
@@ -1724,7 +2089,8 @@ void HybridLocalizationNode::handleLidarOdometry(const LidarOdometryResult &resu
   const double stamp = result.stamp;
   const Eigen::Isometry3d odom_pose = hybrid_localization::projectToSE3(result.pose);
   odom_history_.push_back(std::make_pair(stamp, odom_pose));
-  while (odom_history_.size() > 1200)
+  while (!odom_history_.empty() &&
+         stamp - odom_history_.front().first > odom_history_sec_)
   {
     odom_history_.pop_front();
   }
@@ -1753,6 +2119,7 @@ void HybridLocalizationNode::handleLidarOdometry(const LidarOdometryResult &resu
     last_keyframe_stamp_ = stamp;
     last_publish_stamp_ = ros::Time(stamp);
     publishCurrentState(ros::Time(stamp));
+    processPendingSemanticClouds();
     return;
   }
 
@@ -1838,6 +2205,7 @@ void HybridLocalizationNode::handleLidarOdometry(const LidarOdometryResult &resu
   }
   last_odom_stamp_ = stamp;
   publishCurrentState(ros::Time(stamp));
+  processPendingSemanticClouds();
 }
 
 void HybridLocalizationNode::handleVisualUpdate(const VisualUpdateResult &result)
@@ -1862,9 +2230,14 @@ void HybridLocalizationNode::handleVisualUpdate(const VisualUpdateResult &result
         1e-4, std::abs(result.covariance(index + 3, index + 3)));
   }
   odom_history_.push_back(std::make_pair(stamp, odom_pose));
-  while (odom_history_.size() > 1200) odom_history_.pop_front();
+  while (!odom_history_.empty() &&
+         stamp - odom_history_.front().first > odom_history_sec_)
+  {
+    odom_history_.pop_front();
+  }
   last_odom_stamp_ = stamp;
   publishCurrentState(ros::Time(stamp));
+  processPendingSemanticClouds();
 }
 
 void HybridLocalizationNode::optimizeCurrentWindow()
@@ -1885,9 +2258,12 @@ void HybridLocalizationNode::optimizeCurrentWindow()
 
 void HybridLocalizationNode::lidarCallback(const sensor_msgs::PointCloud2ConstPtr &message)
 {
+  if (!message) return;
   MeasurementEvent event;
-  event.stamp = message->header.stamp.isZero() ? ros::Time::now().toSec()
-                                                : message->header.stamp.toSec();
+  event.stamp = estimateLidarScanEndStamp(*message, lidar_point_time_mode_,
+                                          lidar_point_time_scale_,
+                                          lidar_stamp_is_end_,
+                                          lidar_time_offset_);
   event.type = MeasurementEventType::LIDAR;
   event.lidar = message;
   enqueueMeasurement(std::move(event), !measurement_scheduler_enabled_);
@@ -1938,6 +2314,108 @@ void HybridLocalizationNode::cacheCameraFrame(const cv::Mat &gray, double stamp)
   {
     camera_frame_cache_.pop_front();
   }
+}
+
+bool HybridLocalizationNode::currentLidarDynamicLabels(double scan_stamp,
+                                                        cv::Mat *labels,
+                                                        double *sync_dt) const
+{
+  if (labels != nullptr) labels->release();
+  if (sync_dt != nullptr)
+  {
+    *sync_dt = std::numeric_limits<double>::infinity();
+  }
+  if (!semantic_lidar_filter_enabled_ || !lidar_mask_camera_.valid ||
+      propagated_semantic_labels_.empty() || !std::isfinite(scan_stamp) ||
+      !std::isfinite(sam3_propagated_stamp_) ||
+      !std::isfinite(sam3_source_stamp_))
+  {
+    return false;
+  }
+  const double propagation_dt = std::abs(scan_stamp - sam3_propagated_stamp_);
+  const double source_age = scan_stamp - sam3_source_stamp_;
+  if (sync_dt != nullptr) *sync_dt = propagation_dt;
+  if (propagation_dt > semantic_lidar_filter_sync_tolerance_sec_ ||
+      source_age < -semantic_lidar_filter_sync_tolerance_sec_ ||
+      source_age > semantic_lidar_filter_max_source_age_sec_)
+  {
+    return false;
+  }
+  if (labels != nullptr) *labels = propagated_semantic_labels_;
+  return true;
+}
+
+bool HybridLocalizationNode::isDynamicLidarPoint(const Eigen::Vector3d &body_point,
+                                                  const cv::Mat &labels) const
+{
+  if (!lidar_mask_camera_.valid || labels.empty() || labels.type() != CV_8UC1 ||
+      !body_point.allFinite())
+  {
+    return false;
+  }
+  const Eigen::Vector3d camera_point =
+      lidar_mask_camera_.body_from_camera.inverse() * body_point;
+  if (!camera_point.allFinite() ||
+      camera_point.z() < semantic_lidar_filter_min_depth_)
+  {
+    return false;
+  }
+  const double x = camera_point.x() / camera_point.z();
+  const double y = camera_point.y() / camera_point.z();
+  const double r2 = x * x + y * y;
+  const double radial = 1.0 + lidar_mask_camera_.distortion[0] * r2 +
+      lidar_mask_camera_.distortion[1] * r2 * r2 +
+      lidar_mask_camera_.distortion[4] * r2 * r2 * r2;
+  const double distorted_x = x * radial +
+      2.0 * lidar_mask_camera_.distortion[2] * x * y +
+      lidar_mask_camera_.distortion[3] * (r2 + 2.0 * x * x);
+  const double distorted_y = y * radial +
+      lidar_mask_camera_.distortion[2] * (r2 + 2.0 * y * y) +
+      2.0 * lidar_mask_camera_.distortion[3] * x * y;
+  const double pixel_x = lidar_mask_camera_.fx * distorted_x +
+      lidar_mask_camera_.cx;
+  const double pixel_y = lidar_mask_camera_.fy * distorted_y +
+      lidar_mask_camera_.cy;
+  const int source_width = last_camera_image_width_ > 0 ?
+      last_camera_image_width_ : lidar_mask_camera_.image_width;
+  const int source_height = last_camera_image_height_ > 0 ?
+      last_camera_image_height_ : lidar_mask_camera_.image_height;
+  if (!std::isfinite(pixel_x) || !std::isfinite(pixel_y) ||
+      pixel_x < 0.0 || pixel_y < 0.0 ||
+      pixel_x >= static_cast<double>(source_width) ||
+      pixel_y >= static_cast<double>(source_height))
+  {
+    return false;
+  }
+  const int label_x = std::min(labels.cols - 1, std::max(0,
+      static_cast<int>(std::floor(pixel_x * labels.cols /
+                                  static_cast<double>(source_width)))));
+  const int label_y = std::min(labels.rows - 1, std::max(0,
+      static_cast<int>(std::floor(pixel_y * labels.rows /
+                                  static_cast<double>(source_height)))));
+  int dynamic_pixels = 0;
+  int support_pixels = 0;
+  for (int offset_y = -semantic_lidar_filter_support_radius_px_;
+       offset_y <= semantic_lidar_filter_support_radius_px_; ++offset_y)
+  {
+    const int row = label_y + offset_y;
+    if (row < 0 || row >= labels.rows) continue;
+    for (int offset_x = -semantic_lidar_filter_support_radius_px_;
+         offset_x <= semantic_lidar_filter_support_radius_px_; ++offset_x)
+    {
+      const int column = label_x + offset_x;
+      if (column < 0 || column >= labels.cols) continue;
+      ++support_pixels;
+      if (labels.at<uint8_t>(row, column) ==
+          static_cast<uint8_t>(dynamic_label_))
+      {
+        ++dynamic_pixels;
+      }
+    }
+  }
+  return support_pixels > 0 &&
+      static_cast<double>(dynamic_pixels) / static_cast<double>(support_pixels) >=
+          semantic_lidar_filter_min_dynamic_support_ratio_;
 }
 
 bool HybridLocalizationNode::propagateSemanticLabels(
@@ -2047,8 +2525,11 @@ void HybridLocalizationNode::drainPendingSam3CameraLabels()
           return stamp(left) < stamp(right);
         });
     const double source_stamp = stamp(*latest_iterator) + camera_time_offset_;
+    const double label_cache_tolerance = std::max(
+        sam3_label_sync_tolerance_sec_, semantic_lidar_filter_enabled_ ?
+        semantic_lidar_filter_sync_tolerance_sec_ : 0.0);
     if (std::isfinite(source_stamp) &&
-        last_camera_stamp_ + sam3_label_sync_tolerance_sec_ < source_stamp)
+        last_camera_stamp_ + label_cache_tolerance < source_stamp)
     {
       return;
     }
@@ -2089,7 +2570,10 @@ void HybridLocalizationNode::processSam3CameraLabel(
       best_difference = difference;
     }
   }
-  if (best_difference > sam3_label_sync_tolerance_sec_)
+  const double label_cache_tolerance = std::max(
+      sam3_label_sync_tolerance_sec_, semantic_lidar_filter_enabled_ ?
+      semantic_lidar_filter_sync_tolerance_sec_ : 0.0);
+  if (best_difference > label_cache_tolerance)
   {
     ++sam3_flow_failures_;
     ROS_WARN_THROTTLE(2.0,
@@ -2227,7 +2711,24 @@ void HybridLocalizationNode::drainMeasurementQueue(std::size_t max_events)
     bool stale = false;
     double required_imu_stamp = -std::numeric_limits<double>::infinity();
     {
-      std::lock_guard<std::mutex> lock(measurement_mutex_);
+    std::lock_guard<std::mutex> lock(measurement_mutex_);
+      while (!measurement_queue_.empty())
+      {
+        const MeasurementEvent &candidate = measurement_queue_.front();
+        const bool stale_image =
+            candidate.type == MeasurementEventType::IMAGE &&
+            measurement_max_image_lag_sec_ > 0.0 &&
+            std::isfinite(latest_enqueued_lidar_stamp_) &&
+            latest_enqueued_lidar_stamp_ >
+                candidate.stamp + measurement_max_image_lag_sec_;
+        if (!stale_image) break;
+        // Image updates are optional. Once LiDAR has progressed past the
+        // image's bounded latency budget, discard it rather than making an
+        // already-current LiDAR/IMU state wait behind stale photometric work.
+        measurement_queue_.pop_front();
+        ++measurement_queue_drops_;
+        ++measurement_image_lag_drops_;
+      }
       if (measurement_queue_.empty()) break;
       event = measurement_queue_.front();
       const double sensor_wait = event.type == MeasurementEventType::LIDAR ?
@@ -2308,12 +2809,15 @@ void HybridLocalizationNode::processImageMessage(
     return;
   }
   last_camera_stamp_ = corrected_stamp;
+  last_camera_image_width_ = image.cols;
+  last_camera_image_height_ = image.rows;
   ++processed_image_events_;
 
-  if (!visual_frontend_enabled_) return;
   cv::Mat semantic_labels;
   cv::Mat dynamic_mask;
-  if (visual_use_sam3_)
+  const bool need_sam3_labels = visual_use_sam3_ ||
+      semantic_lidar_filter_enabled_;
+  if (need_sam3_labels)
   {
     const cv::Mat flow_gray = semanticFlowGray(image);
     cacheCameraFrame(flow_gray, corrected_stamp);
@@ -2330,12 +2834,27 @@ void HybridLocalizationNode::processImageMessage(
     if (synchronized && fresh)
     {
       semantic_labels = propagated_semantic_labels_.clone();
-      cv::compare(semantic_labels, cv::Scalar(dynamic_label_), dynamic_mask,
-                  cv::CMP_EQ);
-      sam3_dynamic_pixels_ = static_cast<std::uint64_t>(
-          cv::countNonZero(dynamic_mask));
       ++sam3_camera_labels_applied_;
     }
+  }
+  if (!visual_frontend_enabled_) return;
+  if (visual_update_interval_sec_ > 0.0 &&
+      std::isfinite(last_visual_update_stamp_) &&
+      corrected_stamp < last_visual_update_stamp_ + visual_update_interval_sec_ - 1e-8)
+  {
+    ++visual_update_interval_drops_;
+    return;
+  }
+  if (visual_use_sam3_ && !semantic_labels.empty())
+  {
+    cv::compare(semantic_labels, cv::Scalar(dynamic_label_), dynamic_mask,
+                cv::CMP_EQ);
+    sam3_dynamic_pixels_ = static_cast<std::uint64_t>(
+        cv::countNonZero(dynamic_mask));
+  }
+  else
+  {
+    semantic_labels.release();
   }
   const SparseVisualFrame frame = sparse_visual_map_.prepareFrame(
       corrected_stamp, image, dynamic_mask, semantic_labels);
@@ -2345,6 +2864,7 @@ void HybridLocalizationNode::processImageMessage(
     return;
   }
 
+  last_visual_update_stamp_ = corrected_stamp;
   ++visual_update_attempts_;
   VisualUpdateResult update;
   if (visual_observation_only_)
@@ -2373,6 +2893,18 @@ void HybridLocalizationNode::processImageMessage(
   }
   visual_update_rmse_ = update.rmse;
   visual_update_ncc_ = update.mean_ncc;
+  if (update.correction.matrix().allFinite())
+  {
+    visual_update_correction_translation_ = update.correction.translation().norm();
+    const double cosine = std::max(-1.0, std::min(1.0,
+        0.5 * (update.correction.rotation().trace() - 1.0)));
+    visual_update_correction_rotation_deg_ = std::acos(cosine) * 180.0 / kPi;
+  }
+  else
+  {
+    visual_update_correction_translation_ = std::numeric_limits<double>::infinity();
+    visual_update_correction_rotation_deg_ = std::numeric_limits<double>::infinity();
+  }
   visual_update_landmarks_ = update.landmarks;
   visual_update_residuals_ = update.residuals;
   visual_update_iterations_ = update.iterations;
@@ -2403,8 +2935,6 @@ void HybridLocalizationNode::processLidarMessage(
   const double header_stamp = message->header.stamp.isZero() ? ros::Time::now().toSec()
                                                               : message->header.stamp.toSec();
   const std::vector<CloudPoint> input = decodeCloud(*message, label_field_, max_lidar_points_);
-  TimedPointVector timed_points;
-  timed_points.reserve(input.size());
   double maximum_point_time = -std::numeric_limits<double>::infinity();
   for (const CloudPoint &source : input)
   {
@@ -2413,24 +2943,20 @@ void HybridLocalizationNode::processLidarMessage(
     {
       continue;
     }
-    const Eigen::Vector3d body_point = body_from_lidar_ * source.point;
-    if (body_point.allFinite())
+    if (source.has_point_time && lidar_point_time_mode_ != "none")
     {
-      TimedPoint timed_point;
-      timed_point.point = body_point;
-      if (source.has_point_time && lidar_point_time_mode_ != "none")
+      const double point_time = source.point_time * lidar_point_time_scale_;
+      if (std::isfinite(point_time))
       {
-        timed_point.time_from_scan_end = source.point_time * lidar_point_time_scale_;
-        maximum_point_time = std::max(maximum_point_time, timed_point.time_from_scan_end);
+        maximum_point_time = std::max(maximum_point_time, point_time);
       }
-      timed_points.push_back(timed_point);
     }
   }
 
-  double stamp = header_stamp;
+  double sensor_scan_end_stamp = header_stamp;
+  bool use_absolute_point_time = lidar_point_time_mode_ == "absolute";
   if (std::isfinite(maximum_point_time))
   {
-    bool use_absolute_point_time = lidar_point_time_mode_ == "absolute";
     const bool point_time_looks_absolute =
         maximum_point_time > 1.0e8 && std::abs(maximum_point_time - header_stamp) < 10.0;
     if (!use_absolute_point_time && point_time_looks_absolute)
@@ -2441,21 +2967,69 @@ void HybridLocalizationNode::processLidarMessage(
     }
     if (use_absolute_point_time)
     {
-      stamp = maximum_point_time;
-      for (TimedPoint &point : timed_points)
-      {
-        point.time_from_scan_end -= stamp;
-      }
+      sensor_scan_end_stamp = maximum_point_time;
     }
     else
     {
-      stamp = lidar_stamp_is_end_ ? header_stamp : header_stamp + maximum_point_time;
-      for (TimedPoint &point : timed_points)
-      {
-        point.time_from_scan_end -= maximum_point_time;
-      }
+      sensor_scan_end_stamp = lidar_stamp_is_end_ ? header_stamp :
+          header_stamp + maximum_point_time;
     }
   }
+  const double stamp = sensor_scan_end_stamp + lidar_time_offset_;
+
+  cv::Mat dynamic_labels;
+  const bool dynamic_mask_available = currentLidarDynamicLabels(
+      stamp, &dynamic_labels, &last_sam3_lidar_mask_sync_dt_);
+  if (semantic_lidar_filter_enabled_)
+  {
+    if (dynamic_mask_available)
+    {
+      ++sam3_lidar_mask_scans_;
+    }
+    else
+    {
+      ++sam3_lidar_mask_unavailable_scans_;
+    }
+  }
+
+  TimedPointVector timed_points;
+  timed_points.reserve(input.size());
+  int dynamic_rejections = 0;
+  for (const CloudPoint &source : input)
+  {
+    const double sensor_range = source.point.norm();
+    if (!source.point.allFinite() || sensor_range < local_min_range_ ||
+        sensor_range > local_max_range_)
+    {
+      continue;
+    }
+    const Eigen::Vector3d body_point = body_from_lidar_ * source.point;
+    if (!body_point.allFinite()) continue;
+    if (dynamic_mask_available)
+    {
+      ++sam3_lidar_projected_points_;
+      if (isDynamicLidarPoint(body_point, dynamic_labels))
+      {
+        ++dynamic_rejections;
+        continue;
+      }
+    }
+    TimedPoint timed_point;
+    timed_point.point = body_point;
+    if (source.has_point_time && std::isfinite(maximum_point_time) &&
+        lidar_point_time_mode_ != "none")
+    {
+      const double point_time = source.point_time * lidar_point_time_scale_;
+      if (std::isfinite(point_time))
+      {
+        timed_point.time_from_scan_end = use_absolute_point_time ?
+            point_time - sensor_scan_end_stamp : point_time - maximum_point_time;
+      }
+    }
+    timed_points.push_back(timed_point);
+  }
+  last_sam3_lidar_dynamic_rejections_ = dynamic_rejections;
+  sam3_lidar_dynamic_rejections_ += static_cast<std::uint64_t>(dynamic_rejections);
   if (!lidar_deskew_enabled_)
   {
     for (TimedPoint &point : timed_points)
@@ -2471,14 +3045,18 @@ void HybridLocalizationNode::processLidarMessage(
   const PointVector &body_points = result.deskewed_points;
   lidar_registration_rmse_ = result.rmse;
   lidar_registration_inlier_ratio_ = result.inlier_ratio;
+  lidar_mean_normalized_residual_ = result.mean_normalized_residual;
+  lidar_measurement_condition_ = result.measurement_condition;
   lidar_registration_iterations_ = result.iterations;
   lidar_scan_points_ = result.scan_points;
+  lidar_observable_directions_ = result.observable_directions;
   lidar_correspondence_sectors_ = result.correspondence_azimuth_sectors;
   lidar_point_knn_fallback_queries_ = result.point_knn_fallback_queries;
   lidar_point_knn_fallback_matches_ = result.point_knn_fallback_matches;
   lidar_registration_degenerate_ = result.degenerate;
   lidar_registration_used_imu_ = result.used_imu;
   lidar_registration_used_wheel_ = result.used_wheel;
+  lidar_map_update_deferred_ = result.map_update_deferred;
   lidar_strong_support_ = result.strong_support;
   lidar_recovery_mode_ = result.recovery_mode;
   lidar_loss_limited_ = result.loss_limited;
@@ -2510,9 +3088,11 @@ void HybridLocalizationNode::processLidarMessage(
   else
   {
     ROS_WARN_THROTTLE(2.0,
-                      "[hybrid_localization] LiDAR registration degraded: %s scan=%d corr=%d sectors=%d "
-                      "knn=%d/%d rmse=%.3f strong=%d recovery=%d rejections=%d loss_limited=%d loss_frozen=%d",
+                      "[hybrid_localization] LiDAR registration degraded: %s scan=%d corr=%d obs=%d "
+                      "norm_res=%.3f sectors=%d knn=%d/%d rmse=%.3f strong=%d recovery=%d "
+                      "rejections=%d loss_limited=%d loss_frozen=%d",
                       result.reject_reason.c_str(), result.scan_points, result.correspondences,
+                      result.observable_directions, result.mean_normalized_residual,
                       result.correspondence_azimuth_sectors,
                       result.point_knn_fallback_matches, result.point_knn_fallback_queries, result.rmse,
                       result.strong_support ? 1 : 0, result.recovery_mode ? 1 : 0,
@@ -2553,26 +3133,77 @@ void HybridLocalizationNode::processLidarMessage(
 
 void HybridLocalizationNode::semanticCallback(const sensor_msgs::PointCloud2ConstPtr &message)
 {
-  processSemanticCloud(message);
+  if (!message)
+  {
+    ++dropped_clouds_;
+    return;
+  }
+  const double stamp = message->header.stamp.isZero() ? ros::Time::now().toSec() :
+      message->header.stamp.toSec() + lidar_time_offset_;
+  if (!std::isfinite(stamp))
+  {
+    ++dropped_clouds_;
+    return;
+  }
+  const auto insertion = std::upper_bound(
+      pending_semantic_clouds_.begin(), pending_semantic_clouds_.end(), stamp,
+      [](double value, const PendingSemanticCloud &candidate)
+      {
+        return value < candidate.stamp;
+      });
+  pending_semantic_clouds_.insert(insertion, PendingSemanticCloud{stamp, message});
+  while (pending_semantic_clouds_.size() >
+         static_cast<std::size_t>(max_pending_semantic_clouds_))
+  {
+    // Preserve the oldest observations because their source poses will become
+    // available first. A newer SAM3 result can be regenerated if needed.
+    pending_semantic_clouds_.pop_back();
+    ++semantic_cloud_queue_drops_;
+  }
+  processPendingSemanticClouds();
 }
 
-void HybridLocalizationNode::processSemanticCloud(const sensor_msgs::PointCloud2ConstPtr &message)
+void HybridLocalizationNode::processPendingSemanticClouds()
 {
-  if (!have_odom_)
+  int processed = 0;
+  while (processed < max_semantic_process_per_tick_ &&
+         !pending_semantic_clouds_.empty())
   {
-    ++dropped_clouds_;
-    return;
+    if (!have_odom_ || odom_history_.empty())
+    {
+      return;
+    }
+    const PendingSemanticCloud &pending = pending_semantic_clouds_.front();
+    // The mapper may finish a source frame before the scheduler has processed
+    // its matching LiDAR scan. Wait instead of permanently dropping it.
+    if (odom_history_.back().first + 1e-9 < pending.stamp)
+    {
+      return;
+    }
+    bool pose_ok = false;
+    const Eigen::Isometry3d odom_pose = lookupOdomPose(pending.stamp, &pose_ok);
+    if (!pose_ok)
+    {
+      ++dropped_clouds_;
+      ++semantic_pose_drops_;
+      ROS_WARN_THROTTLE(5.0,
+                        "[hybrid_localization] dropped semantic cloud: no internal LiDAR pose near %.3f",
+                        pending.stamp);
+      pending_semantic_clouds_.pop_front();
+      continue;
+    }
+    const sensor_msgs::PointCloud2ConstPtr message = pending.message;
+    const double stamp = pending.stamp;
+    pending_semantic_clouds_.pop_front();
+    processSemanticCloud(message, stamp, odom_pose);
+    ++processed;
   }
-  const double stamp = message->header.stamp.isZero() ? last_odom_stamp_ : message->header.stamp.toSec();
-  bool pose_ok = false;
-  const Eigen::Isometry3d odom_pose = lookupOdomPose(stamp, &pose_ok);
-  if (!pose_ok)
-  {
-    ++dropped_clouds_;
-    ROS_WARN_THROTTLE(5.0, "[hybrid_localization] dropped semantic cloud: no internal LiDAR pose near %.3f",
-                      stamp);
-    return;
-  }
+}
+
+void HybridLocalizationNode::processSemanticCloud(
+    const sensor_msgs::PointCloud2ConstPtr &message, double stamp,
+    const Eigen::Isometry3d &odom_pose)
+{
   const std::vector<CloudPoint> input = decodeCloud(*message, label_field_, max_semantic_points_);
   std::vector<BevPoint, Eigen::aligned_allocator<BevPoint>> points;
   points.reserve(input.size());
@@ -3034,11 +3665,14 @@ void HybridLocalizationNode::publishCurrentState(const ros::Time &stamp)
   if (trajectory_stream_.is_open() &&
       stamp.toSec() > last_saved_trajectory_stamp_ + 1e-6)
   {
-    const Eigen::Quaterniond saved_q(global_pose.rotation());
+    const Eigen::Isometry3d saved_pose = trajectoryPoseInCoordinateMode(
+        global_pose, trajectory_coordinate_mode_);
+    Eigen::Quaterniond saved_q(saved_pose.rotation());
+    saved_q.normalize();
     trajectory_stream_ << std::fixed << stamp.toSec() << ","
-                       << global_pose.translation().x() << ","
-                       << global_pose.translation().y() << ","
-                       << global_pose.translation().z() << ","
+                       << saved_pose.translation().x() << ","
+                       << saved_pose.translation().y() << ","
+                       << saved_pose.translation().z() << ","
                        << saved_q.x() << "," << saved_q.y() << ","
                        << saved_q.z() << "," << saved_q.w() << "\n";
     trajectory_stream_.flush();
@@ -3302,7 +3936,9 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   std::uint64_t scheduled_images = 0U;
   std::uint64_t scheduler_queue_drops = 0U;
   std::uint64_t scheduler_image_queue_drops = 0U;
+  std::uint64_t scheduler_image_lag_drops = 0U;
   std::uint64_t camera_interval_drops = 0U;
+  std::uint64_t visual_interval_drops = 0U;
   std::uint64_t scheduler_stale_drops = 0U;
   std::size_t pending_sam3_labels = 0U;
   std::uint64_t sam3_label_queue_drops = 0U;
@@ -3313,7 +3949,9 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
     scheduled_images = scheduled_image_events_;
     scheduler_queue_drops = measurement_queue_drops_;
     scheduler_image_queue_drops = measurement_image_queue_drops_;
+    scheduler_image_lag_drops = measurement_image_lag_drops_;
     camera_interval_drops = camera_observation_interval_drops_;
+    visual_interval_drops = visual_update_interval_drops_;
     scheduler_stale_drops = measurement_stale_drops_;
   }
   {
@@ -3332,14 +3970,18 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";lio_accepts=" << lidar_registration_accepts_
          << ";lio_rmse=" << lidar_registration_rmse_
          << ";lio_inlier_ratio=" << lidar_registration_inlier_ratio_
+         << ";lio_mean_normalized_residual=" << lidar_mean_normalized_residual_
+         << ";lio_measurement_condition=" << lidar_measurement_condition_
          << ";lio_iterations=" << lidar_registration_iterations_
          << ";lio_processing_ms=" << lidar_processing_ms_
          << ";lio_scan_points=" << lidar_scan_points_
+         << ";lio_observable_directions=" << lidar_observable_directions_
          << ";lio_correspondence_sectors=" << lidar_correspondence_sectors_
          << ";lio_knn_fallback_queries=" << lidar_point_knn_fallback_queries_
          << ";lio_knn_fallback_matches=" << lidar_point_knn_fallback_matches_
          << ";lio_map_points=" << lidar_odometry_.mapPointCount()
          << ";lio_degenerate=" << (lidar_registration_degenerate_ ? 1 : 0)
+         << ";lio_map_update_deferred=" << (lidar_map_update_deferred_ ? 1 : 0)
          << ";lio_strong_support=" << (lidar_strong_support_ ? 1 : 0)
          << ";lio_recovery_mode=" << (lidar_recovery_mode_ ? 1 : 0)
          << ";lio_used_imu=" << (lidar_registration_used_imu_ ? 1 : 0)
@@ -3351,6 +3993,11 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";wheel_speed=" << last_wheel_speed_
          << ";imu_initialized=" << (lidar_imu_initialized_ ? 1 : 0)
          << ";imu_init_progress=" << lidar_imu_init_progress_
+         << ";sensor_frame_contract=" << (sensor_frame_contract_valid_ ? "valid" : "invalid")
+         << ";sensor_frame_contract_reason=" << sensor_frame_contract_reason_
+         << ";imu_time_offset=" << imu_time_offset_
+         << ";lidar_time_offset=" << lidar_time_offset_
+         << ";camera_time_offset=" << camera_time_offset_
          << ";gyro_bias=" << lidar_gyro_bias_.transpose()
          << ";acceleration_bias=" << lidar_acceleration_bias_.transpose()
          << ";gravity=" << lidar_gravity_.transpose()
@@ -3361,9 +4008,12 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";scheduled_images=" << scheduled_images
          << ";processed_images=" << processed_image_events_
          << ";scheduler_queue_drops=" << scheduler_queue_drops
+         << ";scheduler_image_queue_drops=" << scheduler_image_queue_drops
+         << ";scheduler_image_lag_drops=" << scheduler_image_lag_drops
          << ";scheduler_stale_drops=" << scheduler_stale_drops
          << ";camera_decode_failures=" << camera_decode_failures_
          << ";camera_interval_drops=" << camera_interval_drops
+         << ";visual_interval_drops=" << visual_interval_drops
          << ";last_camera_stamp=" << last_camera_stamp_
          << ";visual_enabled=" << (visual_frontend_enabled_ ? 1 : 0)
          << ";visual_observation_only=" << (visual_observation_only_ ? 1 : 0)
@@ -3374,8 +4024,11 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";visual_residuals=" << visual_update_residuals_
          << ";visual_rmse=" << visual_update_rmse_
          << ";visual_mean_ncc=" << visual_update_ncc_
+         << ";visual_correction_translation=" << visual_update_correction_translation_
+         << ";visual_correction_rotation_deg=" << visual_update_correction_rotation_deg_
          << ";visual_iterations=" << visual_update_iterations_
          << ";visual_reason=" << visual_update_reason_
+         << ";trajectory_coordinate_mode=" << trajectory_coordinate_mode_
          << ";visual_dynamic_rejections=" << visual_stats.dynamic_rejections
          << ";sam3_camera_labels_received=" << sam3_camera_labels_received_
          << ";sam3_camera_labels_applied=" << sam3_camera_labels_applied_
@@ -3384,6 +4037,13 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";sam3_flow_propagations=" << sam3_flow_propagations_
          << ";sam3_flow_failures=" << sam3_flow_failures_
          << ";sam3_dynamic_pixels=" << sam3_dynamic_pixels_
+         << ";sam3_lidar_filter_enabled=" << (semantic_lidar_filter_enabled_ ? 1 : 0)
+         << ";sam3_lidar_mask_scans=" << sam3_lidar_mask_scans_
+         << ";sam3_lidar_mask_unavailable_scans=" << sam3_lidar_mask_unavailable_scans_
+         << ";sam3_lidar_mask_tested_points=" << sam3_lidar_projected_points_
+         << ";sam3_lidar_dynamic_rejections=" << sam3_lidar_dynamic_rejections_
+         << ";sam3_lidar_last_dynamic_rejections=" << last_sam3_lidar_dynamic_rejections_
+         << ";sam3_lidar_mask_sync_dt=" << last_sam3_lidar_mask_sync_dt_
          << ";sam3_source_age=" << (std::isfinite(sam3_source_stamp_) ?
               stamp.toSec() - sam3_source_stamp_ :
               std::numeric_limits<double>::infinity())
@@ -3391,6 +4051,9 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";semantic_points=" << semantic_points.size()
          << ";semantic_clouds=" << semantic_clouds_received_
          << ";semantic_points_received=" << semantic_points_received_
+         << ";semantic_pending=" << pending_semantic_clouds_.size()
+         << ";semantic_queue_drops=" << semantic_cloud_queue_drops_
+         << ";semantic_pose_drops=" << semantic_pose_drops_
          << ";objects=" << objects_.size()
          << ";factors=" << factor_count_
          << ";map_attempts=" << map_match_attempts_
@@ -3411,7 +4074,10 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
                   lidar_registration_inlier_ratio_, static_cast<double>(lidar_odometry_.mapPointCount()),
                   static_cast<double>(lidar_registration_accepts_), lidar_processing_ms_,
                   static_cast<double>(visual_update_accepts_), visual_update_rmse_,
-                  visual_update_ncc_, static_cast<double>(visual_stats.landmarks)};
+                  visual_update_ncc_, static_cast<double>(visual_stats.landmarks),
+                  lidar_mean_normalized_residual_,
+                  static_cast<double>(lidar_observable_directions_),
+                  static_cast<double>(sam3_lidar_dynamic_rejections_)};
   quality_pub_.publish(quality);
 
   diagnostic_msgs::DiagnosticArray diagnostics;
@@ -3423,7 +4089,7 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
                               : diagnostic_msgs::DiagnosticStatus::WARN;
   state.message = have_odom_ ? (lidar_healthy ? "running" : "LiDAR odometry degraded")
                              : "waiting for raw LiDAR";
-  state.values.resize(26);
+  state.values.resize(35);
   state.values[0].key = "prior_map"; state.values[0].value = prior_map_.valid() ? "ready" : "unavailable";
   state.values[1].key = "local_points"; state.values[1].value = std::to_string(local_points.size());
   state.values[2].key = "objects"; state.values[2].value = std::to_string(objects_.size());
@@ -3459,6 +4125,25 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   state.values[24].value = std::to_string(lidar_point_knn_fallback_queries_);
   state.values[25].key = "lidar_knn_fallback_matches";
   state.values[25].value = std::to_string(lidar_point_knn_fallback_matches_);
+  state.values[26].key = "lidar_observable_directions";
+  state.values[26].value = std::to_string(lidar_observable_directions_);
+  state.values[27].key = "lidar_mean_normalized_residual";
+  state.values[27].value = std::to_string(lidar_mean_normalized_residual_);
+  state.values[28].key = "lidar_measurement_condition";
+  state.values[28].value = std::to_string(lidar_measurement_condition_);
+  state.values[29].key = "lidar_map_update_deferred";
+  state.values[29].value = lidar_map_update_deferred_ ? "true" : "false";
+  state.values[30].key = "sensor_frame_contract";
+  state.values[30].value = sensor_frame_contract_valid_ ? "valid" :
+      sensor_frame_contract_reason_;
+  state.values[31].key = "imu_time_offset";
+  state.values[31].value = std::to_string(imu_time_offset_);
+  state.values[32].key = "lidar_time_offset";
+  state.values[32].value = std::to_string(lidar_time_offset_);
+  state.values[33].key = "camera_time_offset";
+  state.values[33].value = std::to_string(camera_time_offset_);
+  state.values[34].key = "sam3_lidar_dynamic_rejections";
+  state.values[34].value = std::to_string(sam3_lidar_dynamic_rejections_);
   diagnostics.status.push_back(state);
   diagnostic_msgs::DiagnosticStatus scheduler;
   scheduler.name = "hybrid_localization/measurement_scheduler";
@@ -3466,7 +4151,7 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   scheduler.level = scheduler_queue_drops == 0U && scheduler_stale_drops == 0U ?
       diagnostic_msgs::DiagnosticStatus::OK : diagnostic_msgs::DiagnosticStatus::WARN;
   scheduler.message = measurement_scheduler_enabled_ ? "timestamp ordered" : "disabled";
-  scheduler.values.resize(12);
+  scheduler.values.resize(14);
   scheduler.values[0].key = "queue";
   scheduler.values[0].value = std::to_string(measurement_queue_size);
   scheduler.values[1].key = "scheduled_lidar";
@@ -3491,6 +4176,10 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   scheduler.values[10].value = std::to_string(scheduler_image_queue_drops);
   scheduler.values[11].key = "camera_interval_drops";
   scheduler.values[11].value = std::to_string(camera_interval_drops);
+  scheduler.values[12].key = "image_lag_drops";
+  scheduler.values[12].value = std::to_string(scheduler_image_lag_drops);
+  scheduler.values[13].key = "visual_interval_drops";
+  scheduler.values[13].value = std::to_string(visual_interval_drops);
   diagnostics.status.push_back(scheduler);
   diagnostic_msgs::DiagnosticStatus visual;
   visual.name = "hybrid_localization/direct_visual_eskf";
@@ -3499,7 +4188,7 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
       visual_update_accepts_ > 0U ? diagnostic_msgs::DiagnosticStatus::OK
                                   : diagnostic_msgs::DiagnosticStatus::WARN;
   visual.message = visual_frontend_enabled_ ? visual_update_reason_ : "disabled";
-  visual.values.resize(19);
+  visual.values.resize(24);
   visual.values[0].key = "attempts";
   visual.values[0].value = std::to_string(visual_update_attempts_);
   visual.values[1].key = "accepts";
@@ -3538,6 +4227,16 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   visual.values[17].value = std::to_string(pending_sam3_labels);
   visual.values[18].key = "sam3_label_queue_drops";
   visual.values[18].value = std::to_string(sam3_label_queue_drops);
+  visual.values[19].key = "sam3_lidar_filter_enabled";
+  visual.values[19].value = semantic_lidar_filter_enabled_ ? "true" : "false";
+  visual.values[20].key = "sam3_lidar_mask_scans";
+  visual.values[20].value = std::to_string(sam3_lidar_mask_scans_);
+  visual.values[21].key = "sam3_lidar_mask_unavailable_scans";
+  visual.values[21].value = std::to_string(sam3_lidar_mask_unavailable_scans_);
+  visual.values[22].key = "sam3_lidar_dynamic_rejections";
+  visual.values[22].value = std::to_string(sam3_lidar_dynamic_rejections_);
+  visual.values[23].key = "sam3_lidar_mask_sync_dt";
+  visual.values[23].value = std::to_string(last_sam3_lidar_mask_sync_dt_);
   diagnostics.status.push_back(visual);
   diagnostic_pub_.publish(diagnostics);
 }

@@ -12,6 +12,12 @@ lidar_point_time_mode: relative
 lidar_point_time_scale: 0.000000001
 lidar_stamp_is_end: false
 lidar_imu_wait_sec: 0.115
+# Corrected sensor time = message time + offset. The i2Nav calibration gives
+# t_imu = t_odo - 0.01 s, so the Ranger timestamp must be shifted by -0.01 s.
+imu_time_offset: 0.0
+lidar_time_offset: 0.0
+wheel_time_offset: -0.01
+camera_time_offset: 0.0
 max_lidar_points: 16000
 
 lidar_odometry:
@@ -21,6 +27,7 @@ lidar_odometry:
   max_correspondence_distance: 1.30
   max_plane_distance: 0.38
   plane_max_eigen_ratio: 0.22
+  use_directional_lidar_covariance: true
   huber_delta: 0.15
   max_rmse: 0.32
   min_inlier_ratio: 0.14
@@ -28,6 +35,12 @@ lidar_odometry:
   max_rotation_per_scan_deg: 12.0
   max_translation_speed: 4.0
   max_rotation_speed_deg: 45.0
+  observability_eigen_ratio: 0.0002
+  min_observable_directions: 3
+  max_mean_normalized_residual: 10.0
+  map_insertion_min_observable_directions: 3
+  map_insertion_max_mean_normalized_residual: 8.0
+  preserve_unobservable_covariance: true
   map_insertion_max_plane_distance: 0.24
   max_iterations: 4
   min_scan_points: 250
@@ -59,6 +72,9 @@ lidar_odometry:
   wheel_lateral_noise: 0.12
   wheel_vertical_noise: 1.00
   wheel_huber_delta: 1.5
+  # Ranger MINI center is [0, 0, 0.852] in ADIS FRD. ROS body is FLU.
+  wheel_lever_arm: [0.0, 0.0, -0.852]
+  wheel_compensate_angular_velocity: true
   lidar_loss_hold_after_rejections: 3
   lidar_loss_freeze_after_rejections: 12
   lidar_loss_max_vertical_offset: 0.35

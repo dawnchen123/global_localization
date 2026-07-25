@@ -22,6 +22,7 @@ int main()
   options.keyframe_distance = 0.0;
   options.keyframe_interval_sec = 0.1;
   options.minimum_index_gap = 2;
+  options.minimum_time_separation_sec = 0.0;
   options.search_radius = 5.0;
   options.maximum_yaw_difference_deg = 20.0;
   options.minimum_descriptor_matches = 30;
@@ -86,6 +87,35 @@ int main()
   {
     std::cerr << "visual loop pose is inconsistent with identity" << std::endl;
     return 3;
+  }
+  for (int iteration = 0; iteration < 25; ++iteration)
+  {
+    hybrid_localization::VisualLoopDetector stress_detector(options);
+    stress_detector.process(0.0, image, points, pose);
+    stress_detector.process(1.0, image, points, pose);
+    const auto stress_result = stress_detector.process(2.0, image, points, pose);
+    if (!stress_result.accepted || stress_result.reference_id != 0 ||
+        stress_result.current_id != 2)
+    {
+      std::cerr << "visual loop stress iteration failed: " << iteration
+                << " reason=" << stress_result.reason << std::endl;
+      return 4;
+    }
+  }
+  hybrid_localization::VisualLoopDetectorOptions temporal_options = options;
+  temporal_options.minimum_time_separation_sec = 3.0;
+  hybrid_localization::VisualLoopDetector temporal_detector(temporal_options);
+  temporal_detector.process(0.0, image, points, pose);
+  temporal_detector.process(1.0, image, points, pose);
+  const auto short_gap = temporal_detector.process(2.0, image, points, pose);
+  const auto long_gap = temporal_detector.process(3.0, image, points, pose);
+  if (short_gap.accepted || !long_gap.accepted || long_gap.reference_id != 0 ||
+      long_gap.temporal_separation_sec < 3.0)
+  {
+    std::cerr << "visual loop temporal-separation gate regression: short="
+              << short_gap.reason << " long=" << long_gap.reason
+              << " separation=" << long_gap.temporal_separation_sec << std::endl;
+    return 5;
   }
   std::cout << "visual loop detector smoke test passed: matches="
             << third.descriptor_matches << " inliers=" << third.pnp_inliers

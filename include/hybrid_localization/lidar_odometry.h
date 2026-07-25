@@ -57,12 +57,29 @@ struct LidarOdometryOptions
   double lidar_range_noise = 0.03;
   double lidar_beam_noise = 0.0015;
   double lidar_measurement_noise = 0.05;
+  // Model the LiDAR return in its beam frame: range uncertainty is radial,
+  // while the angular beam uncertainty grows tangentially with range. This
+  // mirrors the directional point covariance used by FAST-LIVO-style updates
+  // without changing the local-map or ESKF architecture.
+  bool use_directional_lidar_covariance = false;
   double huber_delta = 0.15;
   double max_rmse = 0.30;
   double min_inlier_ratio = 0.15;
   double convergence_translation = 0.0015;
   double convergence_rotation_deg = 0.03;
   double degeneracy_eigen_ratio = 1e-4;
+  // The scan-to-map Hessian is rank deficient in corridors, planar roads, and
+  // sparse views. Project each iterative pose correction onto its observable
+  // eigenspace instead of turning an ill-conditioned least-squares step into
+  // a spurious yaw, height, or lateral correction.
+  double observability_eigen_ratio = 1e-4;
+  int min_observable_directions = 3;
+  // Mean point-to-plane normalized squared residual. A non-positive value
+  // disables the corresponding gate.
+  double max_mean_normalized_residual = 10.0;
+  int map_insertion_min_observable_directions = 3;
+  double map_insertion_max_mean_normalized_residual = 8.0;
+  bool preserve_unobservable_covariance = true;
   double solver_damping = 1e-7;
   double max_translation_per_scan = 2.0;
   double max_rotation_per_scan_deg = 20.0;
@@ -122,6 +139,10 @@ struct LidarOdometryOptions
   int recovery_after_rejections = 0;
   double recovery_max_lidar_correction_translation = 0.0;
   double recovery_max_lidar_correction_rotation_deg = 0.0;
+  // Do not let an isolated post-outage registration write into the local map.
+  // A positive value requires this many consecutive strong-support scans after
+  // any rejected frame before map insertion resumes. Zero keeps legacy behavior.
+  int recovery_map_insert_min_consecutive_strong_support = 0;
   int max_iterations = 5;
   int min_scan_points = 200;
   int min_correspondences = 100;
@@ -166,6 +187,11 @@ struct LidarOdometryOptions
   double wheel_vertical_noise = 0.25;
   double wheel_huber_delta = 1.5;
   double wheel_buffer_duration = 5.0;
+  // Position of the odometer reference point relative to the IMU/body origin,
+  // expressed in the ROS body frame. The velocity measurement is compensated
+  // by omega x lever_arm when synchronized IMU angular velocity is available.
+  Eigen::Vector3d wheel_lever_arm = Eigen::Vector3d::Zero();
+  bool wheel_compensate_angular_velocity = true;
 
   // Asynchronous image update. The visual frontend supplies a robust
   // photometric normal equation over the current body pose.
@@ -174,6 +200,7 @@ struct LidarOdometryOptions
   int visual_min_landmarks = 20;
   int visual_min_residuals = 240;
   double visual_max_rmse = 1.20;
+  double visual_min_mean_ncc = 0.72;
   double visual_max_translation_step = 0.35;
   double visual_max_rotation_step_deg = 4.0;
   double visual_convergence_translation = 0.0005;
@@ -192,6 +219,7 @@ struct LidarOdometryResult
   bool used_imu = false;
   bool used_wheel = false;
   bool map_updated = false;
+  bool map_update_deferred = false;
   bool loss_limited = false;
   bool loss_frozen = false;
   bool strong_support = false;
@@ -203,7 +231,10 @@ struct LidarOdometryResult
   double acceleration_scale = 1.0;
   double wheel_speed = 0.0;
   double wheel_velocity_residual = 0.0;
+  double mean_normalized_residual = std::numeric_limits<double>::infinity();
+  double measurement_condition = std::numeric_limits<double>::infinity();
   int correspondences = 0;
+  int observable_directions = 0;
   int scan_points = 0;
   int correspondence_azimuth_sectors = 0;
   int point_knn_fallback_queries = 0;
@@ -385,6 +416,8 @@ private:
   void updateVoxel(MapVoxel &voxel, const Eigen::Vector3d &point);
   void updateVoxelPlane(MapVoxel &voxel);
   bool wheelMeasurement(double stamp, double *forward_speed) const;
+  bool angularVelocityMeasurement(double stamp,
+                                  Eigen::Vector3d *angular_velocity) const;
   void pruneMap();
   void pruneImu(double stamp);
   bool applyLidarLossProtection(const State &state_before_scan,
@@ -406,6 +439,8 @@ private:
   int accepted_scan_count_ = 0;
   bool lidar_loss_limited_ = false;
   bool lidar_loss_frozen_ = false;
+  bool recovery_map_guard_active_ = false;
+  int recovery_map_trusted_scan_count_ = 0;
   State state_;
   State last_accepted_state_;
   Eigen::Isometry3d pose_cache_ = Eigen::Isometry3d::Identity();

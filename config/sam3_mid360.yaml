@@ -99,6 +99,15 @@ bev_center_mode: latest_pose
 # while /sam3/semantic_cloud_map is a true global accumulated cloud.
 accumulation_window_sec: 0.0
 max_semantic_points: 6000000
+# Compact each scan before global accumulation.  This preserves trajectory
+# coverage while avoiding full-history point-array allocation spikes.
+semantic_batch_voxel_size: 0.20
+# Process one completed SAM3 result at a time; a backlog must not create a
+# single foreground cycle with several large projection/voxel allocations.
+mapper_max_results_per_cycle: 1
+# The queue is a transport buffer, not an experiment archive.  Payloads are
+# removed only after the mapper has published their projected semantic cloud.
+cleanup_processed_queue_files: true
 min_votes_per_cell: 1
 publish_rate: 1.0
 morph_open_kernel: 1

@@ -33,17 +33,19 @@ def main():
             "ape_rmse_m": metric(summary, "metrics", name, "ape", "rmse"),
             "rpe_1m_rmse_m": metric(summary, "metrics", name, "rpe", "rmse"),
             "yaw_rmse_deg": components.get("rmse_yaw_deg"),
+            "rotation_rmse_deg": components.get("rmse_rotation_deg"),
             "z_rmse_m": components.get("rmse_z"),
             "z_mean_abs_m": components.get("mean_abs_z"),
             "associated_poses": components.get("n"),
         })
 
-    print("| mode | APE RMSE (m) | RPE 1m RMSE (m) | yaw RMSE (deg) | Z RMSE (m) | Z MAE (m) | poses |")
-    print("|---|---:|---:|---:|---:|---:|---:|")
+    print("| mode | APE RMSE (m) | RPE 1m RMSE (m) | yaw RMSE (deg) | rotation RMSE (deg) | Z RMSE (m) | Z MAE (m) | poses |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|")
     for row in rows:
-        print("| {mode} | {ape} | {rpe} | {yaw} | {z} | {z_mae} | {poses} |".format(
+        print("| {mode} | {ape} | {rpe} | {yaw} | {rotation} | {z} | {z_mae} | {poses} |".format(
             mode=row["mode"], ape=text(row["ape_rmse_m"]),
             rpe=text(row["rpe_1m_rmse_m"]), yaw=text(row["yaw_rmse_deg"]),
+            rotation=text(row["rotation_rmse_deg"]),
             z=text(row["z_rmse_m"]), z_mae=text(row["z_mean_abs_m"]),
             poses=row["associated_poses"] if row["associated_poses"] is not None else "-"))
 

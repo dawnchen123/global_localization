@@ -305,6 +305,13 @@ struct Candidate
   double distance = 0.0;
 };
 
+struct GenericLoopSupport
+{
+  int reference_id = -1;
+  int last_current_id = -1;
+  int support = 0;
+};
+
 class SpatialIndex
 {
 public:
@@ -1058,10 +1065,16 @@ struct SemanticPoseGraph::Impl
   {
     if (!options.enable_visual_loop_factors) return false;
     ++stats.visual_loop_attempts;
+    const bool visual_quality_accepted = quality >= options.visual_loop_min_quality;
+    const bool lidar_validated_quality_accepted =
+        options.visual_loop_require_lidar_geometry &&
+        quality >= options.visual_loop_min_quality_with_lidar_geometry;
     if (!std::isfinite(reference_stamp) || !std::isfinite(current_stamp) ||
         !std::isfinite(quality) || !reference_from_current.matrix().allFinite() ||
-        quality < options.visual_loop_min_quality ||
-        current_stamp <= reference_stamp)
+        (!visual_quality_accepted && !lidar_validated_quality_accepted) ||
+        current_stamp <= reference_stamp ||
+        current_stamp - reference_stamp <
+            std::max(0.0, options.visual_loop_min_time_separation_sec))
     {
       ++stats.visual_loop_rejections;
       return false;
@@ -1074,6 +1087,78 @@ struct SemanticPoseGraph::Impl
       ++stats.visual_loop_rejections;
       return false;
     }
+    if (options.visual_loop_max_factors > 0 &&
+        stats.visual_loop_factors >= options.visual_loop_max_factors)
+    {
+      ++stats.visual_loop_rejections;
+      ++stats.visual_loop_factor_limit_rejections;
+      return false;
+    }
+    const bool same_reference_event = last_visual_loop_reference_id >= 0 &&
+        std::abs(reference->id - last_visual_loop_reference_id) <=
+            std::max(0, options.visual_loop_reference_neighborhood);
+    if (same_reference_event ||
+        (std::isfinite(last_visual_loop_factor_stamp) &&
+         current->stamp - last_visual_loop_factor_stamp <
+             std::max(0.0, options.visual_loop_minimum_interval_sec)))
+    {
+      ++stats.visual_loop_rejections;
+      ++stats.visual_loop_cooldown_rejections;
+      return false;
+    }
+    Eigen::Isometry3d measurement = projectToSE3(reference_from_current);
+    MatchResult lidar_geometry;
+    bool lidar_geometry_verified = false;
+    stats.last_visual_loop_lidar_candidates = 0;
+    stats.last_visual_loop_lidar_inliers = 0;
+    stats.last_visual_loop_lidar_rmse = 0.0;
+    stats.last_visual_loop_lidar_spread = 0.0;
+    stats.last_visual_loop_lidar_accepted = false;
+    if (options.visual_loop_require_lidar_geometry)
+    {
+      ++stats.visual_loop_lidar_geometry_validations;
+      // Reuse the existing one-to-one mutual-NN, RANSAC, and Huber matcher as
+      // an independent verifier. Generic LiDAR loops remain disabled as a
+      // proposal source; this path is reachable only from a visual candidate.
+      SemanticPoseGraphOptions geometry_options = options;
+      geometry_options.enable_xy_loops = true;
+      geometry_options.enable_z_loops = false;
+      lidar_geometry = matchKeyframes(*reference, *current, geometry_options);
+      stats.last_visual_loop_lidar_candidates = lidar_geometry.xy_candidates;
+      stats.last_visual_loop_lidar_inliers = lidar_geometry.xy_inliers;
+      stats.last_visual_loop_lidar_rmse = lidar_geometry.xy_rmse;
+      stats.last_visual_loop_lidar_spread = lidar_geometry.spread;
+      stats.last_visual_loop_lidar_accepted = lidar_geometry.xy_accepted;
+      if (!lidar_geometry.xy_accepted)
+      {
+        lidar_geometry.reason = "visual_loop_lidar_geometry_" + lidar_geometry.reason;
+        populateDebug(*reference, *current, lidar_geometry, false);
+        ++stats.visual_loop_lidar_geometry_rejections;
+        ++stats.visual_loop_rejections;
+        return false;
+      }
+      const Eigen::Isometry3d pnp_from_lidar = projectToSE3(
+          lidar_geometry.measurement.inverse() * measurement);
+      const double pnp_xy_disagreement =
+          pnp_from_lidar.translation().head<2>().norm();
+      const double pnp_yaw_disagreement = std::abs(wrapAngle(
+          yawOf(measurement) - yawOf(lidar_geometry.measurement)));
+      if (!std::isfinite(pnp_xy_disagreement) || !std::isfinite(pnp_yaw_disagreement) ||
+          pnp_xy_disagreement > options.visual_loop_lidar_max_pnp_xy_disagreement ||
+          pnp_yaw_disagreement > options.visual_loop_lidar_max_pnp_yaw_disagreement_deg *
+              kPi / 180.0)
+      {
+        lidar_geometry.reason = "visual_loop_lidar_pnp_disagreement";
+        populateDebug(*reference, *current, lidar_geometry, false);
+        stats.last_visual_loop_lidar_accepted = false;
+        ++stats.visual_loop_lidar_geometry_rejections;
+        ++stats.visual_loop_rejections;
+        return false;
+      }
+      measurement = lidar_geometry.measurement;
+      lidar_geometry_verified = true;
+    }
+
     const std::uint64_t pair_key =
         (static_cast<std::uint64_t>(static_cast<std::uint32_t>(reference->id)) << 32U) |
         static_cast<std::uint32_t>(current->id);
@@ -1083,7 +1168,46 @@ struct SemanticPoseGraph::Impl
       return false;
     }
 
-    const Eigen::Isometry3d measurement = projectToSE3(reference_from_current);
+    MatchResult ground_z;
+    bool ground_z_refined = false;
+    stats.last_visual_loop_ground_z_candidates = 0;
+    stats.last_visual_loop_ground_z_inliers = 0;
+    stats.last_visual_loop_ground_z_correction = 0.0;
+    stats.last_visual_loop_ground_z_mad = 0.0;
+    stats.last_visual_loop_ground_z_accepted = false;
+    stats.last_visual_loop_z_constrained = false;
+    if (options.visual_loop_refine_z_with_ground)
+    {
+      SemanticPoseGraphOptions z_options = options;
+      z_options.z_candidate_residual_gate =
+          options.visual_loop_ground_z_candidate_residual_gate;
+      z_options.z_inlier_residual_gate =
+          options.visual_loop_ground_z_inlier_residual_gate;
+      z_options.min_z_inliers = options.visual_loop_ground_z_min_inliers;
+      z_options.max_z_mad = options.visual_loop_ground_z_max_mad;
+      z_options.max_z_correction = options.visual_loop_ground_z_max_correction;
+      evaluateZ(*reference, *current, measurement, z_options, &ground_z);
+      stats.last_visual_loop_ground_z_candidates = ground_z.z_candidates;
+      stats.last_visual_loop_ground_z_inliers = ground_z.z_inliers;
+      stats.last_visual_loop_ground_z_correction = ground_z.z_median;
+      stats.last_visual_loop_ground_z_mad = ground_z.z_mad;
+      if (ground_z.z_accepted)
+      {
+        measurement.translation().z() += ground_z.z_median;
+        ground_z_refined = true;
+        stats.last_visual_loop_ground_z_accepted = true;
+      }
+    }
+    if (lidar_geometry_verified)
+    {
+      lidar_geometry.measurement = measurement;
+      lidar_geometry.z_candidates = ground_z.z_candidates;
+      lidar_geometry.z_inliers = ground_z.z_inliers;
+      lidar_geometry.z_median = ground_z.z_median;
+      lidar_geometry.z_mad = ground_z.z_mad;
+      lidar_geometry.z_accepted = ground_z_refined;
+      lidar_geometry.z_pairs = ground_z.z_pairs;
+    }
     const Eigen::Isometry3d raw_relative =
         projectToSE3(reference->raw_pose.inverse() * current->raw_pose);
     const Eigen::Isometry3d disagreement =
@@ -1098,19 +1222,35 @@ struct SemanticPoseGraph::Impl
             options.visual_loop_max_rotation_disagreement_deg * kPi / 180.0)
     {
       visual_loop_pairs.erase(pair_key);
+      if (lidar_geometry_verified)
+      {
+        lidar_geometry.reason = "visual_loop_raw_pose_disagreement";
+        populateDebug(*reference, *current, lidar_geometry, false);
+      }
       ++stats.visual_loop_rejections;
       return false;
     }
 
+    const double factor_quality = lidar_geometry_verified ? std::max(
+        quality, options.visual_loop_min_quality_with_lidar_geometry) : quality;
     const double quality_scale = 1.0 + options.visual_loop_quality_sigma_scale *
-        (1.0 - clampValue(quality, 0.0, 1.0));
+        (1.0 - clampValue(factor_quality, 0.0, 1.0));
+    const bool constrain_z = ground_z_refined ||
+        options.visual_loop_allow_pnp_z_without_ground;
+    if (!constrain_z) ++stats.visual_loop_z_without_ground_suppressed;
+    stats.last_visual_loop_z_constrained = constrain_z;
+    const double visual_z_sigma = !constrain_z ? 1e3 : (ground_z_refined ?
+        std::min(options.visual_loop_sigma_z, options.visual_loop_ground_z_sigma) :
+        options.visual_loop_sigma_z);
+    const double roll_pitch_sigma = options.visual_loop_constrain_roll_pitch ?
+        options.visual_loop_sigma_roll_pitch_deg * quality_scale * kPi / 180.0 : 1e3;
     gtsam::Vector6 sigmas;
-    sigmas << options.visual_loop_sigma_roll_pitch_deg * quality_scale * kPi / 180.0,
-              options.visual_loop_sigma_roll_pitch_deg * quality_scale * kPi / 180.0,
+    sigmas << roll_pitch_sigma,
+              roll_pitch_sigma,
               options.visual_loop_sigma_yaw_deg * quality_scale * kPi / 180.0,
               options.visual_loop_sigma_xy * quality_scale,
               options.visual_loop_sigma_xy * quality_scale,
-              options.visual_loop_sigma_z * quality_scale;
+              visual_z_sigma * quality_scale;
     gtsam::NonlinearFactorGraph factors;
     factors.add(gtsam::BetweenFactor<gtsam::Pose3>(
         poseKey(reference->id), poseKey(current->id), toGtsam(measurement),
@@ -1119,6 +1259,14 @@ struct SemanticPoseGraph::Impl
     isam->update();
     updateOptimizedPoses();
     ++stats.visual_loop_factors;
+    if (ground_z_refined) ++stats.visual_loop_ground_z_refinements;
+    if (lidar_geometry_verified)
+    {
+      lidar_geometry.reason = "visual_loop_lidar_geometry_applied";
+      populateDebug(*reference, *current, lidar_geometry, true);
+    }
+    last_visual_loop_factor_stamp = current->stamp;
+    last_visual_loop_reference_id = reference->id;
     return true;
   }
 
@@ -1191,6 +1339,11 @@ struct SemanticPoseGraph::Impl
     for (int id = 0; id <= maximum_id; ++id)
     {
       const Keyframe &reference = keyframes[static_cast<std::size_t>(id)];
+      if (current.stamp - reference.stamp <
+          std::max(0.0, options.loop_min_time_separation_sec))
+      {
+        continue;
+      }
       const double distance = (reference.raw_pose.translation() -
                                current.raw_pose.translation()).head<2>().norm();
       if (distance > options.loop_search_radius) continue;
@@ -1485,7 +1638,20 @@ struct SemanticPoseGraph::Impl
     if (best_rank <= 0)
     {
       ++stats.semantic_observation_rejections;
-      best_match.reason = "semantic_" + best_match.reason;
+      // `measurement_gate_passed` can mean that only the Z residual test
+      // passed.  A Z-only factor is intentionally forbidden here because it
+      // would make a weak planar association look like a valid constraint.
+      // Keep that distinction visible in the Marker/status output instead of
+      // reporting the misleading generic matcher reason.
+      if (best_match.z_accepted && !best_match.xy_accepted &&
+          options.semantic_observation_require_xy_for_z)
+      {
+        best_match.reason = "semantic_xy_gate_not_passed_z_suppressed";
+      }
+      else
+      {
+        best_match.reason = "semantic_" + best_match.reason;
+      }
       populateDebug(reference, current, best_match, false, &semantic_debug);
       return false;
     }
@@ -1785,6 +1951,89 @@ struct SemanticPoseGraph::Impl
     return true;
   }
 
+  bool addSupportedLoop(const Keyframe &reference, Keyframe *current,
+                        MatchResult *match)
+  {
+    if (current == nullptr || match == nullptr) return false;
+    const double time_separation = current->stamp - reference.stamp;
+    if (time_separation < std::max(0.0, options.loop_min_time_separation_sec))
+    {
+      match->reason = "loop_temporal_separation_gate";
+      populateDebug(reference, *current, *match, false);
+      ++stats.loop_rejections;
+      return false;
+    }
+    if (options.loop_require_xy_for_z && !match->xy_accepted && match->z_accepted)
+    {
+      match->z_accepted = false;
+      match->reason = "loop_z_requires_xy_support";
+    }
+    if (!match->xy_accepted && !match->z_accepted)
+    {
+      populateDebug(reference, *current, *match, false);
+      ++stats.loop_rejections;
+      return false;
+    }
+
+    const int reference_neighborhood = std::max(0, options.loop_support_reference_neighborhood);
+    const int current_gap = std::max(1, options.loop_support_current_max_gap);
+    const bool same_hypothesis = generic_loop_support.support > 0 &&
+        std::abs(reference.id - generic_loop_support.reference_id) <= reference_neighborhood &&
+        current->id > generic_loop_support.last_current_id &&
+        current->id - generic_loop_support.last_current_id <= current_gap;
+    if (!same_hypothesis)
+    {
+      generic_loop_support.reference_id = reference.id;
+      generic_loop_support.last_current_id = current->id;
+      generic_loop_support.support = 1;
+    }
+    else
+    {
+      generic_loop_support.last_current_id = current->id;
+      ++generic_loop_support.support;
+    }
+    stats.last_loop_support = generic_loop_support.support;
+    if (generic_loop_support.support < std::max(1, options.loop_min_support))
+    {
+      match->reason = "loop_awaiting_multiframe_support";
+      populateDebug(reference, *current, *match, false);
+      return false;
+    }
+
+    const bool factor_limit_reached = options.loop_max_factors > 0 &&
+        stats.loop_factors >= options.loop_max_factors;
+    if (factor_limit_reached)
+    {
+      match->reason = "loop_factor_limit";
+      populateDebug(reference, *current, *match, false);
+      ++stats.loop_factor_limit_rejections;
+      generic_loop_support = GenericLoopSupport();
+      return false;
+    }
+    if (std::isfinite(last_generic_loop_stamp) &&
+        current->stamp - last_generic_loop_stamp <
+            std::max(0.0, options.loop_minimum_interval_sec))
+    {
+      match->reason = "loop_cooldown";
+      populateDebug(reference, *current, *match, false);
+      ++stats.loop_cooldown_rejections;
+      generic_loop_support = GenericLoopSupport();
+      return false;
+    }
+
+    const bool applied = addLoop(reference, current, match);
+    if (applied)
+    {
+      ++stats.loop_support_confirmations;
+      stats.last_loop_reference_id = reference.id;
+      stats.last_loop_current_id = current->id;
+      stats.last_loop_time_separation_sec = time_separation;
+      last_generic_loop_stamp = current->stamp;
+    }
+    generic_loop_support = GenericLoopSupport();
+    return applied;
+  }
+
   bool addSemanticObservation(double stamp, const Eigen::Isometry3d &raw_pose,
                               const SemanticGraphPointVector &local_points)
   {
@@ -1933,7 +2182,8 @@ struct SemanticPoseGraph::Impl
     updateOptimizedPoses();
     stats.keyframes = static_cast<int>(keyframes.size());
 
-    if (keyframes.size() > static_cast<std::size_t>(options.loop_min_index_gap + 1))
+    if ((options.enable_xy_loops || options.enable_z_loops) &&
+        keyframes.size() > static_cast<std::size_t>(options.loop_min_index_gap + 1))
     {
       Keyframe &stored_current = keyframes.back();
       const std::vector<Candidate> candidates = findCandidates(stored_current);
@@ -1976,7 +2226,8 @@ struct SemanticPoseGraph::Impl
         }
         else if (best_match.xy_accepted || best_match.z_accepted)
         {
-          addLoop(keyframes[static_cast<std::size_t>(best_id)], &stored_current, &best_match);
+          addSupportedLoop(keyframes[static_cast<std::size_t>(best_id)],
+                           &stored_current, &best_match);
         }
         else
         {
@@ -2003,6 +2254,10 @@ struct SemanticPoseGraph::Impl
   std::deque<WheelObservation> wheel;
   std::deque<VisualObservation, Eigen::aligned_allocator<VisualObservation>> visual;
   std::unordered_set<std::uint64_t> visual_loop_pairs;
+  GenericLoopSupport generic_loop_support;
+  double last_generic_loop_stamp = -std::numeric_limits<double>::infinity();
+  double last_visual_loop_factor_stamp = -std::numeric_limits<double>::infinity();
+  int last_visual_loop_reference_id = -1;
   SemanticLoopDebug debug;
   SemanticLoopDebug semantic_debug;
   SemanticPoseGraphStats stats;

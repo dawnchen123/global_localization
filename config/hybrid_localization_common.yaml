@@ -57,7 +57,14 @@ lidar_point_time_mode: none       # none, relative, or absolute
 lidar_point_time_scale: 1.0
 lidar_stamp_is_end: true
 lidar_imu_wait_sec: 0.0
+# All offsets use corrected_stamp = message_stamp + offset and must refer to
+# the same ROS/body convention as the calibrated extrinsics below.
+imu_time_offset: 0.0
+lidar_time_offset: 0.0
+wheel_time_offset: 0.0
 camera_time_offset: 0.0
+sensor_time_offset_limit_sec: 1.0
+strict_sensor_frame_validation: true
 measurement_scheduler:
   enabled: true
   process_rate_hz: 200.0
@@ -91,6 +98,11 @@ visual_frontend:
   fy: 1065.2546
   cx: 801.4049
   cy: 624.6878
+  # street00 compressed images are rectified by the camera pipeline. Enable
+  # only when subscribing to the original radial-tangential image stream.
+  apply_distortion: false
+  image_width: 1600
+  image_height: 1200
   distortion: [-0.1516, 0.0942, 0.000169, -0.000142, -0.0229]
   body_from_camera: [0.00549192, -0.00206914, 0.99998278, 0.09,
                      -0.99998051, 0.00295932, 0.00549803, 0.20,
@@ -121,11 +133,29 @@ visual_frontend:
   min_landmarks: 20
   min_residuals: 240
   max_rmse: 1.20
+  # Gate the direct update on aggregate appearance consistency as well.
+  min_mean_ncc: 0.72
   max_translation_step: 0.35
   max_rotation_step_deg: 4.0
   convergence_translation: 0.0005
   convergence_rotation_deg: 0.01
   solver_damping: 0.000001
+# Use the propagated SAM3 camera mask in raw LiDAR registration and local-map
+# insertion. A missing or stale mask never drops a scan; it only disables the
+# dynamic-point filter for that scan.
+semantic_lidar_filter:
+  enabled: false
+  # Camera events are intentionally bounded to 5 Hz; 0.30 s covers the
+  # propagated label at the neighboring LiDAR scan without accepting a stale
+  # SAM3 source result.
+  sync_tolerance_sec: 0.30
+  # This applies to the original SAM3 frame, while the label itself is
+  # optical-flow propagated to sam3_propagated_stamp. Keep it no larger than
+  # the camera cache duration so delayed queue results cannot be reused.
+  max_source_age_sec: 6.0
+  min_project_depth: 0.20
+  support_radius_px: 1
+  min_dynamic_support_ratio: 0.55
 max_lidar_points: 14000
 max_semantic_points: 10000
 max_local_points: 24000
@@ -155,6 +185,12 @@ lidar_odometry:
   convergence_translation: 0.0015
   convergence_rotation_deg: 0.03
   degeneracy_eigen_ratio: 0.0001
+  observability_eigen_ratio: 0.0001
+  min_observable_directions: 3
+  max_mean_normalized_residual: 10.0
+  map_insertion_min_observable_directions: 3
+  map_insertion_max_mean_normalized_residual: 8.0
+  preserve_unobservable_covariance: true
   solver_damping: 0.0000001
   max_translation_per_scan: 0.80
   max_rotation_per_scan_deg: 10.0
@@ -239,6 +275,12 @@ keyframe_interval_sec: 0.5
 optimizer_iterations: 3
 optimizer_max_step_norm: 0.5
 max_pose_lookup_dt: 0.15
+# Retain source poses while SAM3 runs asynchronously. This is deliberately
+# longer than the local map window so delayed semantic observations can still
+# be associated to their original LiDAR state.
+odom_history_sec: 600.0
+max_pending_semantic_clouds: 240
+max_semantic_process_per_tick: 2
 
 # Online local geometry/semantic BEV.
 local_map_window_sec: 12.0

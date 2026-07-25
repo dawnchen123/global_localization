@@ -20,6 +20,53 @@ def normalize_quat(qx, qy, qz, qw):
     return qx / n, qy / n, qz / n, qw / n
 
 
+def normalize_coordinate_mode(mode):
+    normalized = (mode or "as_is").strip().lower()
+    aliases = {
+        "as_is": "as_is",
+        "ros_enu": "as_is",
+        "enu": "as_is",
+        "enu_to_ned": "enu_to_ned",
+        "ros_enu_to_ned": "enu_to_ned",
+        "enu_flu_to_ned_frd": "enu_flu_to_ned_frd",
+        "ros_enu_flu_to_ned_frd": "enu_flu_to_ned_frd",
+        "ned": "enu_flu_to_ned_frd",
+        "local_ned": "enu_flu_to_ned_frd",
+    }
+    if normalized not in aliases:
+        raise RuntimeError("unsupported coordinate_mode=%s" % mode)
+    return aliases[normalized]
+
+
+def quat_multiply(left, right):
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+
+def convert_coordinate(row, coordinate_mode):
+    if coordinate_mode == "as_is":
+        return row
+    # R_ned_enu maps ROS ENU coordinates into i2Nav local NED:
+    # [[0, 1, 0], [1, 0, 0], [0, 0, -1]].  It must left-multiply the
+    # world-from-body quaternion just like the position transform.
+    q_ned_enu = (math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0)
+    output_quaternion = quat_multiply(q_ned_enu, row[4:8])
+    if coordinate_mode == "enu_flu_to_ned_frd":
+        # The state publisher uses ROS base_link (FLU), whereas i2Nav ground
+        # truth uses the INS body frame (FRD).  Change the body basis too so
+        # the exported quaternion and position describe the same local-NED pose.
+        output_quaternion = quat_multiply(output_quaternion, (1.0, 0.0, 0.0, 0.0))
+    qx, qy, qz, qw = output_quaternion
+    qx, qy, qz, qw = normalize_quat(qx, qy, qz, qw)
+    return (row[0], row[2], row[1], -row[3], qx, qy, qz, qw)
+
+
 def read_tum8(path):
     rows = []
     bad = 0
@@ -84,12 +131,12 @@ def sort_dedupe(rows):
     return out, dropped
 
 
-def normalize_time(rows, mode, time_shift):
+def normalize_time(rows, mode, time_shift, time_reference=None):
     if mode == "absolute":
         return [(r[0] + time_shift,) + r[1:] for r in rows], rows[0][0]
     if mode != "relative":
         raise RuntimeError("unsupported time_mode=%s" % mode)
-    t0 = rows[0][0]
+    t0 = rows[0][0] if time_reference is None else time_reference
     return [(r[0] - t0 + time_shift,) + r[1:] for r in rows], t0
 
 
@@ -111,11 +158,14 @@ def write_tum(path, rows):
             f.write("%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f\n" % r)
 
 
-def convert_file(src, dst, time_mode, cluster_mode, cluster_width, time_shift, t_start, t_end):
+def convert_file(src, dst, time_mode, cluster_mode, cluster_width, time_shift, t_start, t_end,
+                 coordinate_mode="as_is", time_reference=None):
     rows, bad = read_tum8(src)
+    coordinate_mode = normalize_coordinate_mode(coordinate_mode)
+    rows = [convert_coordinate(row, coordinate_mode) for row in rows]
     rows, cluster_info = filter_cluster(rows, cluster_mode, cluster_width)
     rows, duplicates = sort_dedupe(rows)
-    rows, time_origin = normalize_time(rows, time_mode, time_shift)
+    rows, time_origin = normalize_time(rows, time_mode, time_shift, time_reference)
     rows = crop_time(rows, t_start, t_end)
     write_tum(dst, rows)
     return {
@@ -125,7 +175,9 @@ def convert_file(src, dst, time_mode, cluster_mode, cluster_width, time_shift, t
         "bad_rows": bad,
         "dropped_duplicate_timestamps": duplicates,
         "time_origin": time_origin,
+        "time_reference": time_reference,
         "time_shift": time_shift,
+        "coordinate_mode": coordinate_mode,
         "time_min": rows[0][0],
         "time_max": rows[-1][0],
         "time_span": rows[-1][0] - rows[0][0],
@@ -164,6 +216,29 @@ def quat_to_yaw(qx, qy, qz, qw):
         2.0 * (qw * qz + qx * qy),
         1.0 - 2.0 * (qy * qy + qz * qz),
     )
+
+
+def quat_to_rotation(qx, qy, qz, qw):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("numpy is required for component metrics") from exc
+    qx, qy, qz, qw = normalize_quat(qx, qy, qz, qw)
+    return np.asarray([
+        [1.0 - 2.0 * (qy * qy + qz * qz),
+         2.0 * (qx * qy - qz * qw),
+         2.0 * (qx * qz + qy * qw)],
+        [2.0 * (qx * qy + qz * qw),
+         1.0 - 2.0 * (qx * qx + qz * qz),
+         2.0 * (qy * qz - qx * qw)],
+        [2.0 * (qx * qz - qy * qw),
+         2.0 * (qy * qz + qx * qw),
+         1.0 - 2.0 * (qx * qx + qy * qy)],
+    ], dtype=float)
+
+
+def yaw_of_rotation(rotation):
+    return math.atan2(rotation[1, 0], rotation[0, 0])
 
 
 def wrap_angle(a):
@@ -240,8 +315,6 @@ def write_component_metrics(gt_tum, est_tum, args, name):
     gt_xyz = [(g[1], g[2], g[3]) for g, _, _ in pairs]
     est_xyz = [(e[1], e[2], e[3]) for _, e, _ in pairs]
     R, t = rigid_alignment(gt_xyz, est_xyz, args.align)
-    yaw_align = math.atan2(R[1, 0], R[0, 0])
-
     rows = []
     err_x = []
     err_y = []
@@ -249,6 +322,7 @@ def write_component_metrics(gt_tum, est_tum, args, name):
     err_xy = []
     err_3d = []
     yaw_err_deg = []
+    rotation_err_deg = []
     for g, e, dt in pairs:
         est_aligned = R @ np.asarray([e[1], e[2], e[3]], dtype=float) + t
         dx = float(est_aligned[0] - g[1])
@@ -256,26 +330,32 @@ def write_component_metrics(gt_tum, est_tum, args, name):
         dz = float(est_aligned[2] - g[3])
         exy = math.hypot(dx, dy)
         e3d = math.sqrt(dx * dx + dy * dy + dz * dz)
-        gyaw = quat_to_yaw(g[4], g[5], g[6], g[7])
-        eyaw = quat_to_yaw(e[4], e[5], e[6], e[7]) + yaw_align
+        gt_rotation = quat_to_rotation(g[4], g[5], g[6], g[7])
+        aligned_est_rotation = R @ quat_to_rotation(e[4], e[5], e[6], e[7])
+        gyaw = yaw_of_rotation(gt_rotation)
+        eyaw = yaw_of_rotation(aligned_est_rotation)
         dyaw_deg = wrap_angle(eyaw - gyaw) * 180.0 / math.pi
+        rotation_delta = gt_rotation.T @ aligned_est_rotation
+        rotation_cosine = max(-1.0, min(1.0, (float(np.trace(rotation_delta)) - 1.0) * 0.5))
+        rotation_error_deg = math.acos(rotation_cosine) * 180.0 / math.pi
         err_x.append(dx)
         err_y.append(dy)
         err_z.append(dz)
         err_xy.append(exy)
         err_3d.append(e3d)
         yaw_err_deg.append(dyaw_deg)
+        rotation_err_deg.append(rotation_error_deg)
         rows.append((
             g[0], g[1], g[2], g[3], e[1], e[2], e[3],
             float(est_aligned[0]), float(est_aligned[1]), float(est_aligned[2]),
-            dx, dy, dz, exy, e3d, dyaw_deg, dt,
+            dx, dy, dz, exy, e3d, dyaw_deg, rotation_error_deg, dt,
         ))
 
     csv_path = args.out_dir / ("components_%s.csv" % name)
     with open(csv_path, "w") as f:
         f.write(
             "stamp,gt_x,gt_y,gt_z,est_x,est_y,est_z,aligned_x,aligned_y,aligned_z,"
-            "err_x,err_y,err_z,err_xy,err_3d,yaw_err_deg,dt\n"
+            "err_x,err_y,err_z,err_xy,err_3d,yaw_err_deg,rotation_err_deg,dt\n"
         )
         for r in rows:
             f.write(",".join("%.9f" % v for v in r) + "\n")
@@ -295,6 +375,7 @@ def write_component_metrics(gt_tum, est_tum, args, name):
         "mean_abs_z": sum(abs(v) for v in err_z) / max(1, len(err_z)),
         "max_abs_z": max(abs(v) for v in err_z),
         "rmse_yaw_deg": rmse(yaw_err_deg),
+        "rmse_rotation_deg": rmse(rotation_err_deg),
     }
 
 
@@ -385,10 +466,19 @@ def main():
                         help="Seconds added to converted GroundTruth timestamps after time normalization.")
     parser.add_argument("--est_time_shift", type=float, default=0.0,
                         help="Seconds added to converted estimate timestamps after time normalization.")
+    parser.add_argument("--est_time_shifts", type=float, nargs="+", default=None,
+                        help="Per-estimate timestamp shifts. Overrides --est_time_shift.")
+    parser.add_argument("--est_time_reference", type=float, default=None,
+                        help="Shared absolute estimate timestamp used as the relative-time origin. "
+                             "Use this when trajectories start after different initialization delays.")
     parser.add_argument("--gt_time_cluster", default="all",
                         help="all, auto, or integer floor(timestamp / cluster_width)")
     parser.add_argument("--est_time_cluster", default="auto",
                         help="all, auto, or integer floor(timestamp / cluster_width)")
+    parser.add_argument("--gt_coordinate_mode", default="as_is",
+                        help="as_is, enu_to_ned, or enu_flu_to_ned_frd.")
+    parser.add_argument("--est_coordinate_modes", nargs="+", default=None,
+                        help="Per-estimate coordinate modes: as_is, enu_to_ned, or enu_flu_to_ned_frd.")
     parser.add_argument("--cluster_width", type=float, default=1000000.0)
     parser.add_argument("--t_start", type=float, default=None)
     parser.add_argument("--t_end", type=float, default=None)
@@ -417,6 +507,21 @@ def main():
         args.names = [p.stem for p in args.est]
     if len(args.names) != len(args.est):
         raise RuntimeError("--names length must match --est length")
+    if args.est_time_shifts is None:
+        args.est_time_shifts = [args.est_time_shift] * len(args.est)
+    elif len(args.est_time_shifts) == 1 and len(args.est) > 1:
+        args.est_time_shifts *= len(args.est)
+    elif len(args.est_time_shifts) != len(args.est):
+        raise RuntimeError("--est_time_shifts length must be one or match --est")
+    if args.est_coordinate_modes is None:
+        args.est_coordinate_modes = ["as_is"] * len(args.est)
+    elif len(args.est_coordinate_modes) == 1 and len(args.est) > 1:
+        args.est_coordinate_modes *= len(args.est)
+    elif len(args.est_coordinate_modes) != len(args.est):
+        raise RuntimeError("--est_coordinate_modes length must be one or match --est")
+    args.gt_coordinate_mode = normalize_coordinate_mode(args.gt_coordinate_mode)
+    args.est_coordinate_modes = [normalize_coordinate_mode(mode)
+                                 for mode in args.est_coordinate_modes]
     if args.out_dir is None:
         args.out_dir = args.dataset_dir / "evo_eval"
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -428,13 +533,16 @@ def main():
         "time_mode": args.time_mode,
         "gt_time_shift": args.gt_time_shift,
         "est_time_shift": args.est_time_shift,
+        "est_time_shifts": args.est_time_shifts,
+        "est_time_reference": args.est_time_reference,
         "align": args.align,
         "max_time_diff": args.max_time_diff,
         "rpe_delta": args.rpe_delta,
         "rpe_delta_unit": args.rpe_delta_unit,
         "gt": convert_file(
-            args.gt, gt_tum, args.time_mode, args.gt_time_cluster,
-            args.cluster_width, args.gt_time_shift, args.t_start, args.t_end),
+        args.gt, gt_tum, args.time_mode, args.gt_time_cluster,
+            args.cluster_width, args.gt_time_shift, args.t_start, args.t_end,
+            args.gt_coordinate_mode),
         "estimates": {},
         "commands": {},
         "component_metrics": {},
@@ -443,11 +551,13 @@ def main():
 
     env = configure_evo(args.evo_bin, args.evo_home)
 
-    for name, est in zip(args.names, args.est):
+    for name, est, time_shift, coordinate_mode in zip(
+            args.names, args.est, args.est_time_shifts, args.est_coordinate_modes):
         est_tum = converted_dir / ("%s.tum" % name)
         summary["estimates"][name] = convert_file(
             est, est_tum, args.time_mode, args.est_time_cluster,
-            args.cluster_width, args.est_time_shift, args.t_start, args.t_end)
+            args.cluster_width, time_shift, args.t_start, args.t_end,
+            coordinate_mode, args.est_time_reference)
 
         if not args.skip_component_metrics:
             summary["component_metrics"][name] = write_component_metrics(

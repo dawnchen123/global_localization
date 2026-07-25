@@ -23,6 +23,14 @@ if(EXISTS "/usr/lib/cmake/eigen3/Eigen3Config.cmake")
 endif()
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(GTSAM REQUIRED)
+# ROS Noetic's cv_bridge and Python image bindings are built against Ubuntu's
+# OpenCV 4.2.  A separately installed /usr/local OpenCV 4.5 was selected from
+# the CMake cache and caused the graph node to fault in libopencv_core at
+# runtime.  Keep every C++ target in this package on the ROS binary ABI.
+if(EXISTS "/usr/lib/x86_64-linux-gnu/cmake/opencv4/OpenCVConfig.cmake")
+  set(OpenCV_DIR "/usr/lib/x86_64-linux-gnu/cmake/opencv4" CACHE PATH
+      "OpenCV version matching ROS Noetic binary ABI" FORCE)
+endif()
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc imgcodecs calib3d video features2d)
 set(GTSAM_INCLUDE_DIRS ${GTSAM_INCLUDE_DIR})
 set(GTSAM_LIBRARIES gtsam)
