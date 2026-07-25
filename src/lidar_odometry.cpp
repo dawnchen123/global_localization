@@ -127,8 +127,6 @@ LidarOdometry::LidarOdometry(const LidarOdometryOptions &options) : options_(opt
       0.0, options_.recovery_max_lidar_correction_translation);
   options_.recovery_max_lidar_correction_rotation_deg = std::max(
       0.0, options_.recovery_max_lidar_correction_rotation_deg);
-  options_.recovery_map_insert_min_consecutive_strong_support = std::max(
-      0, options_.recovery_map_insert_min_consecutive_strong_support);
   options_.lidar_measurement_noise = std::max(0.005, options_.lidar_measurement_noise);
   options_.huber_delta = std::max(0.01, options_.huber_delta);
   options_.max_translation_per_scan = std::max(0.05, options_.max_translation_per_scan);
@@ -174,10 +172,6 @@ LidarOdometry::LidarOdometry(const LidarOdometryOptions &options) : options_(opt
   options_.wheel_huber_delta = std::max(0.1, options_.wheel_huber_delta);
   options_.wheel_buffer_duration = std::max(options_.wheel_max_age + 0.1,
                                              options_.wheel_buffer_duration);
-  if (!options_.wheel_lever_arm.allFinite() || options_.wheel_lever_arm.norm() > 5.0)
-  {
-    options_.wheel_lever_arm.setZero();
-  }
   options_.visual_max_iterations = std::max(1, options_.visual_max_iterations);
   options_.visual_min_landmarks = std::max(6, options_.visual_min_landmarks);
   options_.visual_min_residuals = std::max(24, options_.visual_min_residuals);
@@ -205,8 +199,6 @@ void LidarOdometry::reset()
   accepted_scan_count_ = 0;
   lidar_loss_limited_ = false;
   lidar_loss_frozen_ = false;
-  recovery_map_guard_active_ = false;
-  recovery_map_trusted_scan_count_ = 0;
   state_ = State();
   state_.gravity = Eigen::Vector3d(0.0, 0.0, -options_.gravity_magnitude);
   state_.covariance.setZero();
@@ -299,53 +291,6 @@ bool LidarOdometry::wheelMeasurement(double stamp, double *forward_speed) const
   }
   *forward_speed = best->forward_speed;
   return true;
-}
-
-bool LidarOdometry::angularVelocityMeasurement(
-    double stamp, Eigen::Vector3d *angular_velocity) const
-{
-  if (!options_.imu_enabled || angular_velocity == nullptr || imu_buffer_.empty() ||
-      !std::isfinite(stamp))
-  {
-    return false;
-  }
-
-  const auto upper = std::lower_bound(
-      imu_buffer_.begin(), imu_buffer_.end(), stamp,
-      [](const ImuSample &sample, double value) { return sample.stamp < value; });
-  if (upper == imu_buffer_.begin())
-  {
-    if (std::abs(upper->stamp - stamp) > options_.imu_max_gap)
-    {
-      return false;
-    }
-    *angular_velocity = upper->angular_velocity;
-    return angular_velocity->allFinite();
-  }
-  if (upper == imu_buffer_.end())
-  {
-    const ImuSample &sample = imu_buffer_.back();
-    if (std::abs(sample.stamp - stamp) > options_.imu_max_gap)
-    {
-      return false;
-    }
-    *angular_velocity = sample.angular_velocity;
-    return angular_velocity->allFinite();
-  }
-
-  const ImuSample &second = *upper;
-  const ImuSample &first = *(upper - 1);
-  const double dt = second.stamp - first.stamp;
-  if (dt <= 0.0 || dt > options_.imu_max_gap ||
-      stamp < first.stamp - options_.imu_max_gap ||
-      stamp > second.stamp + options_.imu_max_gap)
-  {
-    return false;
-  }
-  const double alpha = std::max(0.0, std::min(1.0, (stamp - first.stamp) / dt));
-  *angular_velocity = (1.0 - alpha) * first.angular_velocity +
-      alpha * second.angular_velocity;
-  return angular_velocity->allFinite();
 }
 
 bool LidarOdometry::initializeImuIfReady()
@@ -922,70 +867,39 @@ bool LidarOdometry::findPointKnnPlane(const Eigen::Vector3d &world_point,
     double squared_distance = 0.0;
   };
   std::vector<PointNeighbor, Eigen::aligned_allocator<PointNeighbor>> neighbors;
-  const std::size_t maximum_neighbors = static_cast<std::size_t>(
-      std::max(options_.min_normal_neighbors, options_.max_plane_neighbors));
-  neighbors.reserve(maximum_neighbors);
-  // Keep the closest samples while traversing the local hash cells.  The
-  // previous implementation accumulated every retained sample and then used
-  // nth_element, which made a dense, FAST-LIVO-style point-plane update pay
-  // for thousands of samples even though the plane fit only consumes the
-  // nearest max_plane_neighbors points.
-  const auto nearer_first = [](const PointNeighbor &first,
-                               const PointNeighbor &second)
+  neighbors.reserve(static_cast<std::size_t>(options_.max_plane_neighbors * 4));
+  for (int dx = -radius; dx <= radius; ++dx)
   {
-    return first.squared_distance < second.squared_distance;
-  };
-  // A mature local map almost always provides the required nearest samples
-  // in the immediately adjacent cells.  Expand one Chebyshev shell at a time
-  // only when that shell does not yet fill the plane-fit neighbourhood.
-  for (int search_radius = 0; search_radius <= radius; ++search_radius)
-  {
-    for (int dx = -search_radius; dx <= search_radius; ++dx)
+    for (int dy = -radius; dy <= radius; ++dy)
     {
-      for (int dy = -search_radius; dy <= search_radius; ++dy)
+      for (int dz = -radius; dz <= radius; ++dz)
       {
-        for (int dz = -search_radius; dz <= search_radius; ++dz)
+        const auto iterator = map_voxels_.find(
+            VoxelKey{center.x + dx, center.y + dy, center.z + dz});
+        if (iterator == map_voxels_.end())
         {
-          if (std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz))) !=
-              search_radius)
+          continue;
+        }
+        for (const Eigen::Vector3d &sample : iterator->second.samples)
+        {
+          const double squared_distance = (sample - world_point).squaredNorm();
+          if (squared_distance <= maximum_distance_squared)
           {
-            continue;
-          }
-          const auto iterator = map_voxels_.find(
-              VoxelKey{center.x + dx, center.y + dy, center.z + dz});
-          if (iterator == map_voxels_.end())
-          {
-            continue;
-          }
-          for (const Eigen::Vector3d &sample : iterator->second.samples)
-          {
-            const double squared_distance = (sample - world_point).squaredNorm();
-            if (squared_distance <= maximum_distance_squared)
-            {
-              PointNeighbor candidate{sample, squared_distance};
-              if (neighbors.size() < maximum_neighbors)
-              {
-                neighbors.push_back(candidate);
-                std::push_heap(neighbors.begin(), neighbors.end(), nearer_first);
-              }
-              else if (squared_distance < neighbors.front().squared_distance)
-              {
-                std::pop_heap(neighbors.begin(), neighbors.end(), nearer_first);
-                neighbors.back() = candidate;
-                std::push_heap(neighbors.begin(), neighbors.end(), nearer_first);
-              }
-            }
+            neighbors.push_back(PointNeighbor{sample, squared_distance});
           }
         }
       }
     }
-    if (search_radius >= std::min(1, radius) &&
-        neighbors.size() >= maximum_neighbors)
-    {
-      break;
-    }
   }
   if (neighbors.size() < static_cast<std::size_t>(options_.min_normal_neighbors)) return false;
+  if (neighbors.size() > static_cast<std::size_t>(options_.max_plane_neighbors))
+  {
+    std::nth_element(neighbors.begin(), neighbors.begin() + options_.max_plane_neighbors,
+                     neighbors.end(),
+                     [](const PointNeighbor &first, const PointNeighbor &second)
+                     { return first.squared_distance < second.squared_distance; });
+    neighbors.resize(static_cast<std::size_t>(options_.max_plane_neighbors));
+  }
   std::sort(neighbors.begin(), neighbors.end(),
             [](const PointNeighbor &first, const PointNeighbor &second)
             { return first.squared_distance < second.squared_distance; });
@@ -1351,12 +1265,6 @@ bool LidarOdometry::applyLidarLossProtection(const State &state_before_scan,
   ++consecutive_rejections_;
   lidar_loss_limited_ = false;
   lidar_loss_frozen_ = false;
-  if (map_initialized_ &&
-      options_.recovery_map_insert_min_consecutive_strong_support > 0)
-  {
-    recovery_map_guard_active_ = true;
-    recovery_map_trusted_scan_count_ = 0;
-  }
   if (!map_initialized_ || options_.lidar_loss_hold_after_rejections <= 0 ||
       consecutive_rejections_ < options_.lidar_loss_hold_after_rejections)
   {
@@ -1724,9 +1632,6 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     consecutive_rejections_ = 0;
     lidar_loss_limited_ = false;
     lidar_loss_frozen_ = false;
-    recovery_map_guard_active_ = false;
-    recovery_map_trusted_scan_count_ =
-        options_.recovery_map_insert_min_consecutive_strong_support;
     last_accepted_state_ = state_;
     insertMapPoints(scan, state_, false);
     pose_cache_ = statePose(state_);
@@ -1835,23 +1740,11 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
       jacobian.block<1, 3>(0, 0) =
           -match.normal.transpose() * estimate.rotation * skew(body_point);
       jacobian.block<1, 3>(0, 3) = match.normal.transpose();
-      const double range = std::max(1e-3, body_point.norm());
-      double point_variance = options_.lidar_range_noise * options_.lidar_range_noise +
-          std::pow(options_.lidar_beam_noise * range, 2.0);
-      if (options_.use_directional_lidar_covariance)
-      {
-        const Eigen::Vector3d radial_direction = body_point / range;
-        const double radial_variance = options_.lidar_range_noise * options_.lidar_range_noise;
-        const double tangential_variance = std::pow(options_.lidar_beam_noise * range, 2.0);
-        const Eigen::Matrix3d point_covariance = tangential_variance *
-            Eigen::Matrix3d::Identity() + (radial_variance - tangential_variance) *
-            radial_direction * radial_direction.transpose();
-        const Eigen::Vector3d body_normal = estimate.rotation.transpose() * match.normal;
-        point_variance = body_normal.dot(point_covariance * body_normal);
-      }
+      const double range = body_point.norm();
       const double measurement_variance =
           options_.lidar_measurement_noise * options_.lidar_measurement_noise +
-          point_variance + match.variance;
+          options_.lidar_range_noise * options_.lidar_range_noise +
+          std::pow(options_.lidar_beam_noise * range, 2.0) + match.variance;
       const double robust_information = huberWeight(residual, options_.huber_delta) /
           std::max(1e-8, measurement_variance);
       measurement_hessian.noalias() +=
@@ -1873,26 +1766,12 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     if (have_wheel_measurement)
     {
       const Eigen::Vector3d body_velocity = estimate.rotation.transpose() * estimate.velocity;
-      Eigen::Vector3d angular_velocity = Eigen::Vector3d::Zero();
-      const bool compensate_lever_arm = options_.wheel_compensate_angular_velocity &&
-          options_.wheel_lever_arm.squaredNorm() > kSmall &&
-          angularVelocityMeasurement(scan_end_stamp, &angular_velocity);
-      if (compensate_lever_arm)
-      {
-        angular_velocity -= estimate.gyro_bias;
-      }
-      const Eigen::Vector3d odometer_velocity = body_velocity +
-          (compensate_lever_arm ? angular_velocity.cross(options_.wheel_lever_arm)
-                                : Eigen::Vector3d::Zero());
-      Eigen::Vector3d residual = odometer_velocity;
-      residual.x() -= measured_forward_speed;
+      Eigen::Vector3d residual;
+      residual << body_velocity.x() - measured_forward_speed,
+                  body_velocity.y(), estimate.velocity.z();
       Eigen::Matrix<double, 3, 18> jacobian = Eigen::Matrix<double, 3, 18>::Zero();
-      jacobian.block<3, 3>(0, 0) = skew(body_velocity);
-      jacobian.block<3, 3>(0, 6) = estimate.rotation.transpose();
-      if (compensate_lever_arm)
-      {
-        jacobian.block<3, 3>(0, 9) = skew(options_.wheel_lever_arm);
-      }
+      jacobian.block<2, 3>(0, 6) = estimate.rotation.transpose().topRows<2>();
+      jacobian(2, 8) = 1.0;
       const Eigen::Vector3d sigma(options_.wheel_forward_noise,
                                   options_.wheel_lateral_noise,
                                   options_.wheel_vertical_noise);
@@ -2155,22 +2034,6 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     lidar_loss_limited_ = false;
     lidar_loss_frozen_ = false;
     last_accepted_state_ = state_;
-    if (recovery_map_guard_active_)
-    {
-      if (strong_support)
-      {
-        ++recovery_map_trusted_scan_count_;
-        if (recovery_map_trusted_scan_count_ >=
-            options_.recovery_map_insert_min_consecutive_strong_support)
-        {
-          recovery_map_guard_active_ = false;
-        }
-      }
-      else
-      {
-        recovery_map_trusted_scan_count_ = 0;
-      }
-    }
     const bool observable_for_map = result.observable_directions >=
         options_.map_insertion_min_observable_directions;
     const bool innovation_for_map =
@@ -2178,7 +2041,7 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
         (std::isfinite(result.mean_normalized_residual) &&
          result.mean_normalized_residual <=
              options_.map_insertion_max_mean_normalized_residual);
-    if (observable_for_map && innovation_for_map && !recovery_map_guard_active_)
+    if (observable_for_map && innovation_for_map)
     {
       insertMapPoints(scan, state_, true);
       result.map_updated = true;
