@@ -1,0 +1,19 @@
+# Controlled Street00 experiment profile for a late visual revisit with small
+# common ground overlap. It does not relax the normal 70-inlier Z gate. The
+# fallback below becomes eligible only when that normal gate failed, the same
+# loop has a strong independent LiDAR XY registration, and the sparse ground
+# inliers are spatially distributed and vertically coherent.
+graph:
+  visual_loop_ground_z_sparse_min_inliers: 20
+  visual_loop_ground_z_sparse_min_inlier_ratio: 0.06
+  # Absolute XY coverage prevents one local ground patch from pulling the
+  # graph. A road-strip overlap may be elongated, so no isotropy requirement
+  # is imposed in this experiment.
+  visual_loop_ground_z_sparse_min_spread: 4.0
+  visual_loop_ground_z_sparse_min_spread_ratio: 0.0
+  visual_loop_ground_z_sparse_max_mad: 0.03
+  # The fallback is valid only after a much stronger-than-baseline structural
+  # registration. Baseline XY matcher gates remain in force as well.
+  visual_loop_ground_z_sparse_min_lidar_xy_inliers: 300
+  visual_loop_ground_z_sparse_max_lidar_xy_rmse: 0.25
+  visual_loop_ground_z_sparse_min_lidar_xy_spread: 8.0

@@ -1,0 +1,7 @@
+# Controlled street00 experiment. The Ranger MINI topic is already replayed
+# and calibrated in the frontend, but this adds an independently robust
+# keyframe-to-keyframe arc-length factor in iSAM2. The LiDAR-verified visual
+# loop path remains enabled so the wheel chain can be globally corrected.
+graph:
+  enable_wheel_factors: true
+  visual_loop_lidar_use_pnp_seed: true

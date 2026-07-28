@@ -189,6 +189,8 @@ SparseVisualMap::SparseVisualMap(const SparseVisualMapOptions &options)
   {
     options_.body_from_camera_translation.setZero();
   }
+  // A rectified frame must always use the pinhole projection/Jacobian.
+  if (options_.rectify_input) options_.apply_distortion = false;
   reset();
 }
 
@@ -240,17 +242,69 @@ SparseVisualFrame SparseVisualMap::prepareFrame(
                options_.image_scale, cv::INTER_AREA);
     gray = resized;
   }
-  const double scale = options_.image_scale;
-  const cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
-      options_.fx * scale, 0.0, options_.cx * scale,
-      0.0, options_.fy * scale, options_.cy * scale,
-      0.0, 0.0, 1.0);
-  const cv::Mat distortion = (cv::Mat_<double>(1, 5) <<
-      options_.distortion[0], options_.distortion[1], options_.distortion[2],
-      options_.distortion[3], options_.distortion[4]);
-  cv::Mat rectified;
-  cv::undistort(gray, rectified, camera_matrix, distortion, camera_matrix);
-  rectified.convertTo(frame.gray, CV_32F);
+  if (options_.rectify_input)
+  {
+    const double scale = options_.image_scale;
+    const cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
+        options_.fx * scale, 0.0, options_.cx * scale,
+        0.0, options_.fy * scale, options_.cy * scale,
+        0.0, 0.0, 1.0);
+    const cv::Mat distortion = (cv::Mat_<double>(1, 5) <<
+        options_.distortion[0], options_.distortion[1], options_.distortion[2],
+        options_.distortion[3], options_.distortion[4]);
+    cv::Mat rectified;
+    cv::undistort(gray, rectified, camera_matrix, distortion, camera_matrix);
+    rectified.convertTo(frame.gray, CV_32F);
+    cv::Sobel(frame.gray, frame.gradient_x, CV_32F, 1, 0, 3, 0.125);
+    cv::Sobel(frame.gray, frame.gradient_y, CV_32F, 0, 1, 3, 0.125);
+
+    if (!dynamic_mask.empty())
+    {
+      cv::Mat mask;
+      if (dynamic_mask.channels() == 1)
+      {
+        mask = dynamic_mask;
+      }
+      else
+      {
+        cv::cvtColor(dynamic_mask, mask, cv::COLOR_BGR2GRAY);
+      }
+      if (mask.depth() != CV_8U) mask.convertTo(mask, CV_8U);
+      if (mask.size() != gray.size())
+      {
+        cv::resize(mask, mask, gray.size(), 0.0, 0.0, cv::INTER_NEAREST);
+      }
+      cv::undistort(mask, frame.dynamic_mask, camera_matrix, distortion,
+                    camera_matrix);
+      cv::threshold(frame.dynamic_mask, frame.dynamic_mask, 0.0, 255.0,
+                    cv::THRESH_BINARY);
+    }
+    if (!semantic_labels.empty())
+    {
+      cv::Mat labels;
+      if (semantic_labels.channels() == 1)
+      {
+        labels = semantic_labels;
+      }
+      else
+      {
+        cv::cvtColor(semantic_labels, labels, cv::COLOR_BGR2GRAY);
+      }
+      if (labels.depth() != CV_8U) labels.convertTo(labels, CV_8U);
+      if (labels.size() != gray.size())
+      {
+        cv::resize(labels, labels, gray.size(), 0.0, 0.0, cv::INTER_NEAREST);
+      }
+      cv::undistort(labels, frame.semantic_labels, camera_matrix, distortion,
+                    camera_matrix);
+    }
+    return frame;
+  }
+
+  // The caller explicitly selected raw-image projection. Do not alter image
+  // pixels, masks, or labels in this branch; project() applies the same
+  // radial-tangential model when requested.
+  gray.convertTo(frame.gray, CV_32F);
   cv::Sobel(frame.gray, frame.gradient_x, CV_32F, 1, 0, 3, 0.125);
   cv::Sobel(frame.gray, frame.gradient_y, CV_32F, 0, 1, 3, 0.125);
 
@@ -270,8 +324,7 @@ SparseVisualFrame SparseVisualMap::prepareFrame(
     {
       cv::resize(mask, mask, gray.size(), 0.0, 0.0, cv::INTER_NEAREST);
     }
-    cv::undistort(mask, frame.dynamic_mask, camera_matrix, distortion,
-                  camera_matrix);
+    frame.dynamic_mask = mask;
     cv::threshold(frame.dynamic_mask, frame.dynamic_mask, 0.0, 255.0,
                   cv::THRESH_BINARY);
   }
@@ -291,8 +344,7 @@ SparseVisualFrame SparseVisualMap::prepareFrame(
     {
       cv::resize(labels, labels, gray.size(), 0.0, 0.0, cv::INTER_NEAREST);
     }
-    cv::undistort(labels, frame.semantic_labels, camera_matrix, distortion,
-                  camera_matrix);
+    frame.semantic_labels = labels;
   }
   return frame;
 }

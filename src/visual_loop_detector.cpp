@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <numeric>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -117,14 +119,33 @@ VisualLoopDetector::VisualLoopDetector(
   options_.maximum_features = std::max(200, options_.maximum_features);
   options_.minimum_depth_features = std::max(10, options_.minimum_depth_features);
   options_.maximum_database_size = std::max(10, options_.maximum_database_size);
+  options_.debug_image_history_size = std::max(0, options_.debug_image_history_size);
   options_.keyframe_distance = std::max(0.0, options_.keyframe_distance);
   options_.keyframe_interval_sec = std::max(0.05, options_.keyframe_interval_sec);
+  options_.retrieval_interval_sec = std::max(0.0, options_.retrieval_interval_sec);
   options_.minimum_index_gap = std::max(2, options_.minimum_index_gap);
   options_.search_radius = std::max(1.0, options_.search_radius);
   options_.maximum_retrieval_candidates = std::max(
       1, options_.maximum_retrieval_candidates);
   options_.maximum_geometric_candidates = std::max(
       1, options_.maximum_geometric_candidates);
+  options_.maximum_global_retrieval_candidates = std::max(
+      0, options_.maximum_global_retrieval_candidates);
+  options_.global_retrieval_feature_count = std::max(
+      32, std::min(options_.maximum_features,
+                   options_.global_retrieval_feature_count));
+  options_.global_retrieval_min_votes = std::max(
+      1, options_.global_retrieval_min_votes);
+  options_.global_retrieval_min_table_count = std::max(
+      1, std::min(kGlobalRetrievalHashTables,
+                  options_.global_retrieval_min_table_count));
+  options_.minimum_global_geometric_candidates = std::max(
+      0, std::min(options_.maximum_geometric_candidates,
+                  options_.minimum_global_geometric_candidates));
+  options_.maximum_verified_candidates = std::max(
+      1, options_.maximum_verified_candidates);
+  options_.candidate_reference_min_separation_sec = std::max(
+      0.0, options_.candidate_reference_min_separation_sec);
   options_.descriptor_ratio = clampValue(options_.descriptor_ratio, 0.3, 0.95);
   options_.minimum_descriptor_matches = std::max(
       8, options_.minimum_descriptor_matches);
@@ -151,7 +172,22 @@ VisualLoopDetector::VisualLoopDetector(
 void VisualLoopDetector::reset()
 {
   keyframes_.clear();
+  for (GlobalVoteBins &bins : global_vote_index_) bins.clear();
+  global_index_stale_keyframes_ = 0;
+  last_accepted_candidates_.clear();
   next_id_ = 0;
+  last_retrieval_stamp_ = -std::numeric_limits<double>::infinity();
+}
+
+void VisualLoopDetector::pruneDebugImages()
+{
+  const std::size_t retained = std::min(
+      keyframes_.size(), static_cast<std::size_t>(options_.debug_image_history_size));
+  const std::size_t release_count = keyframes_.size() - retained;
+  for (std::size_t index = 0U; index < release_count; ++index)
+  {
+    keyframes_[index].gray.release();
+  }
 }
 
 cv::Mat VisualLoopDetector::prepareImage(const cv::Mat &image) const
@@ -209,8 +245,185 @@ VisualLoopDetector::Keyframe VisualLoopDetector::buildKeyframe(
   }
   // Own a compact, continuous descriptor buffer for retained database entries.
   keyframe.descriptors = keyframe.descriptors.clone();
+  selectGlobalRetrievalFeatures(&keyframe);
   associateDepth(&keyframe, body_points);
   return keyframe;
+}
+
+void VisualLoopDetector::selectGlobalRetrievalFeatures(Keyframe *keyframe) const
+{
+  if (keyframe == nullptr ||
+      !validBinaryDescriptors(keyframe->descriptors, keyframe->keypoints.size()))
+  {
+    return;
+  }
+  keyframe->global_retrieval_feature_indices.resize(keyframe->keypoints.size());
+  std::iota(keyframe->global_retrieval_feature_indices.begin(),
+            keyframe->global_retrieval_feature_indices.end(), 0);
+  std::sort(keyframe->global_retrieval_feature_indices.begin(),
+            keyframe->global_retrieval_feature_indices.end(),
+            [&](int left, int right)
+            {
+              const float left_response = keyframe->keypoints[
+                  static_cast<std::size_t>(left)].response;
+              const float right_response = keyframe->keypoints[
+                  static_cast<std::size_t>(right)].response;
+              if (left_response != right_response) return left_response > right_response;
+              return left < right;
+            });
+  if (keyframe->global_retrieval_feature_indices.size() >
+      static_cast<std::size_t>(options_.global_retrieval_feature_count))
+  {
+    keyframe->global_retrieval_feature_indices.resize(
+        static_cast<std::size_t>(options_.global_retrieval_feature_count));
+  }
+}
+
+std::uint32_t VisualLoopDetector::globalRetrievalHash(
+    const uint8_t *descriptor, int table) const
+{
+  if (descriptor == nullptr || table < 0 ||
+      table >= kGlobalRetrievalHashTables) return 0U;
+  std::uint32_t hash = 0U;
+  for (int bit = 0; bit < kGlobalRetrievalHashBits; ++bit)
+  {
+    // Each table samples a different, evenly distributed subset of ORB's 256
+    // binary tests. Nearby descriptors therefore share several table codes,
+    // while unrelated frames only contribute a low collision background.
+    const int descriptor_bit =
+        (17 + table * 37 + bit * 11) & 255;
+    const std::uint32_t value = (descriptor[descriptor_bit / 8] >>
+                                 (descriptor_bit % 8)) & 1U;
+    hash |= value << bit;
+  }
+  return hash;
+}
+
+void VisualLoopDetector::addKeyframeToGlobalIndex(const Keyframe &keyframe)
+{
+  if (!options_.enable_global_retrieval_fallback ||
+      options_.maximum_global_retrieval_candidates <= 0 ||
+      !validBinaryDescriptors(keyframe.descriptors, keyframe.keypoints.size()))
+  {
+    return;
+  }
+  const std::size_t bucket_count =
+      static_cast<std::size_t>(1U << kGlobalRetrievalHashBits);
+  for (GlobalVoteBins &bins : global_vote_index_)
+  {
+    if (bins.empty()) bins.resize(bucket_count);
+  }
+  for (const int feature_index : keyframe.global_retrieval_feature_indices)
+  {
+    if (feature_index < 0 || feature_index >= keyframe.descriptors.rows) continue;
+    const uint8_t *descriptor = keyframe.descriptors.ptr<uint8_t>(feature_index);
+    for (int table = 0; table < kGlobalRetrievalHashTables; ++table)
+    {
+      global_vote_index_[static_cast<std::size_t>(table)][
+          globalRetrievalHash(descriptor, table)].push_back(keyframe.id);
+    }
+  }
+}
+
+void VisualLoopDetector::rebuildGlobalIndex()
+{
+  for (GlobalVoteBins &bins : global_vote_index_)
+  {
+    for (std::vector<int> &bucket : bins) bucket.clear();
+  }
+  global_index_stale_keyframes_ = 0;
+  for (const Keyframe &keyframe : keyframes_)
+  {
+    addKeyframeToGlobalIndex(keyframe);
+  }
+}
+
+std::size_t VisualLoopDetector::databaseIndexForKeyframeId(int id) const
+{
+  if (keyframes_.empty() || id < keyframes_.front().id ||
+      id > keyframes_.back().id)
+  {
+    return keyframes_.size();
+  }
+  const std::size_t index = static_cast<std::size_t>(id - keyframes_.front().id);
+  if (index >= keyframes_.size() || keyframes_[index].id != id)
+  {
+    return keyframes_.size();
+  }
+  return index;
+}
+
+std::vector<VisualLoopDetector::GlobalVoteCandidate>
+VisualLoopDetector::globalVoteCandidates(const Keyframe &current) const
+{
+  struct Vote
+  {
+    int count = 0;
+    uint8_t tables = 0U;
+  };
+  std::vector<GlobalVoteCandidate> candidates;
+  if (current.global_retrieval_feature_indices.empty() || keyframes_.empty() ||
+      global_vote_index_.front().empty())
+  {
+    return candidates;
+  }
+  std::unordered_map<int, Vote> votes;
+  votes.reserve(keyframes_.size());
+  std::unordered_map<int, int> last_seen_token;
+  last_seen_token.reserve(keyframes_.size());
+  int token = 0;
+  for (const int feature_index : current.global_retrieval_feature_indices)
+  {
+    if (feature_index < 0 || feature_index >= current.descriptors.rows) continue;
+    const uint8_t *descriptor = current.descriptors.ptr<uint8_t>(feature_index);
+    for (int table = 0; table < kGlobalRetrievalHashTables; ++table)
+    {
+      ++token;
+      const std::vector<int> &bucket = global_vote_index_[
+          static_cast<std::size_t>(table)][globalRetrievalHash(descriptor, table)];
+      for (const int id : bucket)
+      {
+        if (last_seen_token[id] == token) continue;
+        last_seen_token[id] = token;
+        const std::size_t database_index = databaseIndexForKeyframeId(id);
+        if (database_index >= keyframes_.size()) continue;
+        const Keyframe &reference = keyframes_[database_index];
+        if (current.id - reference.id < options_.minimum_index_gap ||
+            current.stamp - reference.stamp <
+                std::max(0.0, options_.minimum_time_separation_sec))
+        {
+          continue;
+        }
+        Vote &vote = votes[id];
+        ++vote.count;
+        vote.tables |= static_cast<uint8_t>(1U << table);
+      }
+    }
+  }
+  for (const auto &item : votes)
+  {
+    int table_count = 0;
+    for (int table = 0; table < kGlobalRetrievalHashTables; ++table)
+    {
+      if ((item.second.tables & static_cast<uint8_t>(1U << table)) != 0U)
+        ++table_count;
+    }
+    if (item.second.count < options_.global_retrieval_min_votes ||
+        table_count < options_.global_retrieval_min_table_count) continue;
+    const std::size_t database_index = databaseIndexForKeyframeId(item.first);
+    if (database_index >= keyframes_.size()) continue;
+    candidates.push_back(GlobalVoteCandidate{
+        database_index, item.second.count, table_count});
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const GlobalVoteCandidate &left,
+               const GlobalVoteCandidate &right)
+            {
+              if (left.votes != right.votes) return left.votes > right.votes;
+              if (left.tables != right.tables) return left.tables > right.tables;
+              return left.database_index < right.database_index;
+            });
+  return candidates;
 }
 
 void VisualLoopDetector::associateDepth(
@@ -298,10 +511,14 @@ void VisualLoopDetector::associateDepth(
 
 VisualLoopDetector::RetrievalCandidate VisualLoopDetector::retrieve(
     const Keyframe &reference, const Keyframe &current,
-    std::size_t database_index) const
+    std::size_t database_index, bool global_retrieval,
+    int global_retrieval_votes, int global_retrieval_tables) const
 {
   RetrievalCandidate candidate;
   candidate.database_index = database_index;
+  candidate.global_retrieval = global_retrieval;
+  candidate.global_retrieval_votes = global_retrieval_votes;
+  candidate.global_retrieval_tables = global_retrieval_tables;
   if (!validKeyframeFeatures(reference.descriptors, reference.keypoints,
                              reference.depth_points, reference.has_depth) ||
       !validKeyframeFeatures(current.descriptors, current.keypoints,
@@ -376,6 +593,9 @@ VisualLoopResult VisualLoopDetector::verify(
   result.temporal_separation_sec = current.stamp - reference.stamp;
   result.descriptor_matches = candidate.matches;
   result.descriptor_score = candidate.score;
+  result.global_retrieval = candidate.global_retrieval;
+  result.global_retrieval_votes = candidate.global_retrieval_votes;
+  result.global_retrieval_tables = candidate.global_retrieval_tables;
   if (!validKeyframeFeatures(reference.descriptors, reference.keypoints,
                              reference.depth_points, reference.has_depth) ||
       !validKeyframeFeatures(current.descriptors, current.keypoints,
@@ -564,7 +784,12 @@ VisualLoopResult VisualLoopDetector::verify(
     draw_matches.emplace_back(match.trainIdx, match.queryIdx, match.distance);
     draw_mask.push_back(inlier_mask[index] ? 1 : 0);
   }
-  cv::drawMatches(reference.gray, reference.keypoints, current.gray,
+  cv::Mat reference_debug_image = reference.gray;
+  if (reference_debug_image.empty())
+  {
+    reference_debug_image = cv::Mat::zeros(current.gray.size(), current.gray.type());
+  }
+  cv::drawMatches(reference_debug_image, reference.keypoints, current.gray,
                   current.keypoints, draw_matches, result.debug_image,
                   cv::Scalar(40, 220, 40), cv::Scalar(100, 100, 100), draw_mask,
                   cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
@@ -578,6 +803,7 @@ VisualLoopResult VisualLoopDetector::process(
     const VisualLidarPointVector &body_points,
     const Eigen::Isometry3d &world_from_body, const cv::Mat &dynamic_mask)
 {
+  last_accepted_candidates_.clear();
   VisualLoopResult result;
   result.current_stamp = stamp;
   if (!options_.enabled)
@@ -601,7 +827,10 @@ VisualLoopResult VisualLoopDetector::process(
   {
     const Keyframe &last = keyframes_.back();
     const Eigen::Isometry3d motion = last.raw_pose.inverse() * world_from_body;
-    if (motion.translation().norm() < options_.keyframe_distance &&
+    // Bound database growth by time as well as distance. The old OR gate
+    // admitted every high-speed image, so a long return pass discarded its
+    // earliest candidates before the vehicle reached them again.
+    if (motion.translation().norm() < options_.keyframe_distance ||
         stamp - last.stamp < options_.keyframe_interval_sec)
     {
       result.reason = "visual_loop_minimum_interval";
@@ -623,7 +852,56 @@ VisualLoopResult VisualLoopDetector::process(
   }
   result.keyframe_created = true;
 
+  const auto store_keyframe = [&]()
+  {
+    keyframes_.push_back(std::move(current));
+    const bool global_retrieval_enabled =
+        options_.enable_global_retrieval_fallback &&
+        options_.maximum_global_retrieval_candidates > 0;
+    if (global_retrieval_enabled)
+    {
+      addKeyframeToGlobalIndex(keyframes_.back());
+    }
+    ++next_id_;
+    while (keyframes_.size() >
+        static_cast<std::size_t>(options_.maximum_database_size))
+    {
+      keyframes_.pop_front();
+      ++global_index_stale_keyframes_;
+    }
+    // Stale identifiers are skipped during voting. Rebuild periodically so a
+    // replay longer than the retained database cannot grow the index forever.
+    if (global_retrieval_enabled && global_index_stale_keyframes_ >=
+        std::max(64, options_.maximum_database_size / 8))
+    {
+      rebuildGlobalIndex();
+    }
+    pruneDebugImages();
+  };
+  const bool retrieval_due = options_.retrieval_interval_sec <= 0.0 ||
+      !std::isfinite(last_retrieval_stamp_) ||
+      stamp - last_retrieval_stamp_ >= options_.retrieval_interval_sec;
+  if (!retrieval_due)
+  {
+    // Retain the observation for a later revisit without running dozens of
+    // descriptor comparisons and PnP solves in this sensor callback.
+    result.reason = "visual_loop_retrieval_interval";
+    store_keyframe();
+    return result;
+  }
+  last_retrieval_stamp_ = stamp;
+
+  struct CandidateSource
+  {
+    std::size_t database_index;
+    bool global_retrieval;
+    int global_retrieval_votes;
+    int global_retrieval_tables;
+  };
   std::vector<std::pair<double, std::size_t>> spatial;
+  const bool global_retrieval_enabled =
+      options_.enable_global_retrieval_fallback &&
+      options_.maximum_global_retrieval_candidates > 0;
   for (std::size_t index = 0U; index < keyframes_.size(); ++index)
   {
     const Keyframe &reference = keyframes_[index];
@@ -647,14 +925,40 @@ VisualLoopResult VisualLoopDetector::process(
     spatial.resize(static_cast<std::size_t>(
         options_.maximum_retrieval_candidates));
   }
-  std::vector<RetrievalCandidate> candidates;
-  candidates.reserve(spatial.size());
+  const std::vector<GlobalVoteCandidate> global = global_retrieval_enabled ?
+      globalVoteCandidates(current) : std::vector<GlobalVoteCandidate>();
+  std::vector<CandidateSource> sources;
+  sources.reserve(spatial.size() + global.size());
+  std::unordered_set<std::size_t> selected_sources;
   for (const auto &item : spatial)
   {
-    RetrievalCandidate candidate = retrieve(keyframes_[item.second], current,
-                                            item.second);
+    sources.push_back(CandidateSource{item.second, false, 0, 0});
+    selected_sources.insert(item.second);
+  }
+  int global_retrieval_candidates = 0;
+  for (const auto &item : global)
+  {
+    if (global_retrieval_candidates >=
+        options_.maximum_global_retrieval_candidates) break;
+    if (!selected_sources.insert(item.database_index).second) continue;
+    sources.push_back(CandidateSource{item.database_index, true,
+                                      item.votes, item.tables});
+    ++global_retrieval_candidates;
+  }
+  std::vector<RetrievalCandidate> candidates;
+  candidates.reserve(sources.size());
+  int global_retrieval_descriptor_matches = 0;
+  for (const CandidateSource &source : sources)
+  {
+    RetrievalCandidate candidate = retrieve(
+        keyframes_[source.database_index], current, source.database_index,
+        source.global_retrieval, source.global_retrieval_votes,
+        source.global_retrieval_tables);
     if (candidate.matches >= options_.minimum_descriptor_matches)
+    {
+      if (candidate.global_retrieval) ++global_retrieval_descriptor_matches;
       candidates.push_back(std::move(candidate));
+    }
   }
   std::sort(candidates.begin(), candidates.end(),
             [](const RetrievalCandidate &left,
@@ -663,12 +967,27 @@ VisualLoopResult VisualLoopDetector::process(
               if (left.matches != right.matches) return left.matches > right.matches;
               return left.score > right.score;
             });
-  if (candidates.size() >
-      static_cast<std::size_t>(options_.maximum_geometric_candidates))
+  std::vector<RetrievalCandidate> geometric_candidates;
+  geometric_candidates.reserve(std::min(
+      candidates.size(), static_cast<std::size_t>(
+          options_.maximum_geometric_candidates)));
+  std::unordered_set<std::size_t> selected_geometric;
+  for (const RetrievalCandidate &candidate : candidates)
   {
-    candidates.resize(static_cast<std::size_t>(
-        options_.maximum_geometric_candidates));
+    if (!candidate.global_retrieval) continue;
+    if (geometric_candidates.size() >= static_cast<std::size_t>(
+        options_.minimum_global_geometric_candidates)) break;
+    geometric_candidates.push_back(candidate);
+    selected_geometric.insert(candidate.database_index);
   }
+  for (const RetrievalCandidate &candidate : candidates)
+  {
+    if (geometric_candidates.size() >= static_cast<std::size_t>(
+        options_.maximum_geometric_candidates)) break;
+    if (!selected_geometric.insert(candidate.database_index).second) continue;
+    geometric_candidates.push_back(candidate);
+  }
+  candidates.swap(geometric_candidates);
 
   VisualLoopResult best;
   best.current_id = current.id;
@@ -676,23 +995,62 @@ VisualLoopResult VisualLoopDetector::process(
   best.keyframe_created = true;
   best.reason = candidates.empty() ? "visual_loop_no_candidate" :
                                      "visual_loop_geometric_rejection";
+  VisualLoopResultVector verified_candidates;
+  verified_candidates.reserve(candidates.size());
   for (const RetrievalCandidate &candidate : candidates)
   {
     const Keyframe &reference = keyframes_[candidate.database_index];
     VisualLoopResult verified = verify(reference, current, candidate);
-    if (verified.accepted && (!best.accepted || verified.quality > best.quality))
-      best = std::move(verified);
+    if (verified.accepted)
+    {
+      verified_candidates.push_back(verified);
+      if (!best.accepted || verified.quality > best.quality)
+        best = std::move(verified);
+    }
     else if (!best.accepted && verified.pnp_inliers > best.pnp_inliers)
+    {
       best = std::move(verified);
+    }
+  }
+  std::sort(verified_candidates.begin(), verified_candidates.end(),
+            [](const VisualLoopResult &left, const VisualLoopResult &right)
+            {
+              if (left.quality != right.quality) return left.quality > right.quality;
+              if (left.pnp_inliers != right.pnp_inliers)
+                return left.pnp_inliers > right.pnp_inliers;
+              return left.descriptor_matches > right.descriptor_matches;
+            });
+  for (const VisualLoopResult &candidate : verified_candidates)
+  {
+    bool reference_is_independent = true;
+    if (options_.candidate_reference_min_separation_sec > 0.0)
+    {
+      for (const VisualLoopResult &selected : last_accepted_candidates_)
+      {
+        if (std::abs(candidate.reference_stamp - selected.reference_stamp) <
+            options_.candidate_reference_min_separation_sec)
+        {
+          reference_is_independent = false;
+          break;
+        }
+      }
+    }
+    if (!reference_is_independent) continue;
+    last_accepted_candidates_.push_back(candidate);
+    if (last_accepted_candidates_.size() >=
+        static_cast<std::size_t>(options_.maximum_verified_candidates))
+    {
+      break;
+    }
   }
 
-  keyframes_.push_back(std::move(current));
-  ++next_id_;
-  while (keyframes_.size() >
-      static_cast<std::size_t>(options_.maximum_database_size))
-  {
-    keyframes_.pop_front();
-  }
+  // Preserve the existing process() contract: callers that only request one
+  // result observe the strongest verified candidate.
+  if (!last_accepted_candidates_.empty()) best = last_accepted_candidates_.front();
+  best.global_retrieval_candidates = global_retrieval_candidates;
+  best.global_retrieval_descriptor_matches = global_retrieval_descriptor_matches;
+
+  store_keyframe();
   return best;
 }
 

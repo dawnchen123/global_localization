@@ -48,18 +48,61 @@ source "${SETUP_FILE}"
 
 SUBSCRIBE_CAMERA=false
 ENABLE_VISUAL=false
-ENABLE_SAM3=false
-ENABLE_GRAPH=false
+# Leave these unset until the selected mode establishes its default.  This
+# lets a full-graph replay isolate visual loop closure from SAM3 by passing
+# ENABLE_SAM3=false, instead of forcing the GPU service into every graph test.
+ENABLE_SAM3="${ENABLE_SAM3:-}"
+ENABLE_GRAPH="${ENABLE_GRAPH:-}"
+SUBSCRIBE_WHEEL="${SUBSCRIBE_WHEEL:-true}"
+# Leave graph wheel ownership to the loaded configuration unless an ablation
+# explicitly passes true/false. This mirrors the profile-preserving behavior
+# for the sequential ground-Z experiment switch.
+ENABLE_WHEEL_FACTORS="${ENABLE_WHEEL_FACTORS:-}"
 ENABLE_GENERIC_LOOPS="${ENABLE_GENERIC_LOOPS:-false}"
+ENABLE_XY_LOOPS="${ENABLE_XY_LOOPS:-${ENABLE_GENERIC_LOOPS}}"
+ENABLE_Z_LOOPS="${ENABLE_Z_LOOPS:-${ENABLE_GENERIC_LOOPS}}"
+ENABLE_SEQUENTIAL_GROUND_Z="${ENABLE_SEQUENTIAL_GROUND_Z:-}"
+if [[ -z "${ENABLE_SEQUENTIAL_GROUND_Z}" && "${ENABLE_GENERIC_LOOPS}" == true ]]; then
+  ENABLE_SEQUENTIAL_GROUND_Z=true
+fi
+SUBSCRIBE_CAMERA_GRAPH="${SUBSCRIBE_CAMERA_GRAPH:-}"
+PROCESS_REGISTERED_CLOUDS="${PROCESS_REGISTERED_CLOUDS:-}"
+VISUAL_FUSION_PROFILE="${VISUAL_FUSION_PROFILE:-}"
+VISUAL_OBSERVATION_ONLY="${VISUAL_OBSERVATION_ONLY:-}"
+VISUAL_AUTO_Z_WHEN_OBSERVABLE="${VISUAL_AUTO_Z_WHEN_OBSERVABLE:-}"
+FRONTEND_TUNING_CONFIG="${FRONTEND_TUNING_CONFIG:-}"
+GRAPH_TUNING_CONFIG="${GRAPH_TUNING_CONFIG:-}"
 if [[ "${MODE}" != "lio" ]]; then
   SUBSCRIBE_CAMERA=true
   ENABLE_VISUAL=true
+  # lio_visual and later ablations are intended to measure the direct
+  # LiDAR-depth visual ESKF, not merely collect KLT/PnP diagnostics.
+  VISUAL_FUSION_PROFILE="${VISUAL_FUSION_PROFILE:-true}"
+  VISUAL_OBSERVATION_ONLY="${VISUAL_OBSERVATION_ONLY:-false}"
+else
+  VISUAL_FUSION_PROFILE="${VISUAL_FUSION_PROFILE:-false}"
+  VISUAL_OBSERVATION_ONLY="${VISUAL_OBSERVATION_ONLY:-true}"
 fi
 if [[ "${MODE}" == "lio_visual_sam3" || "${MODE}" == "full_graph" ]]; then
-  ENABLE_SAM3=true
+  ENABLE_SAM3="${ENABLE_SAM3:-true}"
 fi
 if [[ "${MODE}" == "full_graph" ]]; then
-  ENABLE_GRAPH=true
+  ENABLE_GRAPH="${ENABLE_GRAPH:-true}"
+fi
+: "${ENABLE_SAM3:=false}"
+: "${ENABLE_GRAPH:=false}"
+if [[ -z "${SUBSCRIBE_CAMERA_GRAPH}" ]]; then
+  SUBSCRIBE_CAMERA_GRAPH="${ENABLE_GRAPH}"
+fi
+if [[ -z "${PROCESS_REGISTERED_CLOUDS}" ]]; then
+  # SAM3 semantic association and graph factors consume registered clouds.
+  # Frontend-only modes have no such consumer, so do not create a lagging
+  # backend keyframe queue during their reference runs.
+  if [[ "${ENABLE_GRAPH}" == true || "${ENABLE_SAM3}" == true ]]; then
+    PROCESS_REGISTERED_CLOUDS=true
+  else
+    PROCESS_REGISTERED_CLOUDS=false
+  fi
 fi
 # Keep the semantic factor groups independently switchable for controlled
 # ablations.  Defaults preserve the selected mode's existing behavior.
@@ -124,25 +167,39 @@ if [[ "${ENABLE_SAM3}" == true ]]; then
   fi
 fi
 
+LAUNCH_ARGS=(
+  rviz:=false
+  "visual_fusion_profile:=${VISUAL_FUSION_PROFILE}"
+  "visual_auto_z_when_observable:=${VISUAL_AUTO_Z_WHEN_OBSERVABLE}"
+  "frontend_tuning_config:=${FRONTEND_TUNING_CONFIG}"
+  "graph_tuning_config:=${GRAPH_TUNING_CONFIG}"
+  "subscribe_wheel:=${SUBSCRIBE_WHEEL}"
+  "subscribe_camera:=${SUBSCRIBE_CAMERA}"
+  "subscribe_camera_graph:=${SUBSCRIBE_CAMERA_GRAPH}"
+  "process_registered_clouds:=${PROCESS_REGISTERED_CLOUDS}"
+  "enable_visual_frontend:=${ENABLE_VISUAL}"
+  "visual_observation_only:=${VISUAL_OBSERVATION_ONLY}"
+  enable_visual_rotation_factors:=false
+  enable_visual_translation_factors:=false
+  "enable_visual_loop_factors:=${ENABLE_GRAPH}"
+  "enable_sam3_semantics:=${ENABLE_SAM3}"
+  "enable_xy_loops:=${ENABLE_XY_LOOPS}"
+  "enable_z_loops:=${ENABLE_Z_LOOPS}"
+  "enable_semantic_observation_factors:=${ENABLE_SEMANTIC_OBSERVATION_FACTORS}"
+  "enable_semantic_observation_xy_factors:=${ENABLE_SEMANTIC_XY_FACTORS}"
+  "enable_semantic_observation_z_factors:=${ENABLE_SEMANTIC_Z_FACTORS}"
+  "sam3_queue_dir:=${QUEUE_DIR}"
+  "frontend_trajectory_save_path:=${RESULT_DIR}/frontend.csv"
+  "trajectory_save_path:=${RESULT_DIR}/graph.csv"
+)
+if [[ -n "${ENABLE_SEQUENTIAL_GROUND_Z}" ]]; then
+  LAUNCH_ARGS+=("enable_sequential_ground_z:=${ENABLE_SEQUENTIAL_GROUND_Z}")
+fi
+if [[ -n "${ENABLE_WHEEL_FACTORS}" ]]; then
+  LAUNCH_ARGS+=("enable_wheel_factors:=${ENABLE_WHEEL_FACTORS}")
+fi
 roslaunch fast_livo2_global_localization hybrid_localization_hesai.launch \
-  rviz:=false \
-  subscribe_camera:="${SUBSCRIBE_CAMERA}" \
-  enable_visual_frontend:="${ENABLE_VISUAL}" \
-  visual_observation_only:=true \
-  enable_visual_rotation_factors:=false \
-  enable_visual_translation_factors:=false \
-  enable_visual_loop_factors:="${ENABLE_GRAPH}" \
-  enable_sam3_semantics:="${ENABLE_SAM3}" \
-  enable_xy_loops:="${ENABLE_GENERIC_LOOPS}" \
-  enable_z_loops:="${ENABLE_GENERIC_LOOPS}" \
-  enable_sequential_ground_z:="${ENABLE_GENERIC_LOOPS}" \
-  enable_semantic_observation_factors:="${ENABLE_SEMANTIC_OBSERVATION_FACTORS}" \
-  enable_semantic_observation_xy_factors:="${ENABLE_SEMANTIC_XY_FACTORS}" \
-  enable_semantic_observation_z_factors:="${ENABLE_SEMANTIC_Z_FACTORS}" \
-  sam3_queue_dir:="${QUEUE_DIR}" \
-  frontend_trajectory_save_path:="${RESULT_DIR}/frontend.csv" \
-  trajectory_save_path:="${RESULT_DIR}/graph.csv" \
-  >"${RESULT_DIR}/launch.log" 2>&1 &
+  "${LAUNCH_ARGS[@]}" >"${RESULT_DIR}/launch.log" 2>&1 &
 LAUNCH_PID=$!
 sleep 4
 rostopic echo /hybrid/status >"${RESULT_DIR}/frontend_status_stream.txt" 2>&1 &
@@ -151,6 +208,9 @@ rostopic echo /hybrid/semantic_graph/stats >"${RESULT_DIR}/graph_stats_stream.tx
 STATS_ECHO_PID=$!
 
 TOPICS=(/adi/adis16465/imu /hesai/at128/points)
+if [[ "${SUBSCRIBE_WHEEL}" == true ]]; then
+  TOPICS+=(/insprobe/ranger/odometer)
+fi
 if [[ "${SUBSCRIBE_CAMERA}" == true ]]; then
   TOPICS+=(/avt_camera/left/image/compressed)
 fi

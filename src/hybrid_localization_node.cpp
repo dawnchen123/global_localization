@@ -146,6 +146,14 @@ struct MeasurementEvent
   sensor_msgs::CompressedImageConstPtr image;
 };
 
+struct PendingWheelMeasurement
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  WheelSample sample;
+  bool has_pose = false;
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+};
+
 struct CachedCameraFrame
 {
   double stamp = 0.0;
@@ -571,8 +579,8 @@ class HybridLocalizationNode
 {
 public:
   HybridLocalizationNode()
-      : nh_(), private_nh_("~"), imu_nh_(nh_), lidar_nh_(nh_),
-        camera_nh_(nh_), optimizer_(12)
+      : nh_(), private_nh_("~"), imu_nh_(nh_), wheel_nh_(nh_),
+        lidar_nh_(nh_), camera_nh_(nh_), optimizer_(12)
   {
     loadParameters();
     if (save_on_shutdown_ && !trajectory_save_path_.empty())
@@ -606,9 +614,12 @@ public:
   void spin()
   {
     ros::AsyncSpinner imu_spinner(1, &imu_callback_queue_);
+    ros::AsyncSpinner wheel_spinner(1, &wheel_callback_queue_);
     ros::AsyncSpinner lidar_spinner(1, &lidar_callback_queue_);
     ros::AsyncSpinner camera_spinner(1, &camera_callback_queue_);
     imu_spinner.start();
+    if (measurement_scheduler_enabled_ && subscribe_wheel_)
+      wheel_spinner.start();
     if (measurement_scheduler_enabled_ && subscribe_lidar_)
       lidar_spinner.start();
     if (measurement_scheduler_enabled_ && subscribe_camera_frontend_)
@@ -618,6 +629,8 @@ public:
       camera_spinner.stop();
     if (measurement_scheduler_enabled_ && subscribe_lidar_)
       lidar_spinner.stop();
+    if (measurement_scheduler_enabled_ && subscribe_wheel_)
+      wheel_spinner.stop();
     imu_spinner.stop();
   }
 
@@ -634,6 +647,13 @@ private:
   double latestReceivedImuStamp() const;
   std::size_t pendingImuSampleCount() const;
   std::uint64_t pendingImuQueueDrops() const;
+  void enqueueWheelMeasurement(PendingWheelMeasurement measurement);
+  void applyWheelMeasurement(const PendingWheelMeasurement &measurement);
+  void drainPendingWheelMeasurements(
+      double up_to_stamp = std::numeric_limits<double>::infinity());
+  double latestReceivedWheelStamp() const;
+  std::size_t pendingWheelMeasurementCount() const;
+  std::uint64_t pendingWheelQueueDrops() const;
   void wheelCallback(const nav_msgs::OdometryConstPtr &message);
   void rangerWheelCallback(const insprobe_msgs::RangerOdometerConstPtr &message);
   void lidarCallback(const sensor_msgs::PointCloud2ConstPtr &message);
@@ -702,9 +722,11 @@ private:
   ros::NodeHandle nh_;
   ros::NodeHandle private_nh_;
   ros::NodeHandle imu_nh_;
+  ros::NodeHandle wheel_nh_;
   ros::NodeHandle lidar_nh_;
   ros::NodeHandle camera_nh_;
   ros::CallbackQueue imu_callback_queue_;
+  ros::CallbackQueue wheel_callback_queue_;
   ros::CallbackQueue lidar_callback_queue_;
   ros::CallbackQueue camera_callback_queue_;
   ros::Subscriber imu_sub_;
@@ -856,6 +878,8 @@ private:
   double visual_update_interval_sec_ = 0.50;
   double measurement_max_image_lag_sec_ = 0.50;
   double measurement_reorder_window_sec_ = 0.02;
+  double measurement_wheel_wait_sec_ = 0.02;
+  double measurement_wheel_timeout_sec_ = 0.15;
   double measurement_scheduler_process_rate_hz_ = 200.0;
   int measurement_scheduler_max_events_per_tick_ = 2;
   double last_processed_measurement_stamp_ =
@@ -872,10 +896,10 @@ private:
   double sam3_flow_scale_ = 0.5;
   double sam3_cache_duration_sec_ = 6.0;
   double sam3_label_sync_tolerance_sec_ = 0.08;
-  double sam3_max_source_age_sec_ = 3.0;
+  double sam3_max_source_age_sec_ = 0.75;
   double sam3_max_flow_pixels_ = 80.0;
   double semantic_lidar_filter_sync_tolerance_sec_ = 0.30;
-  double semantic_lidar_filter_max_source_age_sec_ = 6.0;
+  double semantic_lidar_filter_max_source_age_sec_ = 0.75;
   double semantic_lidar_filter_min_depth_ = 0.20;
   double semantic_lidar_filter_min_dynamic_support_ratio_ = 0.55;
   int semantic_lidar_filter_support_radius_px_ = 1;
@@ -903,6 +927,10 @@ private:
   std::deque<MeasurementEvent> measurement_queue_;
   mutable std::mutex pending_imu_mutex_;
   std::deque<ImuSample, Eigen::aligned_allocator<ImuSample>> pending_imu_samples_;
+  mutable std::mutex pending_wheel_mutex_;
+  std::deque<PendingWheelMeasurement,
+             Eigen::aligned_allocator<PendingWheelMeasurement>>
+      pending_wheel_measurements_;
   mutable std::mutex pending_sam3_label_mutex_;
   std::deque<sensor_msgs::ImageConstPtr> pending_sam3_labels_;
   std::deque<CachedCameraFrame> camera_frame_cache_;
@@ -946,6 +974,9 @@ private:
   std::uint64_t pending_imu_queue_drops_ = 0U;
   double latest_received_imu_stamp_ =
       -std::numeric_limits<double>::infinity();
+  std::uint64_t pending_wheel_queue_drops_ = 0U;
+  double latest_received_wheel_stamp_ =
+      -std::numeric_limits<double>::infinity();
   std::uint64_t visual_update_attempts_ = 0U;
   std::uint64_t visual_update_accepts_ = 0U;
   std::uint64_t sam3_camera_labels_received_ = 0U;
@@ -971,9 +1002,19 @@ private:
   double visual_update_ncc_ = 0.0;
   double visual_update_correction_translation_ = 0.0;
   double visual_update_correction_rotation_deg_ = 0.0;
+  bool visual_update_z_observable_ = false;
+  bool visual_update_z_fused_ = false;
+  double visual_update_z_projection_ = 0.0;
+  double visual_update_z_conditional_information_ratio_ = 0.0;
+  double visual_update_z_correction_ = 0.0;
+  double visual_update_velocity_correction_ = 0.0;
+  double visual_update_gyro_bias_correction_ = 0.0;
+  double visual_update_acceleration_bias_correction_ = 0.0;
+  double visual_update_gravity_correction_ = 0.0;
   int visual_update_landmarks_ = 0;
   int visual_update_residuals_ = 0;
   int visual_update_iterations_ = 0;
+  int visual_update_observable_directions_ = 0;
   std::string visual_update_reason_ = "not_received";
   std::uint64_t semantic_clouds_received_ = 0U;
   std::uint64_t semantic_points_received_ = 0U;
@@ -994,10 +1035,15 @@ private:
   int lidar_correspondence_sectors_ = 0;
   int lidar_point_knn_fallback_queries_ = 0;
   int lidar_point_knn_fallback_matches_ = 0;
+  int lidar_innovation_rejections_ = 0;
+  double lidar_mean_robust_weight_ = 0.0;
   bool lidar_registration_degenerate_ = false;
   bool lidar_registration_used_imu_ = false;
   bool lidar_registration_used_wheel_ = false;
+  double lidar_wheel_velocity_residual_ = 0.0;
+  bool lidar_wheel_forward_rejected_ = false;
   bool lidar_map_update_deferred_ = false;
+  bool lidar_map_keyframe_selected_ = false;
   bool lidar_strong_support_ = false;
   bool lidar_recovery_mode_ = false;
   bool lidar_loss_limited_ = false;
@@ -1113,7 +1159,7 @@ void HybridLocalizationNode::loadParameters()
   private_nh_.param("visual_frontend/sam3_label_sync_tolerance_sec",
                     sam3_label_sync_tolerance_sec_, 0.08);
   private_nh_.param("visual_frontend/sam3_max_source_age_sec",
-                    sam3_max_source_age_sec_, 3.0);
+                    sam3_max_source_age_sec_, 0.75);
   private_nh_.param("visual_frontend/sam3_max_flow_pixels",
                     sam3_max_flow_pixels_, 80.0);
   private_nh_.param("visual_frontend/sam3_max_cached_frames",
@@ -1180,7 +1226,7 @@ void HybridLocalizationNode::loadParameters()
   private_nh_.param("semantic_lidar_filter/sync_tolerance_sec",
                     semantic_lidar_filter_sync_tolerance_sec_, 0.30);
   private_nh_.param("semantic_lidar_filter/max_source_age_sec",
-                    semantic_lidar_filter_max_source_age_sec_, 6.0);
+                    semantic_lidar_filter_max_source_age_sec_, 0.75);
   private_nh_.param("semantic_lidar_filter/min_project_depth",
                     semantic_lidar_filter_min_depth_, 0.20);
   private_nh_.param("semantic_lidar_filter/support_radius_px",
@@ -1195,6 +1241,10 @@ void HybridLocalizationNode::loadParameters()
                     measurement_max_image_lag_sec_, 0.50);
   private_nh_.param("measurement_scheduler/reorder_window_sec",
                     measurement_reorder_window_sec_, 0.02);
+  private_nh_.param("measurement_scheduler/wheel_wait_sec",
+                    measurement_wheel_wait_sec_, 0.02);
+  private_nh_.param("measurement_scheduler/wheel_timeout_sec",
+                    measurement_wheel_timeout_sec_, 0.15);
   private_nh_.param("measurement_scheduler/process_rate_hz",
                     measurement_scheduler_process_rate_hz_, 200.0);
   private_nh_.param("measurement_scheduler/max_events_per_tick",
@@ -1207,6 +1257,10 @@ void HybridLocalizationNode::loadParameters()
   visual_update_interval_sec_ = std::max(0.0, visual_update_interval_sec_);
   measurement_max_image_lag_sec_ = std::max(0.0, measurement_max_image_lag_sec_);
   measurement_reorder_window_sec_ = std::max(0.0, measurement_reorder_window_sec_);
+  measurement_wheel_wait_sec_ = std::max(
+      0.0, measurement_wheel_wait_sec_);
+  measurement_wheel_timeout_sec_ = std::max(
+      measurement_wheel_wait_sec_, measurement_wheel_timeout_sec_);
   measurement_scheduler_process_rate_hz_ = std::max(
       10.0, measurement_scheduler_process_rate_hz_);
   measurement_scheduler_max_events_per_tick_ = std::max(
@@ -1309,7 +1363,12 @@ void HybridLocalizationNode::configureLidarOdometry()
                     options.lidar_measurement_noise, 0.05);
   private_nh_.param("lidar_odometry/use_directional_lidar_covariance",
                     options.use_directional_lidar_covariance, false);
+  options.lidar_origin_in_body = body_from_lidar_.translation();
   private_nh_.param("lidar_odometry/huber_delta", options.huber_delta, 0.20);
+  private_nh_.param("lidar_odometry/lidar_normalized_huber_delta",
+                    options.lidar_normalized_huber_delta, 0.0);
+  private_nh_.param("lidar_odometry/lidar_innovation_gate",
+                    options.lidar_innovation_gate, 0.0);
   private_nh_.param("lidar_odometry/max_rmse", options.max_rmse, 0.35);
   private_nh_.param("lidar_odometry/min_inlier_ratio", options.min_inlier_ratio, 0.18);
   private_nh_.param("lidar_odometry/convergence_translation",
@@ -1330,6 +1389,12 @@ void HybridLocalizationNode::configureLidarOdometry()
                     options.map_insertion_max_mean_normalized_residual, 8.0);
   private_nh_.param("lidar_odometry/preserve_unobservable_covariance",
                     options.preserve_unobservable_covariance, true);
+  private_nh_.param(
+      "lidar_odometry/project_lidar_information_to_observable_subspace",
+      options.project_lidar_information_to_observable_subspace, false);
+  private_nh_.param(
+      "lidar_odometry/project_gyro_bias_update_to_observable_rotation",
+      options.project_gyro_bias_update_to_observable_rotation, false);
   private_nh_.param("lidar_odometry/solver_damping", options.solver_damping, 1e-5);
   private_nh_.param("lidar_odometry/max_translation_per_scan",
                     options.max_translation_per_scan, 3.0);
@@ -1372,6 +1437,16 @@ void HybridLocalizationNode::configureLidarOdometry()
                     options.imu_init_max_gyro_std, 0.08);
   private_nh_.param("lidar_odometry/imu_init_max_gyro_bias",
                     options.imu_init_max_gyro_bias, 0.20);
+  private_nh_.param("lidar_odometry/imu_init_use_mean_covariance",
+                    options.imu_init_use_mean_covariance, false);
+  private_nh_.param("lidar_odometry/imu_init_gyro_bias_covariance_floor",
+                    options.imu_init_gyro_bias_covariance_floor, 1e-8);
+  private_nh_.param("lidar_odometry/imu_init_acceleration_bias_covariance",
+                    options.imu_init_acceleration_bias_covariance, 1e-4);
+  private_nh_.param("lidar_odometry/imu_init_gravity_covariance_floor",
+                    options.imu_init_gravity_covariance_floor, 1e-6);
+  private_nh_.param("lidar_odometry/imu_init_nonstationary_gravity_covariance",
+                    options.imu_init_nonstationary_gravity_covariance, 1e-3);
   private_nh_.param("lidar_odometry/gravity_magnitude", options.gravity_magnitude, 9.81);
   private_nh_.param("lidar_odometry/auto_acceleration_scale",
                     options.auto_acceleration_scale, true);
@@ -1395,6 +1470,8 @@ void HybridLocalizationNode::configureLidarOdometry()
   private_nh_.param("lidar_odometry/wheel_lateral_noise", options.wheel_lateral_noise, 0.15);
   private_nh_.param("lidar_odometry/wheel_vertical_noise", options.wheel_vertical_noise, 0.25);
   private_nh_.param("lidar_odometry/wheel_huber_delta", options.wheel_huber_delta, 1.5);
+  private_nh_.param("lidar_odometry/wheel_forward_innovation_gate",
+                    options.wheel_forward_innovation_gate, 0.0);
   private_nh_.param("lidar_odometry/wheel_buffer_duration",
                     options.wheel_buffer_duration, 5.0);
   std::vector<double> wheel_lever_arm;
@@ -1422,12 +1499,30 @@ void HybridLocalizationNode::configureLidarOdometry()
   private_nh_.param("lidar_odometry/max_plane_variance", options.max_plane_variance, 0.035);
   private_nh_.param("lidar_odometry/plane_uncertainty_scale",
                     options.plane_uncertainty_scale, 1.0);
+  private_nh_.param("lidar_odometry/plane_support_radius_scale",
+                    options.plane_support_radius_scale, 0.0);
+  private_nh_.param("lidar_odometry/plane_extrapolation_uncertainty_scale",
+                    options.plane_extrapolation_uncertainty_scale, 0.0);
+  private_nh_.param("lidar_odometry/plane_parameter_uncertainty_scale",
+                    options.plane_parameter_uncertainty_scale, 0.0);
   private_nh_.param("lidar_odometry/plane_fit_residual_gate",
                     options.plane_fit_residual_gate, 0.15);
+  private_nh_.param("lidar_odometry/smooth_voxel_robust_refit",
+                    options.smooth_voxel_robust_refit, false);
+  private_nh_.param("lidar_odometry/use_adaptive_subvoxel_plane",
+                    options.use_adaptive_subvoxel_plane, false);
+  private_nh_.param("lidar_odometry/adaptive_subvoxel_scale",
+                    options.adaptive_subvoxel_scale, 0.5);
+  private_nh_.param("lidar_odometry/adaptive_subvoxel_search_radius",
+                    options.adaptive_subvoxel_search_radius, 1);
+  private_nh_.param("lidar_odometry/max_adaptive_subvoxels",
+                    options.max_adaptive_subvoxels, 0);
   private_nh_.param("lidar_odometry/use_point_knn_plane",
                     options.use_point_knn_plane, false);
   private_nh_.param("lidar_odometry/use_compatible_voxel_plane",
                     options.use_compatible_voxel_plane, false);
+  private_nh_.param("lidar_odometry/compatible_voxel_search_radius",
+                    options.compatible_voxel_search_radius, 0);
   private_nh_.param("lidar_odometry/point_knn_fallback",
                     options.point_knn_fallback, false);
   private_nh_.param("lidar_odometry/point_knn_fallback_max_queries",
@@ -1451,6 +1546,16 @@ void HybridLocalizationNode::configureLidarOdometry()
                     options.min_voxel_plane_points, 8);
   private_nh_.param("lidar_odometry/max_voxel_points", options.max_voxel_points, 120);
   private_nh_.param("lidar_odometry/max_voxel_samples", options.max_voxel_samples, 12);
+  private_nh_.param("lidar_odometry/freeze_mature_voxels",
+                    options.freeze_mature_voxels, false);
+  private_nh_.param("lidar_odometry/map_insertion_min_translation",
+                    options.map_insertion_min_translation, 0.0);
+  private_nh_.param("lidar_odometry/map_insertion_min_rotation_deg",
+                    options.map_insertion_min_rotation_deg, 0.0);
+  private_nh_.param("lidar_odometry/map_insertion_max_interval",
+                    options.map_insertion_max_interval, 0.0);
+  private_nh_.param("lidar_odometry/covariance_reset_enabled",
+                    options.covariance_reset_enabled, true);
   options.visual_enabled = subscribe_camera_frontend_ && visual_frontend_enabled_ &&
       !visual_observation_only_;
   private_nh_.param("visual_frontend/eskf_max_iterations",
@@ -1472,6 +1577,44 @@ void HybridLocalizationNode::configureLidarOdometry()
                     options.visual_convergence_rotation_deg, 0.01);
   private_nh_.param("visual_frontend/solver_damping",
                     options.visual_solver_damping, 1e-6);
+  private_nh_.param("visual_frontend/fuse_correlated_states",
+                    options.visual_fuse_correlated_states, false);
+  private_nh_.param("visual_frontend/max_velocity_step",
+                    options.visual_max_velocity_step, 0.05);
+  private_nh_.param("visual_frontend/max_gyro_bias_step",
+                    options.visual_max_gyro_bias_step, 0.0005);
+  private_nh_.param("visual_frontend/max_acceleration_bias_step",
+                    options.visual_max_acceleration_bias_step, 0.01);
+  private_nh_.param("visual_frontend/max_gravity_step",
+                    options.visual_max_gravity_step, 0.005);
+  private_nh_.param("visual_frontend/fuse_roll_pitch",
+                    options.visual_fuse_roll_pitch, true);
+  private_nh_.param("visual_frontend/fuse_yaw",
+                    options.visual_fuse_yaw, true);
+  private_nh_.param("visual_frontend/fuse_translation_xy",
+                    options.visual_fuse_translation_xy, true);
+  private_nh_.param("visual_frontend/fuse_translation_z",
+                    options.visual_fuse_translation_z, true);
+  private_nh_.param("visual_frontend/fuse_translation_z_when_observable",
+                    options.visual_fuse_translation_z_when_observable, false);
+  private_nh_.param("visual_frontend/z_min_projection",
+                    options.visual_z_min_projection, 0.92);
+  private_nh_.param("visual_frontend/z_min_conditional_information_ratio",
+                    options.visual_z_min_conditional_information_ratio, 0.20);
+  private_nh_.param("visual_frontend/max_z_step",
+                    options.visual_max_z_step, 0.0);
+  private_nh_.param("visual_frontend/observability_eigen_ratio",
+                    options.visual_observability_eigen_ratio, 1e-4);
+  private_nh_.param("visual_frontend/min_observable_directions",
+                    options.visual_min_observable_directions, 3);
+  private_nh_.param("visual_frontend/two_mode_min_landmarks",
+                    options.visual_two_mode_min_landmarks, 0);
+  private_nh_.param("visual_frontend/two_mode_min_residuals",
+                    options.visual_two_mode_min_residuals, 0);
+  private_nh_.param("visual_frontend/two_mode_max_rmse",
+                    options.visual_two_mode_max_rmse, 0.0);
+  private_nh_.param("visual_frontend/two_mode_min_mean_ncc",
+                    options.visual_two_mode_min_mean_ncc, 0.0);
   lidar_odometry_ = LidarOdometry(options);
 }
 
@@ -1485,6 +1628,8 @@ void HybridLocalizationNode::configureVisualMap()
   private_nh_.param("visual_frontend/cy", options.cy, 624.6878);
   private_nh_.param("visual_frontend/apply_distortion",
                     options.apply_distortion, false);
+  private_nh_.param("visual_frontend/rectify_input",
+                    options.rectify_input, true);
   private_nh_.param("visual_frontend/image_scale", options.image_scale, 0.5);
   private_nh_.param("visual_frontend/patch_half_size", options.patch_half_size, 3);
   private_nh_.param("visual_frontend/grid_size_pixels", options.grid_size_pixels, 24);
@@ -1629,14 +1774,20 @@ void HybridLocalizationNode::initializeRos()
   }
   if (subscribe_wheel_ && !wheel_topic_.empty())
   {
+    ros::NodeHandle &wheel_subscriber_nh =
+        measurement_scheduler_enabled_ ? wheel_nh_ : nh_;
+    if (measurement_scheduler_enabled_)
+    {
+      wheel_nh_.setCallbackQueue(&wheel_callback_queue_);
+    }
     if (wheel_message_type_ == "insprobe_ranger")
     {
-      wheel_sub_ = nh_.subscribe<insprobe_msgs::RangerOdometer>(
+      wheel_sub_ = wheel_subscriber_nh.subscribe<insprobe_msgs::RangerOdometer>(
           wheel_topic_, 200, &HybridLocalizationNode::rangerWheelCallback, this);
     }
     else
     {
-      wheel_sub_ = nh_.subscribe<nav_msgs::Odometry>(
+      wheel_sub_ = wheel_subscriber_nh.subscribe<nav_msgs::Odometry>(
           wheel_topic_, 200, &HybridLocalizationNode::wheelCallback, this);
     }
   }
@@ -2031,23 +2182,100 @@ std::uint64_t HybridLocalizationNode::pendingImuQueueDrops() const
   return pending_imu_queue_drops_;
 }
 
+void HybridLocalizationNode::enqueueWheelMeasurement(
+    PendingWheelMeasurement measurement)
+{
+  if (!std::isfinite(measurement.sample.stamp) ||
+      !std::isfinite(measurement.sample.forward_speed))
+  {
+    return;
+  }
+  if (!measurement_scheduler_enabled_)
+  {
+    applyWheelMeasurement(measurement);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(pending_wheel_mutex_);
+  if (measurement.sample.stamp <= latest_received_wheel_stamp_) return;
+  latest_received_wheel_stamp_ = measurement.sample.stamp;
+  pending_wheel_measurements_.push_back(std::move(measurement));
+  while (pending_wheel_measurements_.size() > 2000U)
+  {
+    pending_wheel_measurements_.pop_front();
+    ++pending_wheel_queue_drops_;
+  }
+}
+
+void HybridLocalizationNode::applyWheelMeasurement(
+    const PendingWheelMeasurement &measurement)
+{
+  lidar_odometry_.addWheelSample(measurement.sample);
+  last_wheel_speed_ = measurement.sample.forward_speed;
+  ++wheel_samples_;
+  if (measurement.has_pose)
+  {
+    latest_wheel_pose_ = measurement.pose;
+    have_wheel_ = true;
+  }
+}
+
+void HybridLocalizationNode::drainPendingWheelMeasurements(
+    double up_to_stamp)
+{
+  std::deque<PendingWheelMeasurement,
+             Eigen::aligned_allocator<PendingWheelMeasurement>> measurements;
+  {
+    std::lock_guard<std::mutex> lock(pending_wheel_mutex_);
+    while (!pending_wheel_measurements_.empty() &&
+           pending_wheel_measurements_.front().sample.stamp <=
+               up_to_stamp + 1e-9)
+    {
+      measurements.push_back(std::move(pending_wheel_measurements_.front()));
+      pending_wheel_measurements_.pop_front();
+    }
+  }
+  for (const PendingWheelMeasurement &measurement : measurements)
+  {
+    applyWheelMeasurement(measurement);
+  }
+}
+
+double HybridLocalizationNode::latestReceivedWheelStamp() const
+{
+  std::lock_guard<std::mutex> lock(pending_wheel_mutex_);
+  return latest_received_wheel_stamp_;
+}
+
+std::size_t HybridLocalizationNode::pendingWheelMeasurementCount() const
+{
+  std::lock_guard<std::mutex> lock(pending_wheel_mutex_);
+  return pending_wheel_measurements_.size();
+}
+
+std::uint64_t HybridLocalizationNode::pendingWheelQueueDrops() const
+{
+  std::lock_guard<std::mutex> lock(pending_wheel_mutex_);
+  return pending_wheel_queue_drops_;
+}
+
 void HybridLocalizationNode::wheelCallback(const nav_msgs::OdometryConstPtr &message)
 {
-  latest_wheel_pose_ = poseFromMessage(message->pose.pose);
-  have_wheel_ = true;
-  WheelSample sample;
-  sample.stamp = message->header.stamp.isZero() ? ros::Time::now().toSec()
-                                                : message->header.stamp.toSec();
-  sample.stamp += wheel_time_offset_;
-  sample.forward_speed = message->twist.twist.linear.x;
-  lidar_odometry_.addWheelSample(sample);
-  last_wheel_speed_ = sample.forward_speed;
-  ++wheel_samples_;
+  if (!message) return;
+  PendingWheelMeasurement measurement;
+  measurement.sample.stamp =
+      message->header.stamp.isZero() ? ros::Time::now().toSec()
+                                     : message->header.stamp.toSec();
+  measurement.sample.stamp += wheel_time_offset_;
+  measurement.sample.forward_speed = message->twist.twist.linear.x;
+  measurement.has_pose = true;
+  measurement.pose = poseFromMessage(message->pose.pose);
+  enqueueWheelMeasurement(std::move(measurement));
 }
 
 void HybridLocalizationNode::rangerWheelCallback(
     const insprobe_msgs::RangerOdometerConstPtr &message)
 {
+  if (!message) return;
   std::array<double, 4> speeds{{message->left_front_speed,
                                 message->right_front_speed,
                                 message->right_back_speed,
@@ -2058,15 +2286,14 @@ void HybridLocalizationNode::rangerWheelCallback(
     return;
   }
   std::sort(speeds.begin(), speeds.end());
-  WheelSample sample;
-  sample.stamp = !message->header.stamp.isZero() ? message->header.stamp.toSec()
+  PendingWheelMeasurement measurement;
+  measurement.sample.stamp =
+      !message->header.stamp.isZero() ? message->header.stamp.toSec()
       : std::isfinite(message->unixtime) && message->unixtime > 0.0
           ? message->unixtime : ros::Time::now().toSec();
-  sample.stamp += wheel_time_offset_;
-  sample.forward_speed = 0.5 * (speeds[1] + speeds[2]);
-  lidar_odometry_.addWheelSample(sample);
-  last_wheel_speed_ = sample.forward_speed;
-  ++wheel_samples_;
+  measurement.sample.stamp += wheel_time_offset_;
+  measurement.sample.forward_speed = 0.5 * (speeds[1] + speeds[2]);
+  enqueueWheelMeasurement(std::move(measurement));
 }
 
 void HybridLocalizationNode::visualFactorCallback(
@@ -2710,6 +2937,7 @@ void HybridLocalizationNode::drainMeasurementQueue(std::size_t max_events)
     MeasurementEvent event;
     bool stale = false;
     double required_imu_stamp = -std::numeric_limits<double>::infinity();
+    double required_wheel_stamp = -std::numeric_limits<double>::infinity();
     {
     std::lock_guard<std::mutex> lock(measurement_mutex_);
       while (!measurement_queue_.empty())
@@ -2735,6 +2963,11 @@ void HybridLocalizationNode::drainMeasurementQueue(std::size_t max_events)
           lidar_imu_wait_sec_ : camera_imu_wait_sec_;
       required_imu_stamp = event.stamp +
           std::max(sensor_wait, measurement_reorder_window_sec_);
+      if (event.type == MeasurementEventType::LIDAR && subscribe_wheel_)
+      {
+        required_wheel_stamp =
+            event.stamp + measurement_wheel_wait_sec_;
+      }
       double sensor_watermark = std::numeric_limits<double>::infinity();
       if (subscribe_lidar_)
       {
@@ -2752,9 +2985,19 @@ void HybridLocalizationNode::drainMeasurementQueue(std::size_t max_events)
       const bool sensor_reorder_ready =
           std::isfinite(sensor_watermark) && sensor_watermark + 1e-6 >=
           event.stamp + measurement_reorder_window_sec_;
+      const bool wheel_timed_out =
+          event.type == MeasurementEventType::LIDAR &&
+          std::isfinite(latest_enqueued_lidar_stamp_) &&
+          latest_enqueued_lidar_stamp_ + 1e-6 >=
+              event.stamp + measurement_wheel_timeout_sec_;
+      const bool wheel_ready =
+          event.type != MeasurementEventType::LIDAR || !subscribe_wheel_ ||
+          latestReceivedWheelStamp() + 1e-6 >= required_wheel_stamp ||
+          wheel_timed_out;
       if (!sensor_reorder_ready ||
           (subscribe_imu_ &&
-           latestReceivedImuStamp() + 1e-6 < required_imu_stamp))
+           latestReceivedImuStamp() + 1e-6 < required_imu_stamp) ||
+          !wheel_ready)
       {
         break;
       }
@@ -2771,6 +3014,10 @@ void HybridLocalizationNode::drainMeasurementQueue(std::size_t max_events)
     if (subscribe_imu_)
     {
       drainPendingImuSamples(required_imu_stamp);
+    }
+    if (event.type == MeasurementEventType::LIDAR && subscribe_wheel_)
+    {
+      drainPendingWheelMeasurements(required_wheel_stamp);
     }
     if (event.type == MeasurementEventType::LIDAR && event.lidar)
     {
@@ -2908,6 +3155,18 @@ void HybridLocalizationNode::processImageMessage(
   visual_update_landmarks_ = update.landmarks;
   visual_update_residuals_ = update.residuals;
   visual_update_iterations_ = update.iterations;
+  visual_update_observable_directions_ = update.observable_directions;
+  visual_update_z_observable_ = update.z_observable;
+  visual_update_z_fused_ = update.z_fused;
+  visual_update_z_projection_ = update.z_projection;
+  visual_update_z_conditional_information_ratio_ =
+      update.z_conditional_information_ratio;
+  visual_update_z_correction_ = update.z_correction;
+  visual_update_velocity_correction_ = update.velocity_correction.norm();
+  visual_update_gyro_bias_correction_ = update.gyro_bias_correction.norm();
+  visual_update_acceleration_bias_correction_ =
+      update.acceleration_bias_correction.norm();
+  visual_update_gravity_correction_ = update.gravity_correction.norm();
   visual_update_reason_ = update.reason;
   if (update.accepted) ++visual_update_accepts_;
 
@@ -3053,10 +3312,15 @@ void HybridLocalizationNode::processLidarMessage(
   lidar_correspondence_sectors_ = result.correspondence_azimuth_sectors;
   lidar_point_knn_fallback_queries_ = result.point_knn_fallback_queries;
   lidar_point_knn_fallback_matches_ = result.point_knn_fallback_matches;
+  lidar_innovation_rejections_ = result.innovation_rejections;
+  lidar_mean_robust_weight_ = result.mean_robust_weight;
   lidar_registration_degenerate_ = result.degenerate;
   lidar_registration_used_imu_ = result.used_imu;
   lidar_registration_used_wheel_ = result.used_wheel;
+  lidar_wheel_velocity_residual_ = result.wheel_velocity_residual;
+  lidar_wheel_forward_rejected_ = result.wheel_forward_rejected;
   lidar_map_update_deferred_ = result.map_update_deferred;
+  lidar_map_keyframe_selected_ = result.map_keyframe_selected;
   lidar_strong_support_ = result.strong_support;
   lidar_recovery_mode_ = result.recovery_mode;
   lidar_loss_limited_ = result.loss_limited;
@@ -3979,13 +4243,20 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";lio_correspondence_sectors=" << lidar_correspondence_sectors_
          << ";lio_knn_fallback_queries=" << lidar_point_knn_fallback_queries_
          << ";lio_knn_fallback_matches=" << lidar_point_knn_fallback_matches_
+         << ";lio_innovation_rejections=" << lidar_innovation_rejections_
+         << ";lio_mean_robust_weight=" << lidar_mean_robust_weight_
          << ";lio_map_points=" << lidar_odometry_.mapPointCount()
          << ";lio_degenerate=" << (lidar_registration_degenerate_ ? 1 : 0)
          << ";lio_map_update_deferred=" << (lidar_map_update_deferred_ ? 1 : 0)
+         << ";lio_map_keyframe_selected="
+         << (lidar_map_keyframe_selected_ ? 1 : 0)
          << ";lio_strong_support=" << (lidar_strong_support_ ? 1 : 0)
          << ";lio_recovery_mode=" << (lidar_recovery_mode_ ? 1 : 0)
          << ";lio_used_imu=" << (lidar_registration_used_imu_ ? 1 : 0)
          << ";lio_used_wheel=" << (lidar_registration_used_wheel_ ? 1 : 0)
+         << ";lio_wheel_velocity_residual=" << lidar_wheel_velocity_residual_
+         << ";lio_wheel_forward_rejected="
+         << (lidar_wheel_forward_rejected_ ? 1 : 0)
          << ";lio_consecutive_rejections=" << lidar_consecutive_rejections_
          << ";lio_loss_limited=" << (lidar_loss_limited_ ? 1 : 0)
          << ";lio_loss_frozen=" << (lidar_loss_frozen_ ? 1 : 0)
@@ -4004,6 +4275,8 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";measurement_queue=" << measurement_queue_size
          << ";pending_imu_queue=" << pendingImuSampleCount()
          << ";pending_imu_queue_drops=" << pendingImuQueueDrops()
+         << ";pending_wheel_queue=" << pendingWheelMeasurementCount()
+         << ";pending_wheel_queue_drops=" << pendingWheelQueueDrops()
          << ";scheduled_lidar=" << scheduled_lidar
          << ";scheduled_images=" << scheduled_images
          << ";processed_images=" << processed_image_events_
@@ -4022,10 +4295,22 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
          << ";visual_landmarks=" << visual_stats.landmarks
          << ";visual_active_landmarks=" << visual_update_landmarks_
          << ";visual_residuals=" << visual_update_residuals_
+         << ";visual_observable_directions=" << visual_update_observable_directions_
          << ";visual_rmse=" << visual_update_rmse_
          << ";visual_mean_ncc=" << visual_update_ncc_
          << ";visual_correction_translation=" << visual_update_correction_translation_
          << ";visual_correction_rotation_deg=" << visual_update_correction_rotation_deg_
+         << ";visual_z_observable=" << (visual_update_z_observable_ ? 1 : 0)
+         << ";visual_z_fused=" << (visual_update_z_fused_ ? 1 : 0)
+         << ";visual_z_projection=" << visual_update_z_projection_
+         << ";visual_z_conditional_information_ratio="
+         << visual_update_z_conditional_information_ratio_
+         << ";visual_z_correction=" << visual_update_z_correction_
+         << ";visual_velocity_correction=" << visual_update_velocity_correction_
+         << ";visual_gyro_bias_correction=" << visual_update_gyro_bias_correction_
+         << ";visual_acceleration_bias_correction="
+         << visual_update_acceleration_bias_correction_
+         << ";visual_gravity_correction=" << visual_update_gravity_correction_
          << ";visual_iterations=" << visual_update_iterations_
          << ";visual_reason=" << visual_update_reason_
          << ";trajectory_coordinate_mode=" << trajectory_coordinate_mode_
@@ -4089,7 +4374,7 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
                               : diagnostic_msgs::DiagnosticStatus::WARN;
   state.message = have_odom_ ? (lidar_healthy ? "running" : "LiDAR odometry degraded")
                              : "waiting for raw LiDAR";
-  state.values.resize(35);
+  state.values.resize(39);
   state.values[0].key = "prior_map"; state.values[0].value = prior_map_.valid() ? "ready" : "unavailable";
   state.values[1].key = "local_points"; state.values[1].value = std::to_string(local_points.size());
   state.values[2].key = "objects"; state.values[2].value = std::to_string(objects_.size());
@@ -4144,6 +4429,14 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   state.values[33].value = std::to_string(camera_time_offset_);
   state.values[34].key = "sam3_lidar_dynamic_rejections";
   state.values[34].value = std::to_string(sam3_lidar_dynamic_rejections_);
+  state.values[35].key = "lidar_innovation_rejections";
+  state.values[35].value = std::to_string(lidar_innovation_rejections_);
+  state.values[36].key = "lidar_mean_robust_weight";
+  state.values[36].value = std::to_string(lidar_mean_robust_weight_);
+  state.values[37].key = "lidar_map_keyframe_selected";
+  state.values[37].value = lidar_map_keyframe_selected_ ? "true" : "false";
+  state.values[38].key = "lidar_wheel_forward_rejected";
+  state.values[38].value = lidar_wheel_forward_rejected_ ? "true" : "false";
   diagnostics.status.push_back(state);
   diagnostic_msgs::DiagnosticStatus scheduler;
   scheduler.name = "hybrid_localization/measurement_scheduler";
@@ -4151,7 +4444,7 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   scheduler.level = scheduler_queue_drops == 0U && scheduler_stale_drops == 0U ?
       diagnostic_msgs::DiagnosticStatus::OK : diagnostic_msgs::DiagnosticStatus::WARN;
   scheduler.message = measurement_scheduler_enabled_ ? "timestamp ordered" : "disabled";
-  scheduler.values.resize(14);
+  scheduler.values.resize(16);
   scheduler.values[0].key = "queue";
   scheduler.values[0].value = std::to_string(measurement_queue_size);
   scheduler.values[1].key = "scheduled_lidar";
@@ -4180,6 +4473,11 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   scheduler.values[12].value = std::to_string(scheduler_image_lag_drops);
   scheduler.values[13].key = "visual_interval_drops";
   scheduler.values[13].value = std::to_string(visual_interval_drops);
+  scheduler.values[14].key = "pending_wheel_samples";
+  scheduler.values[14].value =
+      std::to_string(pendingWheelMeasurementCount());
+  scheduler.values[15].key = "pending_wheel_queue_drops";
+  scheduler.values[15].value = std::to_string(pendingWheelQueueDrops());
   diagnostics.status.push_back(scheduler);
   diagnostic_msgs::DiagnosticStatus visual;
   visual.name = "hybrid_localization/direct_visual_eskf";
@@ -4188,7 +4486,7 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
       visual_update_accepts_ > 0U ? diagnostic_msgs::DiagnosticStatus::OK
                                   : diagnostic_msgs::DiagnosticStatus::WARN;
   visual.message = visual_frontend_enabled_ ? visual_update_reason_ : "disabled";
-  visual.values.resize(24);
+  visual.values.resize(33);
   visual.values[0].key = "attempts";
   visual.values[0].value = std::to_string(visual_update_attempts_);
   visual.values[1].key = "accepts";
@@ -4237,6 +4535,26 @@ void HybridLocalizationNode::publishStatus(const ros::Time &stamp)
   visual.values[22].value = std::to_string(sam3_lidar_dynamic_rejections_);
   visual.values[23].key = "sam3_lidar_mask_sync_dt";
   visual.values[23].value = std::to_string(last_sam3_lidar_mask_sync_dt_);
+  visual.values[24].key = "z_observable";
+  visual.values[24].value = visual_update_z_observable_ ? "true" : "false";
+  visual.values[25].key = "z_fused";
+  visual.values[25].value = visual_update_z_fused_ ? "true" : "false";
+  visual.values[26].key = "z_projection";
+  visual.values[26].value = std::to_string(visual_update_z_projection_);
+  visual.values[27].key = "z_conditional_information_ratio";
+  visual.values[27].value =
+      std::to_string(visual_update_z_conditional_information_ratio_);
+  visual.values[28].key = "z_correction";
+  visual.values[28].value = std::to_string(visual_update_z_correction_);
+  visual.values[29].key = "velocity_correction";
+  visual.values[29].value = std::to_string(visual_update_velocity_correction_);
+  visual.values[30].key = "gyro_bias_correction";
+  visual.values[30].value = std::to_string(visual_update_gyro_bias_correction_);
+  visual.values[31].key = "acceleration_bias_correction";
+  visual.values[31].value =
+      std::to_string(visual_update_acceleration_bias_correction_);
+  visual.values[32].key = "gravity_correction";
+  visual.values[32].value = std::to_string(visual_update_gravity_correction_);
   diagnostics.status.push_back(visual);
   diagnostic_pub_.publish(diagnostics);
 }

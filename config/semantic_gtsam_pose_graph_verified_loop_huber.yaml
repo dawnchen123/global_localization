@@ -1,0 +1,7 @@
+# Controlled street00 experiment: visual candidates already pass independent
+# LiDAR mutual-NN/RANSAC/Huber registration before they reach this factor. A
+# looser graph-level Huber threshold prevents a valid metre-scale return-pass
+# correction from being suppressed solely because the frontend has drifted.
+# This file is intentionally opt-in through graph_tuning_config.
+graph:
+  visual_loop_huber_k: 6.0

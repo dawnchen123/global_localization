@@ -3,7 +3,7 @@ lidar_cloud_topic: /hesai/at128/points
 imu_topic: /adi/adis16465/imu
 wheel_topic: /insprobe/ranger/odometer
 wheel_message_type: insprobe_ranger
-subscribe_wheel: false
+subscribe_wheel: true
 lidar_frame: hesai_at128
 
 # The i2Nav Pandar128 `timestamp` field contains absolute Unix time in seconds.
@@ -85,7 +85,9 @@ lidar_odometry:
   wheel_speed_scale: 0.9865
   wheel_forward_noise: 0.15
   wheel_lateral_noise: 0.12
-  wheel_vertical_noise: 1.00
+  # This is a wheeled ground platform: retain the body-frame non-holonomic
+  # vertical constraint strongly enough to stop scan-to-map height drift.
+  wheel_vertical_noise: 0.18
   wheel_huber_delta: 1.5
   # Ranger MINI center is [0, 0, 0.852] in ADIS FRD. ROS body is FLU.
   wheel_lever_arm: [0.0, 0.0, -0.852]

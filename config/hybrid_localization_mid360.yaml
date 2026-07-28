@@ -3,7 +3,7 @@ lidar_cloud_topic: /livox/mid360/points_xyzirt
 imu_topic: /adi/adis16465/imu
 wheel_topic: /insprobe/ranger/odometer
 wheel_message_type: insprobe_ranger
-subscribe_wheel: false
+subscribe_wheel: true
 lidar_frame: livox_mid360
 
 # Livox CustomMsg offset_time is in nanoseconds from scan start.
@@ -70,7 +70,9 @@ lidar_odometry:
   wheel_speed_scale: 0.9865
   wheel_forward_noise: 0.15
   wheel_lateral_noise: 0.12
-  wheel_vertical_noise: 1.00
+  # Keep the same body-frame non-holonomic vertical constraint as the AT128
+  # profile.  It is valid for the shared i2Nav wheel/IMU assembly.
+  wheel_vertical_noise: 0.18
   wheel_huber_delta: 1.5
   # Ranger MINI center is [0, 0, 0.852] in ADIS FRD. ROS body is FLU.
   wheel_lever_arm: [0.0, 0.0, -0.852]

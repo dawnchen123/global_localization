@@ -6,9 +6,9 @@
 IMU/LiDAR/Image 独立入口 -> 时间水位调度 -> 去畸变 ESKF-LIO
 LiDAR 深度 + 图像 patch -> 图像时刻直接 ESKF 更新 -> /hybrid/frontend/odometry
 KLT/PnP -> 仅发布标定/同步观测，不作为相邻帧图因子
-相机 + LiDAR + 前端位姿 -> SAM3 动态掩码/类别权重 -> 单帧投影语义观测
-3 个互不重叠观测 -> 多帧语义子图 -> MNN + RANSAC/Huber XY/Z 因子
-非相邻 ORB/PnP 闭环 + 语义因子 -> GTSAM iSAM2 -> /hybrid/odometry
+相机 + LiDAR + 前端位姿 -> SAM3 队列 -> 单帧投影语义观测和 BEV 地图
+多帧语义子图 -> MNN + RANSAC/Huber 候选/内点/离群调试
+经长时间间隔和空间重访验证的闭环/语义因子 -> GTSAM iSAM2 -> /hybrid/odometry
 ```
 
 ## 1. 编译
@@ -66,11 +66,14 @@ roslaunch fast_livo2_global_localization hybrid_localization_hesai.launch \
   pointcloud_topic:=/hesai/at128/points \
   imu_topic:=/adi/adis16465/imu \
   camera_topic:=/avt_camera/left/image/compressed \
+  subscribe_wheel:=false \
   subscribe_camera:=true \
   enable_visual_frontend:=true \
   visual_observation_only:=true \
   enable_visual_loop_factors:=true \
   enable_sam3_semantics:=true \
+  enable_sam3_visual_mask:=true \
+  enable_sam3_lidar_filter:=false \
   enable_semantic_observation_factors:=true \
   enable_semantic_observation_xy_factors:=true \
   enable_semantic_observation_z_factors:=true \
@@ -79,8 +82,14 @@ roslaunch fast_livo2_global_localization hybrid_localization_hesai.launch \
   frontend_trajectory_save_path:=/data/result/hesai_frontend.csv \
   object_save_path:=/data/result/hesai_objects.csv \
   semantic_cloud_save_path:=/data/result/hesai_sam3_map.ply \
-  rviz:=true
+  rviz:=false
 ```
+
+这是长回放的稳定起点：SAM3 仍会发布 `/sam3/projected_semantic_points` 和
+`/sam3/semantic_cloud_map`，但积压或过期的 SAM3 结果不会删掉 LiDAR 配准点，未独立
+验证的语义/视觉闭环也不会改写轨迹。该 i2Nav 配置默认使用已标定的
+`/insprobe/ranger/odometer` 前端速度约束，bag 播放必须包含该 topic；没有 Ranger
+数据时显式传入 `subscribe_wheel:=false`。确认完整回放稳定后，再显式开启反馈实验。
 
 Hesai 点云的 `timestamp` 字段在 i2Nav 数据集中是绝对 Unix 秒，launch 默认使用：
 
@@ -104,15 +113,18 @@ roslaunch fast_livo2_global_localization hybrid_localization_mid360.launch \
   livox_custom_topic:=/livox/mid360/points \
   imu_topic:=/adi/adis16465/imu \
   camera_topic:=/avt_camera/left/image/compressed \
+  subscribe_wheel:=true \
   start_livox_converter:=true \
   subscribe_camera:=true \
   enable_visual_frontend:=true \
   visual_observation_only:=true \
-  enable_visual_loop_factors:=true \
+  enable_visual_loop_factors:=false \
   enable_sam3_semantics:=true \
-  enable_semantic_observation_factors:=true \
-  enable_semantic_observation_xy_factors:=true \
-  enable_semantic_observation_z_factors:=true \
+  enable_sam3_visual_mask:=false \
+  enable_sam3_lidar_filter:=false \
+  enable_semantic_observation_factors:=false \
+  enable_semantic_observation_xy_factors:=false \
+  enable_semantic_observation_z_factors:=false \
   sam3_queue_dir:=/tmp/sam3_street00 \
   trajectory_save_path:=/data/result/mid360_graph.csv \
   frontend_trajectory_save_path:=/data/result/mid360_frontend.csv \
@@ -140,6 +152,7 @@ Hesai：
 rosbag play --clock /path/to/street00.bag \
   --topics /adi/adis16465/imu \
            /hesai/at128/points \
+           /insprobe/ranger/odometer \
            /avt_camera/left/image/compressed
 ```
 
@@ -149,6 +162,7 @@ Mid360：
 rosbag play --clock /path/to/street00.bag \
   --topics /adi/adis16465/imu \
            /livox/mid360/points \
+           /insprobe/ranger/odometer \
            /avt_camera/left/image/compressed
 ```
 
@@ -212,10 +226,16 @@ visual_accepts > 0
 ```
 
 启用 SAM3 后还应看到 `sam3_camera_labels_applied > 0` 和
-`visual_dynamic_rejections > 0`。`visual_observation_only=true` 只禁止相邻
-KLT/PnP 进入 GTSAM，不会关闭前端 patch 直接更新，也不会关闭非相邻视觉闭环。
+`visual_dynamic_rejections > 0`。`visual_observation_only=true` 保留图像投影、
+KLT/PnP 观测和调试输出，但不会将 patch 直接更新写入前端 ESKF，也不会将相邻
+KLT/PnP 相对位姿写入 GTSAM。非相邻视觉闭环由
+`enable_visual_loop_factors` 单独控制。视觉闭环每秒保留一条 ORB/深度关键帧，
+但默认每 `4 s` 才执行一次耗时的候选检索和 PnP 验证；这不会删除中间历史，
+而是避免回访段的匹配计算阻塞前端。若 stats 中出现
+`visual_loop_ground_z_correction` 但 `visual_loop_z_constrained=false`，表示该
+候选超过单条 Z 修正门限，XY 因子仍可独立应用而 Z 不会被拉动。
 
-默认每 3 个互不重叠原始观测构成一个子图，因此 `semantic_keyframes` 约为 `semantic_observations_associated / 3`。场景有足够重叠和结构时，`semantic_observation_xy_factors`、`semantic_observation_z_factors` 应增长。RViz 默认启用 `Optimized Semantic Graph Map` 和 `SAM3 Fused Semantic Map`；`Current Semantic Observation` 默认关闭，可手动勾选检查单帧投影。
+默认每 5 个互不重叠原始观测构成一个子图，因此 `semantic_keyframes` 约为 `semantic_observations_associated / 5`。稳定启动中 `semantic_observation_*_factors` 保持为零是正常的，语义地图仍会累积。只有显式启用语义反馈且检测到长时间间隔的空间重访时，这些计数才应增长。RViz 默认启用 `Optimized Semantic Graph Map` 和 `SAM3 Fused Semantic Map`；`Current Semantic Observation` 默认关闭，可手动勾选检查单帧投影。
 
 若 `/sam3/semantic_cloud_map` 看起来停在起点，先连续读取两次 stats。`latest_stamp`
 不增长表示导出/SAM3 队列停滞；时间增长但 `latest_pose_xyz` 不变表示车辆尚未运动或
@@ -280,7 +300,50 @@ OUTPUT_ROOT=/data/result/street00_ablation \
 汇总结果位于 `evaluation/ablation_metrics.csv`。是否优于 FAST-LIVO2 必须以
 完整数据集和同一评估设置为准，不能由短片段或单次运行保证。
 
-## 9. 关键配置
+## 9. A+C+D 回环鲁棒性实验
+
+`semantic_gtsam_pose_graph_consensus_continuous_wheel_z.yaml` 是 A+C 主线、D 补充的
+图后端 profile。它不改变 ESKF-LIO 前端标定，也不把 SAM3 语义因子默认并入本次
+对照；先隔离验证视觉闭环、连续输出、轮速和地面 Z 的贡献。完整 street00 回放示例：
+
+```bash
+cd ~/workspace/fast_livo2_global_ws/src
+export OUTPUT_ROOT=/data/result/street00_acd
+export DURATION=1401
+export START=0
+export RATE=1.0
+export POST_RUN_WAIT=60
+export ENABLE_SAM3=false
+export ENABLE_SEMANTIC_OBSERVATION_FACTORS=false
+export ENABLE_SEMANTIC_XY_FACTORS=false
+export ENABLE_SEMANTIC_Z_FACTORS=false
+export GRAPH_TUNING_CONFIG=$PWD/fast_livo2_global_localization/config/semantic_gtsam_pose_graph_consensus_continuous_wheel_z.yaml
+
+./fast_livo2_global_localization/tools/run_street00_ablation.sh full_graph
+```
+
+该命令仍启用相机和非相邻视觉闭环；`graph_tuning_config` 在基础 YAML 和 launch
+布尔参数之后加载，因此 profile 内的 `enable_wheel_factors`、
+`enable_sequential_ground_z` 会生效。不要同时显式传入
+`ENABLE_WHEEL_FACTORS=false` 或 `ENABLE_SEQUENTIAL_GROUND_Z=false`。
+
+检查 `/hybrid/semantic_graph/stats`：
+
+| 字段 | 正常含义 |
+|---|---|
+| `visual_loop_support_waits` | 第一条已通过 LiDAR 验证的候选正在等待相邻帧复核，不是失败。 |
+| `visual_loop_support_confirmations` | 两条候选在参考邻域、XY/yaw/Z 校正上达成一致。 |
+| `visual_loop_factors` | 实际进入 iSAM2 的 DCS 鲁棒闭环数；没有足够独立支持时保持 0 是预期保护行为。 |
+| `visual_loop_support_disagreements` | 两个 LiDAR 验证候选不一致，第二条被拒绝并重新开始支持窗口。 |
+| `visual_loop_alternative_*` | 同一检索周期内，参考帧去相关的备选 PnP/LiDAR 候选数量、实际尝试数和成功替代首选的次数。首选正在等待多帧支持时不会切换备选。 |
+| `correction_target_*` / `correction_applied_*` | 图优化要求的校正与在线已平滑施加的校正。 |
+| `correction_lag_*` | 连续输出层尚未施加的暂存校正；应在车辆持续运动后收敛。 |
+| `wheel_rejections` / `sequential_ground_rejections` | 原始 LIO 与轮速弧长不一致，或地面几何/多帧一致性不通过而被安全抑制。 |
+
+`trajectory_save_path` 保存的仍是未平滑的 iSAM 优化结果，用于 EVO；连续校正只影响
+实时 `/hybrid/odometry`、TF 和校正点云，避免在线消费方在一个回调内接收大跳变。
+
+## 10. 关键配置
 
 | 文件 | 关键内容 |
 |---|---|
@@ -288,6 +351,7 @@ OUTPUT_ROOT=/data/result/street00_ablation \
 | `hybrid_localization_hesai.yaml` | AT128 点时间、噪声和外参 |
 | `hybrid_localization_mid360.yaml` | Mid360 点时间、噪声和外参 |
 | `semantic_gtsam_pose_graph.yaml` | iSAM2、普通约束、多帧语义子图和 XY/Z 因子 |
+| `semantic_gtsam_pose_graph_consensus_continuous_wheel_z.yaml` | A+C+D 实验：LiDAR 验证视觉闭环共识、DCS、连续输出、轮速和地面 Z 弱约束 |
 | `sam3_hesai.yaml` | AT128 相机投影、队列等待、BEV 和 PLY |
 | `sam3_mid360.yaml` | Mid360 相机投影、队列等待、BEV 和 PLY |
 
@@ -302,10 +366,11 @@ OUTPUT_ROOT=/data/result/street00_ablation \
 | `lidar_odometry/map_insertion_*` | 比状态更新更严格的局部地图插入门限，避免弱约束或高残差帧污染地图。 |
 | `semantic_lidar_filter/enabled` | 将 SAM3 相机标签投影到原始 LiDAR；动态点不参与扫描匹配、注册点云和局部地图插入。 |
 | `semantic_lidar_filter/sync_tolerance_sec` | 光流传播标签与扫描末端的最大时间差。 |
-| `semantic_lidar_filter/max_source_age_sec` | 原始 SAM3 标签的最大年龄，代码会限制在 `sam3_cache_duration_sec` 内。 |
+| `semantic_lidar_filter/max_source_age_sec` | 原始 SAM3 标签的最大年龄，默认 `0.75 s`；超时结果不会参与 LiDAR 配准。 |
+| `visual_frontend/sam3_max_source_age_sec` | SAM3 视觉 mask 的原始标签最大年龄，默认 `0.75 s`；超过该值仅保留原始图像观测。 |
 
-当 `enable_sam3_semantics:=true` 时，Hesai/Mid360 launch 默认将
-`enable_sam3_lidar_filter` 设为同一值，并自动订阅相机以提供动态 LiDAR 筛选。
+`enable_sam3_semantics:=true` 只启用语义队列、投影地图和语义观测。`enable_sam3_visual_mask`、
+`enable_sam3_lidar_filter` 和 `enable_semantic_observation_*_factors` 都是独立的实验开关，默认关闭。
 在 `/hybrid/status` 中检查 `sensor_frame_contract`、`lio_observable_directions`、
 `lio_mean_normalized_residual`、`sam3_lidar_mask_scans` 和
 `sam3_lidar_dynamic_rejections`；若掩码持续不可用，应先检查相机标签 topic、
@@ -315,8 +380,10 @@ OUTPUT_ROOT=/data/result/street00_ablation \
 
 | 参数 | 说明 |
 |---|---|
-| `graph/semantic_submap_observations` | 每个不重叠语义子图使用的原始观测数，默认 3 |
+| `graph/semantic_submap_observations` | 每个不重叠语义子图使用的原始观测数，默认 5 |
 | `graph/semantic_observation_min/max_index_gap` | 可匹配子图的关键帧间隔 |
+| `graph/semantic_observation_min_time_separation_sec` | 因子候选的最小真实时间间隔；默认 `90 s`，禁止相邻街段匹配。 |
+| `graph/semantic_observation_minimum_interval_sec` / `max_factors` | 两次已应用语义因子的最小间隔和总上限，默认 `180 s` / `2`，抑制相关误差累积。 |
 | `graph/semantic_observation_correspondence_distance` | 同标签互为最近邻半径 |
 | `graph/semantic_observation_ransac_inlier_distance` | XY RANSAC 内点门限 |
 | `graph/semantic_observation_min_inliers` | XY 最少内点数 |
@@ -340,14 +407,38 @@ OUTPUT_ROOT=/data/result/street00_ablation \
 | `visual_frontend/photometric_huber_delta` | 直接视觉残差 Huber 门限 |
 | `visual_frontend/semantic_class_weights` | SAM3 静态类别对视觉观测的信息权重 |
 | `visual_loop/minimum_index_gap` | 非相邻视觉闭环最小关键帧间隔 |
+| `visual_loop/maximum_database_size` | 保留的完整 ORB/深度历史数；默认 1600，覆盖 street00 的 1400 秒回放。 |
+| `visual_loop/debug_image_history_size` | 仅为 RViz 调试保留的最近灰度图数量；旧关键帧仍可匹配，但其调试图以空白参考图显示。 |
+| `visual_loop/retrieval_interval_sec` | 保留关键帧的同时执行数据库检索/PnP 的最小间隔；默认 `4 s`，防止长回放回访段的候选匹配抢占前端。 |
+| `visual_loop/enable_global_retrieval_fallback` | 允许在原始里程计空间半径之外，以多哈希 ORB 倒排投票从完整历史库补充候选；仅影响候选召回，后续 PnP、LiDAR 与图优化门限不变。 |
+| `visual_loop/maximum_global_retrieval_candidates` | 每轮最多补充的全局候选数；需与回放 CPU 余量一起设置。`0` 或关闭开关时完全保持空间检索行为。 |
+| `visual_loop/global_retrieval_feature_count` | 每个关键帧进入全局倒排表的高响应 ORB 特征数；只影响检索内存和召回，不改变完整描述子的 PnP 匹配。 |
+| `visual_loop/global_retrieval_min_votes` | 一个历史关键帧需要得到的 ORB 多哈希投票数；较高值更保守，较低值提高召回并增加后续 BF 匹配量。 |
+| `visual_loop/global_retrieval_min_table_count` | 投票必须来自的最少独立哈希表数，用于抑制单一二进制码碰撞。 |
+| `visual_loop/minimum_global_geometric_candidates` | 从全局候选中预留给 PnP 几何验证的最少席位，避免空间候选按匹配数排序后完全挤掉远距离回访。 |
+| `visual_loop/maximum_verified_candidates` | 每次检索最多输出的、已通过 PnP 门限的候选数；图端仍逐条执行 LiDAR 验证和多帧一致性。 |
+| `visual_loop/candidate_reference_min_separation_sec` | 同一检索中两个候选参考帧的最小时间间隔，避免相邻图像构成高度相关的替代因子。 |
 | `visual_loop/minimum_pnp_inliers` | PnP-RANSAC 闭环最少内点数 |
 | `graph/visual_loop_sigma_*` | GTSAM 视觉闭环 6DoF 噪声 |
+| `graph/visual_loop_min_support` | 同一参考邻域需要的连续 LiDAR 验证视觉候选数；`1` 保持历史单候选行为。 |
+| `graph/visual_loop_support_*` | 相邻候选的参考/当前关键帧窗口与 implied map-from-raw XY/yaw/Z 一致性门限。 |
+| `graph/visual_loop_use_dcs` / `dcs_k` | 使用 GTSAM Dynamic Covariance Scaling 作为视觉回环软开关；大残差闭环会被动态降权。 |
+| `continuous_correction_*` | 只限制在线 `map->odom` 的 XY/Z/旋转变化率，不修改 iSAM 优化轨迹或最终 EVO CSV。 |
+| `graph/wheel_max_*disagreement` | Ranger 弧长和原始 LIO 关键帧平移不一致时拒绝该轮速因子。 |
+| `graph/sequential_ground_min_support` | 地面 Z 残差需要连续多帧重复成立后才加入；`max_step` 限制单个关键帧的垂直注入。 |
+| `graph/*_use_dcs` | 对 wheel 或 sequential-ground 因子使用 DCS 鲁棒核，默认关闭。 |
+| `graph/visual_loop_ground_z_max_correction` | 单条视觉回环允许的地面 Z 修正上限；超过该值时保留 XY 回环验证结果，但不约束 Z。 |
 
-纯几何消融可使用：
+在完成稳定基线后，可用如下命令进行受控语义重访实验。只有 `/hybrid/semantic_graph/stats` 中
+确认因子来自长时间间隔重访、且全程 APE/RPE 改善时，才保留该配置：
 
 ```bash
 roslaunch fast_livo2_global_localization hybrid_localization_hesai.launch \
-  enable_sam3_semantics:=false \
-  enable_semantic_observation_factors:=false \
+  enable_sam3_semantics:=true \
+  enable_sam3_lidar_filter:=false \
+  enable_sam3_visual_mask:=false \
+  enable_semantic_observation_factors:=true \
+  enable_semantic_observation_xy_factors:=true \
+  enable_semantic_observation_z_factors:=true \
   rviz:=true
 ```

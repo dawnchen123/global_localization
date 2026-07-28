@@ -38,12 +38,29 @@ hybrid_localization::SemanticGraphPointVector makeObservation(
 
 int main()
 {
+  const hybrid_localization::SemanticPoseGraphOptions default_options;
+  if (default_options.enable_semantic_observation_factors ||
+      default_options.enable_semantic_observation_xy_factors ||
+      default_options.enable_semantic_observation_z_factors)
+  {
+    std::cerr << "semantic feedback must be opt-in by default\n";
+    return 20;
+  }
+  if (!default_options.visual_loop_require_lidar_geometry)
+  {
+    std::cerr << "visual loop geometry verification must be enabled by default\n";
+    return 21;
+  }
+
   hybrid_localization::SemanticPoseGraphOptions options;
   // Generic geometric loop proposals are intentionally opt-in in production.
   // This test exercises that separate path, so enable it explicitly.
   options.enable_xy_loops = true;
   options.enable_z_loops = true;
   options.enable_sequential_ground_z = true;
+  // The visual-only and LiDAR-validated loop paths are exercised separately
+  // below. Keep this synthetic ground-Z regression focused on its own gate.
+  options.visual_loop_require_lidar_geometry = false;
   options.keyframe_distance = 0.5;
   options.keyframe_interval_sec = 0.1;
   options.keyframe_yaw_deg = 2.0;
@@ -76,6 +93,7 @@ int main()
   options.max_z_mad = 0.08;
   options.min_loops_for_xy_output = 1;
   options.enable_semantic_observation_factors = true;
+  options.enable_semantic_observation_xy_factors = true;
   options.enable_visual_loop_factors = true;
   options.visual_loop_max_time_offset = 0.1;
   options.visual_loop_min_index_gap = 3;
@@ -93,7 +111,10 @@ int main()
   options.semantic_submap_observations = 1;
   options.semantic_observation_min_index_gap = 1;
   options.semantic_observation_max_index_gap = 1;
+  options.semantic_observation_min_time_separation_sec = 0.0;
   options.semantic_observation_interval = 1;
+  options.semantic_observation_minimum_interval_sec = 0.0;
+  options.semantic_observation_max_factors = 0;
   options.semantic_observation_min_features = 20;
   options.semantic_observation_min_inliers = 20;
   options.semantic_observation_min_z_inliers = 15;
@@ -153,6 +174,12 @@ int main()
       std::cerr << "failed to add synthetic keyframe " << i << '\n';
       return 1;
     }
+    if (!graph.hasKeyframeNear(stamp) ||
+        std::abs(graph.latestKeyframeStamp() - stamp) > 1e-9)
+    {
+      std::cerr << "keyframe readiness regression at " << stamp << '\n';
+      return 25;
+    }
     if (!graph.addSemanticObservation(stamp, raw[i], semantic))
     {
       std::cerr << "failed to associate semantic observation " << i << '\n';
@@ -186,6 +213,7 @@ int main()
   }
   if (stats.visual_loop_ground_z_refinements != 1 ||
       std::abs(stats.last_visual_loop_ground_z_correction + 0.60) > 0.05 ||
+      std::abs(stats.last_visual_loop_ground_z_applied_correction + 0.60) > 0.05 ||
       stats.last_visual_loop_ground_z_inliers < 20 ||
       !stats.last_visual_loop_ground_z_accepted ||
       !stats.last_visual_loop_z_constrained ||
@@ -196,6 +224,101 @@ int main()
               << stats.last_visual_loop_ground_z_correction << " inliers="
               << stats.last_visual_loop_ground_z_inliers << '\n';
     return 12;
+  }
+
+  // A LiDAR-verified visual loop is not inserted on its first proposal when
+  // multi-frame support is enabled.  The adjacent proposal must agree on the
+  // implied map correction, then the DCS robust kernel receives one factor.
+  hybrid_localization::SemanticPoseGraphOptions support_options = options;
+  support_options.enable_xy_loops = false;
+  support_options.enable_z_loops = false;
+  support_options.visual_loop_require_lidar_geometry = true;
+  support_options.visual_loop_use_dcs = true;
+  support_options.visual_loop_dcs_k = 1.0;
+  support_options.visual_loop_min_support = 2;
+  support_options.visual_loop_support_reference_neighborhood = 0;
+  support_options.visual_loop_support_current_max_gap = 1;
+  // The synthetic pass accumulates deliberately exaggerated raw drift between
+  // the two observations, so retain finite but permissive consistency gates.
+  support_options.visual_loop_support_max_correction_xy = 2.0;
+  support_options.visual_loop_support_max_correction_yaw_deg = 5.0;
+  support_options.visual_loop_support_max_correction_z = 0.80;
+  hybrid_localization::SemanticPoseGraph support_graph(support_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!support_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add visual-loop support regression keyframe " << i << '\n';
+      return 26;
+    }
+  }
+  if (support_graph.addVisualLoopConstraint(0.0, 3.0, pose(10.0, 0.0, 0.0, 0.0), 0.90))
+  {
+    std::cerr << "visual loop was inserted before multiframe confirmation\n";
+    return 27;
+  }
+  if (!support_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.90))
+  {
+    const hybrid_localization::SemanticPoseGraphStats failed_support_stats =
+        support_graph.stats();
+    std::cerr << "failed to insert multiframe-confirmed visual loop: reason="
+              << failed_support_stats.last_visual_loop_reason << " support="
+              << failed_support_stats.last_visual_loop_support << '\n';
+    return 28;
+  }
+  const hybrid_localization::SemanticPoseGraphStats support_stats = support_graph.stats();
+  if (support_stats.visual_loop_factors != 1 ||
+      support_stats.visual_loop_support_waits < 1 ||
+      support_stats.visual_loop_support_confirmations != 1 ||
+      support_stats.visual_loop_rejections != 0)
+  {
+    std::cerr << "visual loop support/DCS regression: waits="
+              << support_stats.visual_loop_support_waits << " confirmations="
+              << support_stats.visual_loop_support_confirmations << " factors="
+              << support_stats.visual_loop_factors << " rejections="
+              << support_stats.visual_loop_rejections << '\n';
+    return 29;
+  }
+
+  // A coherent large height residual must pass the hard ground gate, but a
+  // configured trust-region step limits what one loop factor can inject.
+  hybrid_localization::SemanticPoseGraphOptions clipped_z_options = options;
+  clipped_z_options.enable_xy_loops = false;
+  clipped_z_options.enable_z_loops = false;
+  clipped_z_options.visual_loop_require_lidar_geometry = false;
+  clipped_z_options.visual_loop_ground_z_max_step = 0.25;
+  hybrid_localization::SemanticPoseGraph clipped_z_graph(clipped_z_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!clipped_z_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add clipped-Z regression keyframe " << i << '\n';
+      return 22;
+    }
+  }
+  if (!clipped_z_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.90))
+  {
+    std::cerr << "failed to add clipped-Z regression loop\n";
+    return 23;
+  }
+  const hybrid_localization::SemanticPoseGraphStats clipped_z_stats = clipped_z_graph.stats();
+  if (!clipped_z_stats.last_visual_loop_ground_z_accepted ||
+      clipped_z_stats.visual_loop_ground_z_clipped_refinements != 1 ||
+      std::abs(clipped_z_stats.last_visual_loop_ground_z_correction + 0.60) > 0.05 ||
+      std::abs(clipped_z_stats.last_visual_loop_ground_z_applied_correction + 0.25) > 0.02)
+  {
+    std::cerr << "clipped ground-Z regression: raw="
+              << clipped_z_stats.last_visual_loop_ground_z_correction
+              << " applied=" << clipped_z_stats.last_visual_loop_ground_z_applied_correction
+              << " clipped=" << clipped_z_stats.visual_loop_ground_z_clipped_refinements
+              << '\n';
+    return 24;
   }
 
   hybrid_localization::SemanticPoseGraphOptions visual_only_options = options;
@@ -232,7 +355,8 @@ int main()
       visual_only_stats.last_visual_loop_z_constrained ||
       visual_only_stats.visual_loop_z_without_ground_suppressed != 1 ||
       visual_only_stats.visual_loop_factors != 1 ||
-      visual_only_stats.visual_loop_factor_limit_rejections != 1)
+      visual_only_stats.visual_loop_factor_limit_rejections != 1 ||
+      visual_only_stats.last_visual_loop_reason != "visual_loop_factor_limit")
   {
     std::cerr << "visual-only Z suppression regression: accepted="
               << visual_only_stats.last_visual_loop_ground_z_accepted
@@ -283,6 +407,189 @@ int main()
               << " inliers=" << lidar_validated_stats.last_visual_loop_lidar_inliers
               << " factors=" << lidar_validated_stats.visual_loop_factors << '\n';
     return 19;
+  }
+
+  // On a long return pass the raw frontend can be metres from the revisit.
+  // The LiDAR verifier must then refine around an already gated PnP proposal,
+  // rather than reject every structural model because it is too far from raw.
+  hybrid_localization::SemanticPoseGraphOptions pnp_seeded_options =
+      lidar_validated_options;
+  pnp_seeded_options.visual_loop_lidar_use_pnp_seed = true;
+  pnp_seeded_options.max_xy_correction = 0.20;
+  pnp_seeded_options.max_yaw_correction_deg = 1.0;
+  hybrid_localization::SemanticPoseGraph pnp_seeded_graph(pnp_seeded_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!pnp_seeded_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add PnP-seeded LiDAR regression keyframe " << i << '\n';
+      return 36;
+    }
+  }
+  if (!pnp_seeded_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.60))
+  {
+    std::cerr << "failed to add PnP-seeded LiDAR visual loop\n";
+    return 37;
+  }
+  const hybrid_localization::SemanticPoseGraphStats pnp_seeded_stats =
+      pnp_seeded_graph.stats();
+  if (pnp_seeded_stats.visual_loop_lidar_seeded_validations != 1 ||
+      !pnp_seeded_stats.last_visual_loop_lidar_seeded ||
+      pnp_seeded_stats.visual_loop_lidar_geometry_rejections != 0 ||
+      !pnp_seeded_stats.last_visual_loop_lidar_accepted ||
+      pnp_seeded_stats.visual_loop_factors != 1)
+  {
+    std::cerr << "PnP-seeded LiDAR verification regression: seeded="
+              << pnp_seeded_stats.visual_loop_lidar_seeded_validations
+              << " rejected=" << pnp_seeded_stats.visual_loop_lidar_geometry_rejections
+              << " factors=" << pnp_seeded_stats.visual_loop_factors << '\n';
+    return 38;
+  }
+
+  // A small but spatially distributed ground overlap is allowed only by the
+  // visual-loop-specific fallback, and only after the independent LiDAR XY
+  // verification above. Force the normal high-count branch to reject so this
+  // checks that the fallback cannot accidentally become a generic Z gate.
+  hybrid_localization::SemanticPoseGraphOptions sparse_ground_options =
+      lidar_validated_options;
+  sparse_ground_options.visual_loop_ground_z_min_inliers = 1000;
+  sparse_ground_options.visual_loop_ground_z_max_step = 0.25;
+  sparse_ground_options.visual_loop_ground_z_sparse_min_inliers = 20;
+  sparse_ground_options.visual_loop_ground_z_sparse_min_inlier_ratio = 0.05;
+  sparse_ground_options.visual_loop_ground_z_sparse_min_spread = 4.0;
+  sparse_ground_options.visual_loop_ground_z_sparse_min_spread_ratio = 0.0;
+  sparse_ground_options.visual_loop_ground_z_sparse_max_mad = 0.03;
+  sparse_ground_options.visual_loop_ground_z_sparse_min_lidar_xy_inliers = 100;
+  sparse_ground_options.visual_loop_ground_z_sparse_max_lidar_xy_rmse = 0.30;
+  sparse_ground_options.visual_loop_ground_z_sparse_min_lidar_xy_spread = 4.0;
+  hybrid_localization::SemanticPoseGraph sparse_ground_graph(sparse_ground_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!sparse_ground_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add sparse-ground regression keyframe " << i << '\n';
+      return 26;
+    }
+  }
+  if (!sparse_ground_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.60))
+  {
+    std::cerr << "failed to add sparse-ground visual loop\n";
+    return 27;
+  }
+  const hybrid_localization::SemanticPoseGraphStats sparse_ground_stats =
+      sparse_ground_graph.stats();
+  if (!sparse_ground_stats.last_visual_loop_ground_z_accepted ||
+      !sparse_ground_stats.last_visual_loop_ground_z_sparse_accepted ||
+      sparse_ground_stats.visual_loop_ground_z_sparse_refinements != 1 ||
+      sparse_ground_stats.last_visual_loop_ground_z_inliers < 20 ||
+      sparse_ground_stats.last_visual_loop_ground_z_spread < 4.0 ||
+      std::abs(sparse_ground_stats.last_visual_loop_ground_z_applied_correction + 0.25) >
+          0.02)
+  {
+    std::cerr << "sparse ground-Z fallback regression: accepted="
+              << sparse_ground_stats.last_visual_loop_ground_z_sparse_accepted
+              << " inliers=" << sparse_ground_stats.last_visual_loop_ground_z_inliers
+              << " spread=" << sparse_ground_stats.last_visual_loop_ground_z_spread
+              << " applied="
+              << sparse_ground_stats.last_visual_loop_ground_z_applied_correction << '\n';
+    return 28;
+  }
+
+  // Spatial coverage is not optional: the same high-quality visual/LiDAR
+  // loop must remain Z-unconstrained when its accepted ground support is
+  // artificially required to span an impossible area.
+  hybrid_localization::SemanticPoseGraphOptions sparse_reject_options =
+      sparse_ground_options;
+  sparse_reject_options.visual_loop_ground_z_sparse_min_spread = 1000.0;
+  hybrid_localization::SemanticPoseGraph sparse_reject_graph(sparse_reject_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!sparse_reject_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add sparse-ground rejection keyframe " << i << '\n';
+      return 29;
+    }
+  }
+  if (!sparse_reject_graph.addVisualLoopConstraint(0.0, 4.0, biased_visual_loop, 0.60))
+  {
+    std::cerr << "failed to add sparse-ground rejection loop\n";
+    return 30;
+  }
+  const hybrid_localization::SemanticPoseGraphStats sparse_reject_stats =
+      sparse_reject_graph.stats();
+  if (sparse_reject_stats.last_visual_loop_ground_z_accepted ||
+      sparse_reject_stats.last_visual_loop_ground_z_sparse_accepted ||
+      sparse_reject_stats.visual_loop_ground_z_refinements != 0 ||
+      sparse_reject_stats.last_visual_loop_z_constrained ||
+      sparse_reject_stats.visual_loop_z_without_ground_suppressed != 1)
+  {
+    std::cerr << "sparse ground-Z coverage gate regression: accepted="
+              << sparse_reject_stats.last_visual_loop_ground_z_accepted
+              << " sparse=" << sparse_reject_stats.last_visual_loop_ground_z_sparse_accepted
+              << " constrained=" << sparse_reject_stats.last_visual_loop_z_constrained
+              << '\n';
+    return 31;
+  }
+
+  // Sequential ground-Z factors are opt-in and must reject a narrow local
+  // patch when the configured spatial coverage requirement is not met.
+  hybrid_localization::SemanticPoseGraphOptions sequential_ground_options = options;
+  sequential_ground_options.enable_xy_loops = false;
+  sequential_ground_options.enable_z_loops = false;
+  sequential_ground_options.enable_visual_loop_factors = false;
+  sequential_ground_options.enable_semantic_observation_factors = false;
+  sequential_ground_options.enable_semantic_observation_xy_factors = false;
+  sequential_ground_options.enable_semantic_observation_z_factors = false;
+  sequential_ground_options.sequential_ground_interval = 1;
+  sequential_ground_options.sequential_ground_min_spread = 4.0;
+  sequential_ground_options.sequential_ground_min_spread_ratio = 0.05;
+  hybrid_localization::SemanticPoseGraph sequential_ground_graph(sequential_ground_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!sequential_ground_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add sequential ground regression keyframe " << i << '\n';
+      return 32;
+    }
+  }
+  if (sequential_ground_graph.stats().sequential_ground_factors < 1)
+  {
+    std::cerr << "sequential ground coverage regression: expected accepted factors\n";
+    return 33;
+  }
+  hybrid_localization::SemanticPoseGraphOptions sequential_ground_reject_options =
+      sequential_ground_options;
+  sequential_ground_reject_options.sequential_ground_min_spread = 1000.0;
+  hybrid_localization::SemanticPoseGraph sequential_ground_reject_graph(
+      sequential_ground_reject_options);
+  for (std::size_t i = 0; i < raw.size(); ++i)
+  {
+    const auto semantic = makeObservation(truth[i], world);
+    auto geometry = semantic;
+    for (auto &point : geometry) point.label = 0U;
+    if (!sequential_ground_reject_graph.addFrame(static_cast<double>(i), raw[i], geometry))
+    {
+      std::cerr << "failed to add sequential ground rejection keyframe " << i << '\n';
+      return 34;
+    }
+  }
+  if (sequential_ground_reject_graph.stats().sequential_ground_factors != 0)
+  {
+    std::cerr << "sequential ground spatial gate regression: factors="
+              << sequential_ground_reject_graph.stats().sequential_ground_factors << '\n';
+    return 35;
   }
   if (stats.semantic_observation_factors < 1 ||
       stats.semantic_observation_xy_factors < 1)

@@ -2,35 +2,58 @@
   <!-- Enables the direct LiDAR-depth visual ESKF profile without changing the
        conservative observation-only defaults used by existing commands. -->
   <arg name="visual_fusion_profile" default="false" />
+  <!-- Empty preserves the selected profile. Set true/false only for a
+       controlled direct-visual Z ablation. -->
+  <arg name="visual_auto_z_when_observable" default="" />
   <!-- Optional per-run frontend override.  Keeping it empty preserves the
        validated sensor defaults while allowing reproducible tuning sweeps. -->
   <arg name="frontend_tuning_config" default="" />
+  <!-- Optional graph-only experiment profile. It loads after the baseline
+       graph profile and never changes the frontend calibration. -->
+  <arg name="graph_tuning_config" default="" />
+  <!-- Keep true for normal operation. Frontend-only evaluation can disable
+       GTSAM to reduce CPU and memory pressure during long bag sweeps. -->
+  <arg name="start_graph" default="true" />
   <arg name="pointcloud_topic" default="/hesai/at128/points" />
   <arg name="imu_topic" default="/adi/adis16465/imu" />
   <arg name="wheel_topic" default="/insprobe/ranger/odometer" />
   <arg name="wheel_time_offset" default="-0.01" />
-  <arg name="subscribe_wheel" default="false" />
-  <arg name="enable_wheel_factors" default="false" />
+  <!-- i2Nav Ranger odometry is a calibrated frontend constraint. Disable this
+       explicitly only when the wheel topic is unavailable. -->
+  <arg name="subscribe_wheel" default="true" />
+  <!-- Empty preserves the graph configuration. Pass true/false only when a
+       command-line launch must override a graph-tuning profile. -->
+  <arg name="enable_wheel_factors" default="" />
   <arg name="camera_topic" default="/avt_camera/left/image/compressed" />
   <arg name="subscribe_camera"
-       default="$(eval 'true' if arg('visual_fusion_profile') == 'true' else 'false')" />
+       default="$(eval 'true' if arg('visual_fusion_profile') else 'false')" />
   <arg name="enable_visual_frontend"
-       default="$(eval 'true' if arg('visual_fusion_profile') == 'true' else 'false')" />
+       default="$(eval 'true' if arg('visual_fusion_profile') else 'false')" />
   <arg name="visual_observation_only"
-       default="$(eval 'false' if arg('visual_fusion_profile') == 'true' else 'true')" />
+       default="$(eval 'false' if arg('visual_fusion_profile') else 'true')" />
   <arg name="enable_visual_rotation_factors"
        default="false" />
   <arg name="enable_visual_translation_factors" default="false" />
-  <arg name="enable_visual_loop_factors"
-       default="$(eval 'true' if arg('visual_fusion_profile') == 'true' else 'false')" />
+  <arg name="enable_visual_loop_factors" default="false" />
+  <!-- The frontend uses images for direct ESKF independently of graph-side
+       PnP/loop processing. Keep the latter off unless it can add a factor. -->
+  <arg name="subscribe_camera_graph"
+       default="$(eval 'true' if arg('enable_visual_rotation_factors') or arg('enable_visual_translation_factors') or arg('enable_visual_loop_factors') else 'false')" />
+  <!-- Registered clouds are needed for graph factors and semantic-map
+       association, but not for a frontend-only LIO/direct-visual run. -->
+  <arg name="process_registered_clouds" default="true" />
   <arg name="enable_xy_loops" default="false" />
   <arg name="enable_z_loops" default="false" />
-  <arg name="enable_sequential_ground_z" default="false" />
-  <arg name="enable_semantic_observation_factors" default="true" />
-  <arg name="enable_semantic_observation_xy_factors" default="true" />
-  <arg name="enable_semantic_observation_z_factors" default="true" />
+  <!-- Empty preserves the configuration file value. Pass true/false only to
+       explicitly override a graph-tuning profile from the command line. -->
+  <arg name="enable_sequential_ground_z" default="" />
+  <arg name="enable_semantic_observation_factors" default="false" />
+  <arg name="enable_semantic_observation_xy_factors" default="false" />
+  <arg name="enable_semantic_observation_z_factors" default="false" />
   <arg name="enable_sam3_semantics" default="true" />
-  <arg name="enable_sam3_lidar_filter" default="$(arg enable_sam3_semantics)" />
+  <!-- Mapping is independent from feedback into the estimator. -->
+  <arg name="enable_sam3_visual_mask" default="false" />
+  <arg name="enable_sam3_lidar_filter" default="false" />
   <arg name="sam3_config" default="$(find fast_livo2_global_localization)/config/sam3_hesai.yaml" />
   <arg name="sam3_queue_dir" default="/tmp/sam3_projected_semantic_queue" />
   <arg name="semantic_cloud_save_path" default="" />
@@ -58,6 +81,9 @@
               file="$(find fast_livo2_global_localization)/config/hybrid_localization_visual_fusion.yaml" />
     <rosparam if="$(eval arg('frontend_tuning_config') != '')" command="load"
               file="$(arg frontend_tuning_config)" />
+    <param if="$(eval arg('visual_auto_z_when_observable') != '')"
+           name="visual_frontend/fuse_translation_z_when_observable"
+           value="$(arg visual_auto_z_when_observable)" />
     <param name="lidar_cloud_topic" value="$(arg pointcloud_topic)" />
     <param name="imu_topic" value="$(arg imu_topic)" />
     <param name="wheel_topic" value="$(arg wheel_topic)" />
@@ -66,13 +92,15 @@
     <param name="subscribe_wheel" value="$(arg subscribe_wheel)" />
     <param name="camera_topic" value="$(arg camera_topic)" />
     <param name="subscribe_camera_frontend" value="$(arg subscribe_camera)" />
-    <!-- SAM3 dynamic filtering needs the same image stream as the label map. -->
+    <!-- SAM3 feedback paths need the same image stream as the label map. -->
     <param if="$(arg enable_sam3_lidar_filter)"
+           name="subscribe_camera_frontend" value="true" />
+    <param if="$(arg enable_sam3_visual_mask)"
            name="subscribe_camera_frontend" value="true" />
     <param name="visual_frontend/enabled" value="$(arg enable_visual_frontend)" />
     <param name="visual_frontend/observation_only"
            value="$(arg visual_observation_only)" />
-    <param name="visual_frontend/use_sam3" value="$(arg enable_sam3_semantics)" />
+    <param name="visual_frontend/use_sam3" value="$(arg enable_sam3_visual_mask)" />
     <param name="semantic_lidar_filter/enabled"
            value="$(arg enable_sam3_lidar_filter)" />
     <param name="lidar_point_time_mode" value="$(arg lidar_point_time_mode)" />
@@ -93,7 +121,8 @@
     <param name="object_save_path" value="$(arg object_save_path)" />
   </node>
 
-  <node pkg="fast_livo2_global_localization"
+  <node if="$(arg start_graph)"
+        pkg="fast_livo2_global_localization"
         type="semantic_gtsam_pose_graph_node"
         name="semantic_gtsam_pose_graph_node"
         output="screen">
@@ -103,9 +132,13 @@
               file="$(find fast_livo2_global_localization)/config/hybrid_localization_visual_fusion.yaml" />
     <param name="wheel_topic" value="$(arg wheel_topic)" />
     <param name="wheel_time_offset" value="$(arg wheel_time_offset)" />
-    <param name="graph/enable_wheel_factors" value="$(arg enable_wheel_factors)" />
+    <param if="$(eval arg('enable_wheel_factors') != '')"
+           name="graph/enable_wheel_factors"
+           value="$(arg enable_wheel_factors)" />
     <param name="camera_topic" value="$(arg camera_topic)" />
-    <param name="subscribe_camera" value="$(arg subscribe_camera)" />
+    <param name="subscribe_camera" value="$(arg subscribe_camera_graph)" />
+    <param name="process_registered_clouds"
+           value="$(arg process_registered_clouds)" />
     <param name="visual_observation_only" value="$(arg visual_observation_only)" />
     <param name="graph/enable_visual_rotation_factors"
            value="$(arg enable_visual_rotation_factors)" />
@@ -115,7 +148,8 @@
            value="$(arg enable_visual_loop_factors)" />
     <param name="graph/enable_xy_loops" value="$(arg enable_xy_loops)" />
     <param name="graph/enable_z_loops" value="$(arg enable_z_loops)" />
-    <param name="graph/enable_sequential_ground_z"
+    <param if="$(eval arg('enable_sequential_ground_z') != '')"
+           name="graph/enable_sequential_ground_z"
            value="$(arg enable_sequential_ground_z)" />
     <param name="graph/enable_semantic_observation_factors"
            value="$(arg enable_semantic_observation_factors)" />
@@ -123,6 +157,10 @@
            value="$(arg enable_semantic_observation_xy_factors)" />
     <param name="graph/enable_semantic_observation_z_factors"
            value="$(arg enable_semantic_observation_z_factors)" />
+    <!-- The optional graph tuning file supplies experiment-only graph
+         parameters. Empty launch overrides leave its boolean choices intact. -->
+    <rosparam if="$(eval arg('graph_tuning_config') != '')" command="load"
+              file="$(arg graph_tuning_config)" />
     <param unless="$(arg enable_sam3_semantics)" name="subscribe_semantic" value="$(arg subscribe_semantic)" />
     <param if="$(arg enable_sam3_semantics)" name="subscribe_semantic" value="true" />
     <param name="trajectory_save_path" value="$(arg trajectory_save_path)" />

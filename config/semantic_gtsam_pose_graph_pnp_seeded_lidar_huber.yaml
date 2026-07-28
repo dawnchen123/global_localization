@@ -1,0 +1,7 @@
+# Controlled street00 long-return experiment. This combines PnP-seeded LiDAR
+# verification with a broader Huber transition for factors that have already
+# passed mutual-NN, RANSAC/Huber, spatial-spread, RMSE, PnP/LiDAR agreement,
+# and raw-pose consistency gates. It is intentionally opt-in.
+graph:
+  visual_loop_lidar_use_pnp_seed: true
+  visual_loop_huber_k: 6.0

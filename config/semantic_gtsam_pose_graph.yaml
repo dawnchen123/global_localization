@@ -25,6 +25,10 @@ label_field: label
 confidence_field: confidence
 subscribe_semantic: false
 subscribe_camera: false
+# Keep this on for normal mapping/graph launches. The reproducible LIO and
+# direct-visual ablations explicitly turn it off when no graph factor can use
+# registered clouds, preventing backend backlog from perturbing the frontend.
+process_registered_clouds: true
 visual_observation_only: true
 publish_visual_debug_images: true
 semantic_cloud_in_map_frame: true
@@ -37,6 +41,13 @@ odom_history_sec: 600.0
 semantic_map_publish_rate: 0.20
 semantic_map_voxel_size: 0.30
 semantic_map_max_points: 120000
+# Disabled baseline: graph optimization is published immediately, exactly as
+# prior experiments. The consensus/continuous profile enables rate limiting.
+continuous_correction_enabled: false
+continuous_correction_max_xy_rate: 0.0
+continuous_correction_max_z_rate: 0.0
+continuous_correction_max_rotation_rate_deg: 0.0
+continuous_correction_reset_gap_sec: 5.0
 max_registered_points: 8000
 max_pending_registered_clouds: 100
 max_pending_semantic_clouds: 240
@@ -103,9 +114,15 @@ visual_loop:
   image_scale: 0.5
   maximum_features: 1800
   minimum_depth_features: 80
-  maximum_database_size: 1000
+  # One loop keyframe per second keeps the whole 1400 s street00 pass
+  # searchable. Older entries retain ORB/depth only, not full gray images.
+  maximum_database_size: 1600
+  debug_image_history_size: 96
   keyframe_distance: 0.75
   keyframe_interval_sec: 1.0
+  # Keep every one-second feature/depth keyframe, but do not run full database
+  # retrieval for every entry. The matcher stays responsive during revisits.
+  retrieval_interval_sec: 4.0
   minimum_index_gap: 25
   # A true revisit is separated by time even when the raw trajectory has
   # already drifted. Let descriptor/PnP verification decide reverse-heading
@@ -144,9 +161,11 @@ graph:
   enable_visual_rotation_factors: false
   enable_visual_translation_factors: false
   enable_visual_loop_factors: false
-  enable_semantic_observation_factors: true
-  enable_semantic_observation_xy_factors: true
-  enable_semantic_observation_z_factors: true
+  # SAM3 mapping remains enabled below, but its trajectory feedback is opt-in.
+  # Enable these only after a full replay confirms independent revisits.
+  enable_semantic_observation_factors: false
+  enable_semantic_observation_xy_factors: false
+  enable_semantic_observation_z_factors: false
   semantic_observation_require_xy_for_z: true
   use_semantics: true
 
@@ -176,22 +195,26 @@ graph:
   semantic_weight: 0.35
 
   # Each message is one original-time SAM observation. Five consecutive
-  # observations form one non-overlapping semantic BEV submap. This prevents
-  # adjacent camera views from repeatedly imposing the same local bias.
-  # The rolling visualization map is never used as a factor input.
+  # observations form one non-overlapping semantic BEV submap. The rolling
+  # visualization map is never used as a factor input.
   semantic_submap_observations: 5
-  semantic_observation_min_index_gap: 12
-  semantic_observation_max_index_gap: 45
-  semantic_observation_max_reference_uses: 2
+  # A factor is a revisit constraint, not a short-baseline adjacent-street
+  # match. Zero max gap means any sufficiently old submap may be considered.
+  semantic_observation_min_index_gap: 1
+  semantic_observation_max_index_gap: 0
+  semantic_observation_min_time_separation_sec: 90.0
+  semantic_observation_max_reference_uses: 1
   semantic_observation_interval: 1
+  semantic_observation_minimum_interval_sec: 180.0
+  semantic_observation_max_factors: 2
   semantic_observation_min_features: 100
   # A five-frame submap is already spatially compacted by the mapper.  Sixty
   # mutually verified structural correspondences retain the spread/RMSE gates
   # below while allowing a valid street segment to reach iSAM.
   semantic_observation_min_inliers: 60
   semantic_observation_min_z_inliers: 60
-  semantic_observation_search_radius: 30.0
-  semantic_observation_min_baseline: 8.0
+  semantic_observation_search_radius: 18.0
+  semantic_observation_min_baseline: 0.0
   semantic_observation_max_time_offset: 0.75
   semantic_observation_correspondence_distance: 0.70
   semantic_observation_ransac_inlier_distance: 0.30
@@ -267,8 +290,18 @@ graph:
   loop_sigma_yaw_deg: 1.00
   loop_sigma_z: 0.15
   sequential_ground_sigma_z: 0.12
+  sequential_ground_interval: 1
+  sequential_ground_min_spread: 0.0
+  sequential_ground_min_spread_ratio: 0.0
+  sequential_ground_min_support: 1
+  sequential_ground_support_max_gap: 2
+  sequential_ground_support_max_z_disagreement: 0.0
+  sequential_ground_min_inlier_ratio: 0.0
+  sequential_ground_max_step: 0.0
   loop_huber_k: 1.345
   sequential_ground_huber_k: 1.345
+  sequential_ground_use_dcs: false
+  sequential_ground_dcs_k: 1.0
 
   # Ranger MINI is integrated only between graph keyframes. The calibrated
   # scale is obtained from the street00 wheel distance versus FAST-LIVO2 path.
@@ -279,6 +312,11 @@ graph:
   wheel_lateral_sigma: 0.15
   wheel_huber_k: 1.345
   wheel_min_samples: 5
+  wheel_min_raw_translation: 0.0
+  wheel_max_arc_disagreement: 0.0
+  wheel_max_relative_arc_disagreement: 0.0
+  wheel_use_dcs: false
+  wheel_dcs_k: 1.0
 
   # Camera factors are gated against the LIO prediction before insertion.
   # Translation is used only when metric LiDAR-depth PnP is enabled explicitly.
@@ -300,23 +338,37 @@ graph:
   visual_loop_min_index_gap: 20
   visual_loop_min_time_separation_sec: 60.0
   visual_loop_min_quality: 0.65
-  # Keep the base launch conservative. The visual-fusion profile enables this
-  # only when a candidate also passes independent LiDAR structure matching.
-  visual_loop_require_lidar_geometry: false
+  # PnP only proposes a revisit. Every visual loop must also pass independent
+  # LiDAR structural matching before it can alter the graph.
+  visual_loop_require_lidar_geometry: true
   visual_loop_min_quality_with_lidar_geometry: 0.55
+  # Keep the raw-odometry seed in the baseline. A named experiment can seed
+  # LiDAR RANSAC from an already gated PnP revisit on long return passes.
+  visual_loop_lidar_use_pnp_seed: false
   visual_loop_lidar_max_pnp_xy_disagreement: 1.20
   visual_loop_lidar_max_pnp_yaw_disagreement_deg: 3.0
   visual_loop_max_translation_disagreement: 3.0
   visual_loop_max_rotation_disagreement_deg: 10.0
-  visual_loop_minimum_interval_sec: 180.0
+  visual_loop_minimum_interval_sec: 90.0
   visual_loop_reference_neighborhood: 16
-  visual_loop_max_factors: 1
+  visual_loop_max_factors: 3
   visual_loop_sigma_roll_pitch_deg: 2.0
   visual_loop_sigma_yaw_deg: 1.0
   visual_loop_sigma_xy: 0.25
   visual_loop_sigma_z: 0.35
   visual_loop_quality_sigma_scale: 1.5
   visual_loop_huber_k: 1.345
+  visual_loop_use_dcs: false
+  visual_loop_dcs_k: 1.0
+  visual_loop_min_support: 1
+  visual_loop_support_reference_neighborhood: 16
+  visual_loop_support_current_max_gap: 5
+  visual_loop_support_max_correction_xy: 0.0
+  visual_loop_support_max_correction_yaw_deg: 0.0
+  visual_loop_support_max_correction_z: 0.0
+  visual_loop_graph_consistency_max_xy: 0.0
+  visual_loop_graph_consistency_max_yaw_deg: 0.0
+  visual_loop_graph_consistency_max_z: 0.0
   # Roll/pitch remains governed by the gravity-aligned LiDAR/IMU frontend.
   visual_loop_constrain_roll_pitch: false
   # The PnP loop supplies the horizontal pose; a separate robust ground-pair
@@ -328,8 +380,23 @@ graph:
   visual_loop_ground_z_inlier_residual_gate: 0.16
   visual_loop_ground_z_min_inliers: 70
   visual_loop_ground_z_max_mad: 0.08
+  # A large ground-height residual is accepted only after the structural,
+  # inlier-count and MAD gates above.  Its graph contribution remains bounded
+  # so multiple independent revisits must agree before a large Z pull occurs.
   visual_loop_ground_z_max_correction: 1.50
+  visual_loop_ground_z_max_step: 0.35
   visual_loop_ground_z_sigma: 0.15
+  visual_loop_ground_z_clipped_sigma: 0.40
+  # Disabled baseline: a sparse-ground fallback is evaluated only through a
+  # named experiment profile after its spatial-support diagnostics are checked.
+  visual_loop_ground_z_sparse_min_inliers: 0
+  visual_loop_ground_z_sparse_min_inlier_ratio: 0.0
+  visual_loop_ground_z_sparse_min_spread: 0.0
+  visual_loop_ground_z_sparse_min_spread_ratio: 0.0
+  visual_loop_ground_z_sparse_max_mad: 0.0
+  visual_loop_ground_z_sparse_min_lidar_xy_inliers: 0
+  visual_loop_ground_z_sparse_max_lidar_xy_rmse: 0.0
+  visual_loop_ground_z_sparse_min_lidar_xy_spread: 0.0
 
   isam_relinearize_threshold: 0.05
   isam_relinearize_skip: 1

@@ -27,8 +27,9 @@ using SemanticGraphPointVector =
 struct SemanticPoseGraphOptions
 {
   bool enabled = true;
-  // Generic geometric loop proposals are opt-in.  Semantic observations have
-  // their own stricter multi-frame gates and remain enabled independently.
+  // Every graph correction is opt-in. Semantic observations still build the
+  // semantic map and debug output when disabled, but do not alter odometry
+  // until a dataset-specific revisit experiment enables them.
   bool enable_xy_loops = false;
   bool enable_z_loops = false;
   bool enable_sequential_ground_z = false;
@@ -36,9 +37,9 @@ struct SemanticPoseGraphOptions
   bool enable_visual_rotation_factors = false;
   bool enable_visual_translation_factors = false;
   bool enable_visual_loop_factors = false;
-  bool enable_semantic_observation_factors = true;
-  bool enable_semantic_observation_xy_factors = true;
-  bool enable_semantic_observation_z_factors = true;
+  bool enable_semantic_observation_factors = false;
+  bool enable_semantic_observation_xy_factors = false;
+  bool enable_semantic_observation_z_factors = false;
   // A vertical correspondence is meaningful only after the planar semantic
   // registration has established its horizontal association.
   bool semantic_observation_require_xy_for_z = true;
@@ -72,12 +73,18 @@ struct SemanticPoseGraphOptions
   // submaps. Each observation contributes to exactly one submap.
   int semantic_submap_observations = 3;
   int semantic_observation_min_index_gap = 4;
-  int semantic_observation_max_index_gap = 30;
+  // Zero accepts any older keyframe. A real-time gate below prevents short
+  // baseline street segments from being treated as revisits.
+  int semantic_observation_max_index_gap = 0;
+  double semantic_observation_min_time_separation_sec = 90.0;
   // Limit repeated use of a semantic reference submap so one locally biased
   // projection cannot accumulate into many correlated graph factors. Zero
   // leaves reuse unlimited.
   int semantic_observation_max_reference_uses = 0;
   int semantic_observation_interval = 1;
+  // Bound correlated corrections even after a valid revisit is found.
+  double semantic_observation_minimum_interval_sec = 180.0;
+  int semantic_observation_max_factors = 2;
   int semantic_observation_min_features = 80;
   int semantic_observation_min_inliers = 45;
   int semantic_observation_min_z_inliers = 30;
@@ -156,8 +163,22 @@ struct SemanticPoseGraphOptions
   double loop_sigma_yaw_deg = 0.45;
   double loop_sigma_z = 0.08;
   double sequential_ground_sigma_z = 0.06;
+  int sequential_ground_interval = 1;
+  double sequential_ground_min_spread = 0.0;
+  double sequential_ground_min_spread_ratio = 0.0;
+  // Consecutive ground registrations are correlated.  Require a small
+  // temporal consensus window before inserting a sequential vertical factor
+  // when this is enabled by an experiment profile.  Defaults preserve the
+  // original single-pair behavior.
+  int sequential_ground_min_support = 1;
+  int sequential_ground_support_max_gap = 2;
+  double sequential_ground_support_max_z_disagreement = 0.0;
+  double sequential_ground_min_inlier_ratio = 0.0;
+  double sequential_ground_max_step = 0.0;
   double loop_huber_k = 1.345;
   double sequential_ground_huber_k = 1.345;
+  bool sequential_ground_use_dcs = false;
+  double sequential_ground_dcs_k = 1.0;
 
   double wheel_speed_scale = 0.9865;
   double wheel_max_gap = 0.08;
@@ -166,6 +187,14 @@ struct SemanticPoseGraphOptions
   double wheel_lateral_sigma = 0.15;
   double wheel_huber_k = 1.345;
   int wheel_min_samples = 5;
+  // Disabled gates preserve the historical wheel factor.  A profile can
+  // reject a wheel interval that disagrees with the independently estimated
+  // LiDAR/IMU keyframe displacement before it reaches iSAM.
+  double wheel_min_raw_translation = 0.0;
+  double wheel_max_arc_disagreement = 0.0;
+  double wheel_max_relative_arc_disagreement = 0.0;
+  bool wheel_use_dcs = false;
+  double wheel_dcs_k = 1.0;
 
   double visual_max_time_offset = 0.15;
   double visual_min_quality = 0.30;
@@ -187,8 +216,12 @@ struct SemanticPoseGraphOptions
   // independent LiDAR structural registration verifies the same keyframe pair.
   // This keeps image retrieval as a proposal mechanism rather than a direct
   // global pose measurement.
-  bool visual_loop_require_lidar_geometry = false;
+  bool visual_loop_require_lidar_geometry = true;
   double visual_loop_min_quality_with_lidar_geometry = 0.55;
+  // A verified PnP revisit may be a better registration seed than the
+  // drifted raw odometry on a long return pass.  LiDAR correspondence, RANSAC
+  // and all geometric gates still decide whether a factor is inserted.
+  bool visual_loop_lidar_use_pnp_seed = false;
   double visual_loop_lidar_max_pnp_xy_disagreement = 1.20;
   double visual_loop_lidar_max_pnp_yaw_disagreement_deg = 3.0;
   double visual_loop_max_translation_disagreement = 3.0;
@@ -204,6 +237,26 @@ struct SemanticPoseGraphOptions
   double visual_loop_sigma_z = 0.35;
   double visual_loop_quality_sigma_scale = 1.5;
   double visual_loop_huber_k = 1.345;
+  // DCS is a switchable robust kernel: a large post-insertion residual
+  // dynamically inflates the covariance instead of allowing one loop to
+  // dominate the graph.  It is opt-in to keep existing experiments stable.
+  bool visual_loop_use_dcs = false;
+  double visual_loop_dcs_k = 1.0;
+  // Visual retrieval remains a proposal source.  Each proposal is first
+  // verified by the independent LiDAR matcher above, then adjacent verified
+  // proposals must agree on the implied map-from-raw correction before one
+  // factor is inserted.  A support of one is the legacy behavior.
+  int visual_loop_min_support = 1;
+  int visual_loop_support_reference_neighborhood = 16;
+  int visual_loop_support_current_max_gap = 5;
+  double visual_loop_support_max_correction_xy = 0.0;
+  double visual_loop_support_max_correction_yaw_deg = 0.0;
+  double visual_loop_support_max_correction_z = 0.0;
+  // Unlike the raw-PnP gate, this compares the accepted LiDAR measurement
+  // with the current graph state.  Non-positive limits leave the gate off.
+  double visual_loop_graph_consistency_max_xy = 0.0;
+  double visual_loop_graph_consistency_max_yaw_deg = 0.0;
+  double visual_loop_graph_consistency_max_z = 0.0;
   // Gravity comes from the LiDAR/IMU frontend. A monocular PnP loop may
   // validate yaw and translation while still having biased roll/pitch, so it
   // does not constrain those axes unless this is explicitly requested.
@@ -219,8 +272,33 @@ struct SemanticPoseGraphOptions
   double visual_loop_ground_z_inlier_residual_gate = 0.16;
   int visual_loop_ground_z_min_inliers = 70;
   double visual_loop_ground_z_max_mad = 0.08;
+  // This is the hard acceptance gate on the ground-pair median.  A smaller
+  // max_step below can still limit what one independently verified event
+  // injects into the graph.
   double visual_loop_ground_z_max_correction = 1.50;
+  // Zero preserves the historical full-correction behavior.  A positive
+  // value applies a bounded trust-region step from a large, but coherent,
+  // ground-height residual.
+  double visual_loop_ground_z_max_step = 0.0;
   double visual_loop_ground_z_sigma = 0.15;
+  // A clipped Z step is deliberately weaker than a fully applied ground
+  // measurement, so several independent revisits are required for a large
+  // vertical correction.
+  double visual_loop_ground_z_clipped_sigma = 0.50;
+  // Disabled by default.  A late revisit can have only a small visible ground
+  // overlap even when its structural XY registration is exceptionally strong.
+  // This opt-in fallback accepts that sparse Z support only when both its
+  // spatial coverage and the independent LiDAR XY evidence pass the stricter
+  // gates below.  It is intentionally scoped to visual-loop ground Z, not
+  // generic or semantic loop matching.
+  int visual_loop_ground_z_sparse_min_inliers = 0;
+  double visual_loop_ground_z_sparse_min_inlier_ratio = 0.0;
+  double visual_loop_ground_z_sparse_min_spread = 0.0;
+  double visual_loop_ground_z_sparse_min_spread_ratio = 0.0;
+  double visual_loop_ground_z_sparse_max_mad = 0.0;
+  int visual_loop_ground_z_sparse_min_lidar_xy_inliers = 0;
+  double visual_loop_ground_z_sparse_max_lidar_xy_rmse = 0.0;
+  double visual_loop_ground_z_sparse_min_lidar_xy_spread = 0.0;
 
   double isam_relinearize_threshold = 0.05;
   int isam_relinearize_skip = 1;
@@ -285,18 +363,39 @@ struct SemanticPoseGraphStats
   int visual_loop_rejections = 0;
   int visual_loop_factors = 0;
   int visual_loop_ground_z_refinements = 0;
+  int visual_loop_ground_z_clipped_refinements = 0;
+  int visual_loop_ground_z_sparse_refinements = 0;
   int visual_loop_cooldown_rejections = 0;
   int visual_loop_factor_limit_rejections = 0;
   int visual_loop_z_without_ground_suppressed = 0;
   int visual_loop_lidar_geometry_validations = 0;
+  int visual_loop_lidar_seeded_validations = 0;
   int visual_loop_lidar_geometry_rejections = 0;
+  int visual_loop_support_waits = 0;
+  int visual_loop_support_confirmations = 0;
+  int visual_loop_support_resets = 0;
+  int visual_loop_support_disagreements = 0;
+  int last_visual_loop_support = 0;
+  // Difference between the two most recent LiDAR-verified visual-loop
+  // hypotheses in map-from-raw space.  These are diagnostics for the
+  // multi-frame gate, not residuals of an inserted graph factor.
+  double last_visual_loop_support_xy_disagreement = 0.0;
+  double last_visual_loop_support_yaw_disagreement_deg = 0.0;
+  double last_visual_loop_support_z_disagreement = 0.0;
+  int sequential_ground_rejections = 0;
+  int sequential_ground_support_waits = 0;
+  int sequential_ground_support_confirmations = 0;
+  int wheel_rejections = 0;
   int last_visual_loop_ground_z_candidates = 0;
+  int last_visual_loop_ground_z_broad_candidates = 0;
   int last_visual_loop_ground_z_inliers = 0;
   int last_visual_loop_lidar_candidates = 0;
   int last_visual_loop_lidar_inliers = 0;
   bool last_visual_loop_ground_z_accepted = false;
+  bool last_visual_loop_ground_z_sparse_accepted = false;
   bool last_visual_loop_z_constrained = false;
   bool last_visual_loop_lidar_accepted = false;
+  bool last_visual_loop_lidar_seeded = false;
   int loop_attempts = 0;
   int loop_rejections = 0;
   int loop_factors = 0;
@@ -334,11 +433,21 @@ struct SemanticPoseGraphStats
   double last_semantic_z_median = 0.0;
   double last_semantic_z_mad = 0.0;
   double last_visual_loop_ground_z_correction = 0.0;
+  double last_visual_loop_ground_z_applied_correction = 0.0;
   double last_visual_loop_ground_z_mad = 0.0;
+  double last_visual_loop_ground_z_inlier_ratio = 0.0;
+  double last_visual_loop_ground_z_spread = 0.0;
+  double last_visual_loop_ground_z_spread_ratio = 0.0;
   double last_visual_loop_lidar_rmse = 0.0;
   double last_visual_loop_lidar_spread = 0.0;
+  double last_visual_loop_lidar_pnp_xy_disagreement = 0.0;
+  double last_visual_loop_lidar_pnp_yaw_disagreement_deg = 0.0;
+  double last_visual_loop_graph_xy_innovation = 0.0;
+  double last_visual_loop_graph_yaw_innovation_deg = 0.0;
+  double last_visual_loop_graph_z_innovation = 0.0;
   double last_loop_time_separation_sec = 0.0;
   double last_optimization_ms = 0.0;
+  std::string last_visual_loop_reason = "not_attempted";
 };
 
 class SemanticPoseGraph
@@ -369,6 +478,11 @@ public:
                                double quality);
 
   bool initialized() const;
+  // Graph-side visual loops can arrive before the registered-cloud callback
+  // creates the matching keyframe.  The ROS node uses these queries to defer
+  // such a loop instead of turning callback ordering into a rejection.
+  bool hasKeyframeNear(double stamp) const;
+  double latestKeyframeStamp() const;
   Eigen::Isometry3d correctedPose(const Eigen::Isometry3d &raw_pose) const;
   std::vector<GraphTrajectorySample, Eigen::aligned_allocator<GraphTrajectorySample>>
   optimizedTrajectory() const;

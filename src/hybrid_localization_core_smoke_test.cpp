@@ -151,6 +151,8 @@ int main()
   odometry_options.visual_min_landmarks = 20;
   odometry_options.visual_min_residuals = 200;
   odometry_options.visual_max_rmse = 1.0;
+  odometry_options.visual_fuse_correlated_states = true;
+  odometry_options.visual_max_velocity_step = 0.05;
   LidarOdometry lidar_odometry(odometry_options);
   const LidarOdometryResult first_scan = lidar_odometry.processScan(world_points, 1.0);
   assert(first_scan.accepted);
@@ -188,10 +190,13 @@ int main()
   LidarOdometryOptions planar_options = odometry_options;
   planar_options.min_observable_directions = 3;
   planar_options.map_insertion_min_observable_directions = 3;
+  planar_options.project_lidar_information_to_observable_subspace = true;
   planar_options.max_mean_normalized_residual = 5.0;
   planar_options.map_insertion_max_mean_normalized_residual = 5.0;
   LidarOdometry planar_odometry(planar_options);
-  assert(planar_odometry.processScan(planar_points, 1.5).accepted);
+  const LidarOdometryResult planar_initial =
+      planar_odometry.processScan(planar_points, 1.5);
+  assert(planar_initial.accepted);
   const LidarOdometryResult planar_scan =
       planar_odometry.processScan(planar_points, 1.6);
   assert(planar_scan.accepted);
@@ -199,6 +204,66 @@ int main()
   assert(planar_scan.observable_directions >= 3);
   assert(planar_scan.observable_directions < 6);
   assert(std::isfinite(planar_scan.mean_normalized_residual));
+  const double initial_unobservable_variance =
+      planar_initial.covariance(2, 2) +
+      planar_initial.covariance(3, 3) +
+      planar_initial.covariance(4, 4);
+  const double updated_unobservable_variance =
+      planar_scan.covariance(2, 2) +
+      planar_scan.covariance(3, 3) +
+      planar_scan.covariance(4, 4);
+  assert(updated_unobservable_variance >=
+         0.95 * initial_unobservable_variance);
+
+  // Directional covariance, whitened Huber weighting, and point-wise NIS
+  // gating must retain the coherent scan while rejecting individual plane
+  // outliers instead of rejecting the whole frame.
+  LidarOdometryOptions robust_options = odometry_options;
+  robust_options.use_directional_lidar_covariance = true;
+  robust_options.lidar_origin_in_body =
+      Eigen::Vector3d(0.04, 0.02, 0.06);
+  robust_options.lidar_normalized_huber_delta = 2.5;
+  robust_options.lidar_innovation_gate = 0.05;
+  robust_options.freeze_mature_voxels = true;
+  robust_options.max_voxel_points = 8;
+  LidarOdometry robust_odometry(robust_options);
+  assert(robust_odometry.processScan(world_points, 1.7).accepted);
+  PointVector mixed_scan = world_points;
+  for (std::size_t index = 0; index < world_points.size(); index += 5U)
+  {
+    mixed_scan.push_back(world_points[index] +
+        Eigen::Vector3d(0.31, -0.27, 0.36));
+  }
+  const LidarOdometryResult robust_scan =
+      robust_odometry.processScan(mixed_scan, 1.8);
+  assert(robust_scan.accepted);
+  assert(robust_scan.innovation_rejections > 0);
+  assert(robust_scan.mean_robust_weight > 0.0);
+  assert(robust_scan.mean_robust_weight <= 1.0);
+  assert(robust_scan.covariance.allFinite());
+
+  // Motion-based map insertion must skip highly correlated stationary scans
+  // but refresh after the configured maximum interval.
+  LidarOdometryOptions keyframe_options = odometry_options;
+  keyframe_options.map_insertion_min_translation = 0.50;
+  keyframe_options.map_insertion_min_rotation_deg = 5.0;
+  keyframe_options.map_insertion_max_interval = 1.0;
+  LidarOdometry keyframe_odometry(keyframe_options);
+  const LidarOdometryResult keyframe_initial =
+      keyframe_odometry.processScan(world_points, 5.0);
+  assert(keyframe_initial.accepted);
+  assert(keyframe_initial.map_keyframe_selected);
+  const LidarOdometryResult keyframe_skipped =
+      keyframe_odometry.processScan(world_points, 5.1);
+  assert(keyframe_skipped.accepted);
+  assert(!keyframe_skipped.map_keyframe_selected);
+  assert(!keyframe_skipped.map_updated);
+  assert(keyframe_skipped.map_update_deferred);
+  const LidarOdometryResult keyframe_refresh =
+      keyframe_odometry.processScan(world_points, 6.1);
+  assert(keyframe_refresh.accepted);
+  assert(keyframe_refresh.map_keyframe_selected);
+  assert(keyframe_refresh.map_updated);
 
   // Exercise the FAST-LIO-style sample KNN plane path used as a fallback in
   // sparse parts of the rolling voxel map.
@@ -213,6 +278,24 @@ int main()
       logSE3(expected_pose.inverse() * knn_scan.pose);
   assert(knn_registration_error.head<3>().norm() < 0.04);
   assert(knn_registration_error.tail<3>().norm() < 0.12);
+
+  // Finite plane support and query-dependent extrapolation uncertainty must
+  // retain a coherent scan in both the smooth voxel and KNN fallback paths.
+  LidarOdometryOptions support_options = odometry_options;
+  support_options.plane_support_radius_scale = 3.0;
+  support_options.plane_extrapolation_uncertainty_scale = 1.0;
+  support_options.plane_parameter_uncertainty_scale = 1.0;
+  support_options.smooth_voxel_robust_refit = true;
+  support_options.use_adaptive_subvoxel_plane = true;
+  support_options.max_adaptive_subvoxels = 20000;
+  support_options.point_knn_fallback = true;
+  support_options.point_knn_fallback_max_queries = 200;
+  LidarOdometry support_odometry(support_options);
+  assert(support_odometry.processScan(world_points, 2.2).accepted);
+  const LidarOdometryResult support_scan =
+      support_odometry.processScan(second_body_points, 2.3);
+  assert(support_scan.accepted);
+  assert(support_scan.covariance.allFinite());
 
   // A wide-FOV scan can have a low global correspondence fraction even when
   // it has thousands of spatially distributed, low-residual constraints.
@@ -260,12 +343,14 @@ int main()
       second_body_points, 20.7);
   assert(delayed_scan.accepted);
 
-  const Eigen::Vector3d visual_target = second_scan.pose.translation() +
+  const Eigen::Vector3d visual_prediction =
+      second_scan.pose.translation() + 0.1 * second_scan.velocity;
+  const Eigen::Vector3d visual_target = visual_prediction +
       Eigen::Vector3d(0.01, -0.005, 0.002);
   const double visual_error_before =
-      (second_scan.pose.translation() - visual_target).norm();
+      (visual_prediction - visual_target).norm();
   const VisualUpdateResult visual_update = lidar_odometry.processVisual(
-      1.1, [&visual_target](const Eigen::Isometry3d &pose)
+      1.2, [&visual_target](const Eigen::Isometry3d &pose)
       {
         VisualPoseLinearization linearization;
         linearization.valid = true;
@@ -283,6 +368,176 @@ int main()
   assert(visual_update.accepted);
   assert((visual_update.pose.translation() - visual_target).norm() <
          visual_error_before);
+  assert(visual_update.velocity_correction.allFinite());
+  assert(visual_update.velocity_correction.norm() > 1e-8);
+  assert(visual_update.velocity_correction.norm() <=
+         odometry_options.visual_max_velocity_step + 1e-8);
+
+  // A forward-facing direct image update must not manufacture roll, pitch, or
+  // Z corrections when the fusion profile assigns those axes to LiDAR/IMU.
+  LidarOdometryOptions constrained_visual_options = odometry_options;
+  constrained_visual_options.visual_enabled = true;
+  constrained_visual_options.visual_fuse_roll_pitch = false;
+  constrained_visual_options.visual_fuse_yaw = true;
+  constrained_visual_options.visual_fuse_translation_xy = true;
+  constrained_visual_options.visual_fuse_translation_z = false;
+  constrained_visual_options.visual_observability_eigen_ratio = 1e-3;
+  constrained_visual_options.visual_min_observable_directions = 3;
+  constrained_visual_options.visual_max_rotation_step_deg = 4.0;
+  constrained_visual_options.visual_max_translation_step = 0.20;
+  LidarOdometry constrained_visual_odometry(constrained_visual_options);
+  assert(constrained_visual_odometry.processScan(world_points, 21.0).accepted);
+  const Eigen::Vector3d constrained_visual_target(0.04, -0.03, 0.07);
+  const VisualUpdateResult constrained_visual_update =
+      constrained_visual_odometry.processVisual(
+          21.1, [&constrained_visual_target](const Eigen::Isometry3d &pose)
+          {
+            VisualPoseLinearization linearization;
+            linearization.valid = true;
+            linearization.landmarks = 40;
+            linearization.residuals = 400;
+            linearization.rmse = 0.2;
+            linearization.mean_ncc = 0.95;
+            linearization.hessian = Eigen::Matrix<double, 6, 6>::Identity() * 1000.0;
+            linearization.gradient(0) = 100.0;
+            linearization.gradient(1) = -80.0;
+            linearization.gradient(2) = 1000.0 *
+                (std::atan2(pose.rotation()(1, 0), pose.rotation()(0, 0)) - 0.02);
+            linearization.gradient.tail<3>() = 1000.0 *
+                (pose.translation() - constrained_visual_target);
+            linearization.reason = "synthetic_constrained_visual_measurement";
+            return linearization;
+          });
+  assert(constrained_visual_update.accepted);
+  assert(constrained_visual_update.observable_directions == 3);
+  assert(constrained_visual_update.correction.translation().head<2>().norm() > 1e-3);
+  assert(std::abs(constrained_visual_update.correction.translation().z()) < 1e-8);
+  const Eigen::Matrix3d constrained_rotation =
+      constrained_visual_update.correction.rotation();
+  assert(std::abs(constrained_rotation(2, 0)) < 1e-8);
+  assert(std::abs(constrained_rotation(2, 1)) < 1e-8);
+  assert(std::abs(std::atan2(constrained_rotation(1, 0),
+                             constrained_rotation(0, 0))) > 1e-3);
+
+  // A two-direction direct alignment needs stricter image quality before it
+  // can replace the normal three-direction observability requirement.
+  LidarOdometryOptions two_mode_quality_options = constrained_visual_options;
+  two_mode_quality_options.visual_min_observable_directions = 2;
+  two_mode_quality_options.visual_two_mode_min_mean_ncc = 0.97;
+  LidarOdometry two_mode_quality_odometry(two_mode_quality_options);
+  assert(two_mode_quality_odometry.processScan(world_points, 21.5).accepted);
+  const VisualUpdateResult rejected_two_mode_update =
+      two_mode_quality_odometry.processVisual(
+          21.6, [](const Eigen::Isometry3d &)
+          {
+            VisualPoseLinearization linearization;
+            linearization.valid = true;
+            linearization.landmarks = 80;
+            linearization.residuals = 800;
+            linearization.rmse = 0.20;
+            linearization.mean_ncc = 0.95;
+            linearization.hessian = Eigen::Matrix<double, 6, 6>::Zero();
+            linearization.hessian(2, 2) = 1000.0;
+            linearization.hessian(3, 3) = 1000.0;
+            linearization.gradient(2) = 15.0;
+            linearization.gradient(3) = -20.0;
+            linearization.reason = "synthetic_two_mode_measurement";
+            return linearization;
+          });
+  assert(!rejected_two_mode_update.accepted);
+  assert(rejected_two_mode_update.observable_directions == 2);
+  assert(rejected_two_mode_update.reason == "visual_two_mode_quality_gate");
+
+  two_mode_quality_options.visual_two_mode_min_mean_ncc = 0.94;
+  LidarOdometry accepted_two_mode_odometry(two_mode_quality_options);
+  assert(accepted_two_mode_odometry.processScan(world_points, 21.7).accepted);
+  const VisualUpdateResult accepted_two_mode_update =
+      accepted_two_mode_odometry.processVisual(
+          21.8, [](const Eigen::Isometry3d &)
+          {
+            VisualPoseLinearization linearization;
+            linearization.valid = true;
+            linearization.landmarks = 80;
+            linearization.residuals = 800;
+            linearization.rmse = 0.20;
+            linearization.mean_ncc = 0.95;
+            linearization.hessian = Eigen::Matrix<double, 6, 6>::Zero();
+            linearization.hessian(2, 2) = 1000.0;
+            linearization.hessian(3, 3) = 1000.0;
+            linearization.gradient(2) = 15.0;
+            linearization.gradient(3) = -20.0;
+            linearization.reason = "synthetic_two_mode_measurement";
+            return linearization;
+          });
+  assert(accepted_two_mode_update.accepted);
+  assert(accepted_two_mode_update.observable_directions == 2);
+
+  // A LiDAR-depth visual map can contribute altitude only when Z is an
+  // independently conditioned photometric direction. The automatic path is
+  // bounded over the entire ESKF update, not once per Gauss-Newton step.
+  LidarOdometryOptions gated_z_options = constrained_visual_options;
+  gated_z_options.visual_fuse_translation_z_when_observable = true;
+  gated_z_options.visual_z_min_projection = 0.92;
+  gated_z_options.visual_z_min_conditional_information_ratio = 0.20;
+  gated_z_options.visual_max_z_step = 0.015;
+  LidarOdometry gated_z_odometry(gated_z_options);
+  assert(gated_z_odometry.processScan(world_points, 22.0).accepted);
+  const Eigen::Vector3d gated_z_target(0.03, -0.02, 0.10);
+  const VisualUpdateResult gated_z_update = gated_z_odometry.processVisual(
+      22.1, [&gated_z_target](const Eigen::Isometry3d &pose)
+      {
+        VisualPoseLinearization linearization;
+        linearization.valid = true;
+        linearization.landmarks = 40;
+        linearization.residuals = 400;
+        linearization.rmse = 0.2;
+        linearization.mean_ncc = 0.95;
+        linearization.hessian = Eigen::Matrix<double, 6, 6>::Identity() * 1000.0;
+        linearization.gradient.tail<3>() = 1000.0 *
+            (pose.translation() - gated_z_target);
+        linearization.reason = "synthetic_gated_z_visual_measurement";
+        return linearization;
+      });
+  assert(gated_z_update.accepted);
+  assert(gated_z_update.z_observable);
+  assert(gated_z_update.z_fused);
+  assert(gated_z_update.z_projection > 0.99);
+  assert(gated_z_update.z_conditional_information_ratio > 0.99);
+  assert(std::abs(gated_z_update.z_correction) > 0.005);
+  assert(std::abs(gated_z_update.z_correction) <= 0.015 + 1e-8);
+
+  // A single yaw/XY/Z coupled image direction must not masquerade as a
+  // vertical measurement. The auto-Z gate re-projects the update onto the
+  // remaining yaw/XY subspace and leaves altitude to LiDAR/IMU.
+  LidarOdometry coupled_z_odometry(gated_z_options);
+  assert(coupled_z_odometry.processScan(world_points, 23.0).accepted);
+  const Eigen::Vector3d coupled_z_target(0.03, -0.02, 0.10);
+  const VisualUpdateResult coupled_z_update = coupled_z_odometry.processVisual(
+      23.1, [&coupled_z_target](const Eigen::Isometry3d &pose)
+      {
+        VisualPoseLinearization linearization;
+        linearization.valid = true;
+        linearization.landmarks = 40;
+        linearization.residuals = 400;
+        linearization.rmse = 0.2;
+        linearization.mean_ncc = 0.95;
+        linearization.hessian.setZero();
+        linearization.hessian(2, 2) = 1000.0;
+        linearization.hessian(3, 3) = 1000.0;
+        linearization.hessian(4, 4) = 1000.0;
+        linearization.hessian(3, 5) = 1000.0;
+        linearization.hessian(5, 3) = 1000.0;
+        linearization.hessian(5, 5) = 1000.0;
+        linearization.gradient(2) = 1000.0 *
+            std::atan2(pose.rotation()(1, 0), pose.rotation()(0, 0));
+        linearization.gradient.tail<3>() = 1000.0 *
+            (pose.translation() - coupled_z_target);
+        linearization.reason = "synthetic_coupled_z_visual_measurement";
+        return linearization;
+      });
+  assert(coupled_z_update.accepted);
+  assert(!coupled_z_update.z_fused);
+  assert(std::abs(coupled_z_update.z_correction) < 1e-8);
 
   PointVector unrelated_scan;
   unrelated_scan.reserve(world_points.size());
@@ -292,7 +547,7 @@ int main()
   }
   const Eigen::Isometry3d pose_before_rejection = lidar_odometry.pose();
   const std::size_t map_size_before_rejection = lidar_odometry.mapPointCount();
-  const LidarOdometryResult rejected_scan = lidar_odometry.processScan(unrelated_scan, 1.2);
+  const LidarOdometryResult rejected_scan = lidar_odometry.processScan(unrelated_scan, 1.3);
   assert(!rejected_scan.accepted);
   assert(!rejected_scan.map_updated);
   assert(lidar_odometry.mapPointCount() == map_size_before_rejection);
@@ -317,6 +572,10 @@ int main()
   inertial_options.imu_init_samples = 150;
   inertial_options.imu_init_require_stationary = true;
   inertial_options.imu_max_gap = 0.02;
+  inertial_options.imu_init_use_mean_covariance = true;
+  inertial_options.imu_init_gyro_bias_covariance_floor = 2e-8;
+  inertial_options.imu_init_acceleration_bias_covariance = 3e-5;
+  inertial_options.imu_init_gravity_covariance_floor = 4e-6;
   LidarOdometry inertial_odometry(inertial_options);
   const Eigen::Vector3d known_gyro_bias(0.010, -0.005, 0.002);
   for (int index = 0; index <= 1000; ++index)
@@ -330,6 +589,14 @@ int main()
   assert(inertial_odometry.imuInitialized());
   assert((inertial_odometry.gyroBias() - known_gyro_bias).norm() < 1e-6);
   assert((inertial_odometry.gravity() - Eigen::Vector3d(0.0, 0.0, -9.81)).norm() < 1e-6);
+  const Matrix18d &initialized_covariance = inertial_odometry.stateCovariance();
+  assert((initialized_covariance.block<3, 3>(9, 9).diagonal() -
+          Eigen::Vector3d::Constant(2e-8)).cwiseAbs().maxCoeff() < 1e-12);
+  assert((initialized_covariance.block<3, 3>(12, 12).diagonal() -
+          Eigen::Vector3d::Constant(3e-5)).cwiseAbs().maxCoeff() < 1e-12);
+  assert(std::abs(initialized_covariance(15, 15) - 4e-6) < 1e-12);
+  assert(std::abs(initialized_covariance(16, 16) - 4e-6) < 1e-12);
+  assert(initialized_covariance(17, 17) < 1e-8);
 
   LidarOdometryResult inertial_result = inertial_odometry.processScan(world_points, 12.0);
   assert(inertial_result.accepted);

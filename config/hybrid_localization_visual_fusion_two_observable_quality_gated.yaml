@@ -1,0 +1,7 @@
+# Street00 experiment: retain only well-supported two-direction direct-image
+# updates. Three-direction measurements continue to use the baseline gates.
+visual_frontend:
+  min_observable_directions: 2
+  two_mode_min_landmarks: 500
+  two_mode_max_rmse: 0.30
+  two_mode_min_mean_ncc: 0.95

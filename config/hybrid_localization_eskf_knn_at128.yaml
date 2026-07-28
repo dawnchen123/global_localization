@@ -1,0 +1,20 @@
+# Robust local-sample plane ablation. Restrict lookup to adjacent voxels so
+# every scan point can use the robust KNN fit within the 10 Hz CPU budget.
+lidar_odometry:
+  use_point_knn_plane: true
+  point_knn_fallback: false
+  normal_neighbor_voxels: 1
+  max_correspondence_distance: 0.80
+  max_plane_distance: 0.22
+  plane_fit_residual_gate: 0.10
+  max_plane_neighbors: 20
+
+  use_directional_lidar_covariance: true
+  lidar_normalized_huber_delta: 2.5
+  lidar_innovation_gate: 25.0
+  wheel_forward_innovation_gate: 25.0
+  covariance_reset_enabled: true
+  freeze_mature_voxels: true
+  map_insertion_min_translation: 0.20
+  map_insertion_min_rotation_deg: 0.8
+  map_insertion_max_interval: 0.50

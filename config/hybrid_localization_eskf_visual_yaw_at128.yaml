@@ -1,0 +1,22 @@
+# Ground-vehicle visual ablation: let direct patches correct only yaw. LiDAR,
+# wheel/NHC, and IMU retain ownership of translation, roll, pitch, and height.
+lidar_odometry:
+  use_directional_lidar_covariance: true
+  lidar_normalized_huber_delta: 2.5
+  lidar_innovation_gate: 25.0
+  wheel_forward_innovation_gate: 25.0
+  covariance_reset_enabled: true
+  freeze_mature_voxels: true
+  map_insertion_min_translation: 0.20
+  map_insertion_min_rotation_deg: 0.8
+  map_insertion_max_interval: 0.50
+
+visual_frontend:
+  information_scale: 0.20
+  fuse_roll_pitch: false
+  fuse_yaw: true
+  fuse_translation_xy: false
+  fuse_translation_z: false
+  fuse_translation_z_when_observable: false
+  min_observable_directions: 1
+  max_rotation_step_deg: 0.35

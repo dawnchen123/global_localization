@@ -1,0 +1,14 @@
+# Robust ESKF ablation profile for dense spinning LiDARs such as Hesai AT128.
+# Load this after the sensor calibration YAML through frontend_tuning_config.
+lidar_odometry:
+  use_directional_lidar_covariance: true
+  lidar_normalized_huber_delta: 2.5
+  # Scalar chi-square gates. These are intentionally sensor-time agnostic.
+  lidar_innovation_gate: 25.0
+  wheel_forward_innovation_gate: 25.0
+
+  covariance_reset_enabled: true
+  freeze_mature_voxels: true
+  map_insertion_min_translation: 0.20
+  map_insertion_min_rotation_deg: 0.8
+  map_insertion_max_interval: 0.50

@@ -74,6 +74,10 @@ measurement_scheduler:
   # scheduling rate so image work cannot starve the LiDAR/IMU frontend.
   camera_observation_interval_sec: 0.20
   reorder_window_sec: 0.02
+  # Wait for the next 50 Hz wheel sample so LiDAR updates see a deterministic
+  # nearest measurement. A LiDAR-time timeout prevents wheel dropout stalls.
+  wheel_wait_sec: 0.02
+  wheel_timeout_sec: 0.15
   max_queue: 400
 
 # Sparse LiDAR-depth visual map and direct photometric ESKF update.  The
@@ -90,7 +94,9 @@ visual_frontend:
   sam3_flow_scale: 0.5
   sam3_cache_duration_sec: 6.0
   sam3_label_sync_tolerance_sec: 0.08
-  sam3_max_source_age_sec: 3.0
+  # The visual mask is an estimator feedback path. Do not propagate a queued
+  # SAM3 result for seconds and use it to suppress current image patches.
+  sam3_max_source_age_sec: 0.75
   sam3_max_flow_pixels: 80.0
   sam3_max_cached_frames: 80
   sam3_max_replay_frames: 40
@@ -98,8 +104,9 @@ visual_frontend:
   fy: 1065.2546
   cx: 801.4049
   cy: 624.6878
-  # street00 compressed images are rectified by the camera pipeline. Enable
-  # only when subscribing to the original radial-tangential image stream.
+  # street00 records the left camera as a compressed raw pinhole-radtan
+  # stream. Rectify it once, then use the matching pinhole projection.
+  rectify_input: true
   apply_distortion: false
   image_width: 1600
   image_height: 1200
@@ -149,10 +156,10 @@ semantic_lidar_filter:
   # propagated label at the neighboring LiDAR scan without accepting a stale
   # SAM3 source result.
   sync_tolerance_sec: 0.30
-  # This applies to the original SAM3 frame, while the label itself is
-  # optical-flow propagated to sam3_propagated_stamp. Keep it no larger than
-  # the camera cache duration so delayed queue results cannot be reused.
-  max_source_age_sec: 6.0
+  # This applies to the original SAM3 frame. Optical flow only bridges a
+  # neighboring camera/LiDAR event; it must not revive a queued result from
+  # seconds earlier and remove static scan-matching structure.
+  max_source_age_sec: 0.75
   min_project_depth: 0.20
   support_radius_px: 1
   min_dynamic_support_ratio: 0.55
@@ -179,7 +186,12 @@ lidar_odometry:
   lidar_range_noise: 0.03
   lidar_beam_noise: 0.0015
   lidar_measurement_noise: 0.05
+  use_directional_lidar_covariance: false
   huber_delta: 0.15
+  # Positive values whiten the residual before Huber robustification and gate
+  # each plane match by scalar NIS. Zero keeps the historical behavior.
+  lidar_normalized_huber_delta: 0.0
+  lidar_innovation_gate: 0.0
   max_rmse: 0.30
   min_inlier_ratio: 0.15
   convergence_translation: 0.0015
@@ -191,6 +203,12 @@ lidar_odometry:
   map_insertion_min_observable_directions: 3
   map_insertion_max_mean_normalized_residual: 8.0
   preserve_unobservable_covariance: true
+  # Optional consistent degeneracy projection. Sensor profiles enable it only
+  # after a controlled trajectory comparison.
+  project_lidar_information_to_observable_subspace: false
+  # Optional mean-only protection against corrupting gyro bias with a
+  # scan-unobservable rotation. It remains off until sensor-profile A/B tests.
+  project_gyro_bias_update_to_observable_rotation: false
   solver_damping: 0.0000001
   max_translation_per_scan: 0.80
   max_rotation_per_scan_deg: 10.0
@@ -222,13 +240,36 @@ lidar_odometry:
   max_plane_neighbors: 20
   min_voxel_plane_points: 8
   max_voxel_points: 120
+  max_voxel_samples: 12
+  freeze_mature_voxels: false
+  map_insertion_min_translation: 0.0
+  map_insertion_min_rotation_deg: 0.0
+  map_insertion_max_interval: 0.0
+  covariance_reset_enabled: true
   max_plane_variance: 0.035
   plane_uncertainty_scale: 1.0
+  # Optional finite-plane support model. Sensor profiles can enable it after
+  # validation; zero values preserve the existing infinite-plane behavior.
+  plane_support_radius_scale: 0.0
+  plane_extrapolation_uncertainty_scale: 0.0
+  # Optional PCA plane-parameter covariance. This is kept off globally and
+  # enabled only in sensor profiles that pass trajectory A/B validation.
+  plane_parameter_uncertainty_scale: 0.0
+  # Optional two-stage fit for rejecting mixed neighboring surfaces. Sensor
+  # profiles enable it only after a controlled trajectory comparison.
+  smooth_voxel_robust_refit: false
+  # Bounded second-level map for root voxels that cannot form a stable plane.
+  # It remains disabled until a sensor profile passes trajectory A/B testing.
+  use_adaptive_subvoxel_plane: false
+  adaptive_subvoxel_scale: 0.5
+  adaptive_subvoxel_search_radius: 1
+  max_adaptive_subvoxels: 0
   # Use retained point samples when a sparse/new local-map area cannot form a
   # smooth voxel plane. Sensor-specific files set the strong-support recovery
   # thresholds because LiDAR density differs substantially.
   point_knn_fallback: true
   point_knn_fallback_max_queries: 0
+  compatible_voxel_search_radius: 0
   strong_support_min_correspondences: 0
   strong_support_min_azimuth_sectors: 4
   strong_support_max_rmse: 0.0
@@ -244,6 +285,7 @@ lidar_odometry:
   wheel_lateral_noise: 0.15
   wheel_vertical_noise: 0.25
   wheel_huber_delta: 1.5
+  wheel_forward_innovation_gate: 0.0
   wheel_buffer_duration: 5.0
 
   imu_init_duration: 1.5
@@ -252,6 +294,14 @@ lidar_odometry:
   imu_init_max_acc_std: 0.80
   imu_init_max_gyro_std: 0.08
   imu_init_max_gyro_bias: 0.20
+  # The stationary initializer estimates gyro bias and gravity from an IMU
+  # sample mean. Use covariance-of-the-mean instead of treating one-sample
+  # noise as uncertainty in the initialized hidden state.
+  imu_init_use_mean_covariance: false
+  imu_init_gyro_bias_covariance_floor: 1.0e-8
+  imu_init_acceleration_bias_covariance: 1.0e-4
+  imu_init_gravity_covariance_floor: 1.0e-6
+  imu_init_nonstationary_gravity_covariance: 1.0e-3
   gravity_magnitude: 9.81
   auto_acceleration_scale: true
   acceleration_scale: 1.0

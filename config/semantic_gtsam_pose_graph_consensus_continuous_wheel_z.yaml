@@ -1,0 +1,108 @@
+# Street00 A+C+D experiment profile.
+#
+# A: a visual revisit is only a proposal.  Two nearby LiDAR-verified returns
+# must agree before a single DCS-robust loop factor is inserted.
+# C: iSAM remains the estimator; only the live map-from-odom output is
+# rate-limited after an accepted correction.  Saved graph trajectories remain
+# the unfiltered optimized solution for fair EVO evaluation.
+# D: wheel and sequential ground-Z factors are weak, independently gated
+# supplements.  They do not replace the LiDAR/IMU frontend constraint.
+
+continuous_correction_enabled: true
+continuous_correction_max_xy_rate: 0.35
+continuous_correction_max_z_rate: 0.10
+continuous_correction_max_rotation_rate_deg: 1.0
+continuous_correction_reset_gap_sec: 5.0
+
+# The detector retains the original PnP/LiDAR gates but exposes a small set of
+# reference-diverse verified proposals. A multi-table ORB inverted index lets
+# high-response local features vote for a few far-away reference frames when
+# raw LIO drift makes the spatial radius miss a true revisit. Every proposal
+# still has to pass descriptor matching, PnP, LiDAR registration and graph
+# consensus.
+visual_loop:
+  retrieval_interval_sec: 3.0
+  maximum_retrieval_candidates: 60
+  maximum_geometric_candidates: 8
+  enable_global_retrieval_fallback: true
+  maximum_global_retrieval_candidates: 16
+  global_retrieval_feature_count: 450
+  global_retrieval_min_votes: 10
+  global_retrieval_min_table_count: 2
+  minimum_global_geometric_candidates: 2
+  # The vote count is only a retrieval ranking gate. PnP, LiDAR registration,
+  # multiframe support and DCS remain the false-positive protection.
+  maximum_verified_candidates: 3
+  candidate_reference_min_separation_sec: 25.0
+  pending_max_size: 32
+  pending_max_retries_per_tick: 3
+
+graph:
+  enable_wheel_factors: true
+  enable_sequential_ground_z: true
+
+  # PnP narrows LiDAR registration only; LiDAR mutual-NN/RANSAC/Huber and the
+  # support gate below still decide whether a loop reaches iSAM2.
+  visual_loop_lidar_use_pnp_seed: true
+  visual_loop_use_dcs: true
+  # The visual-fusion profile has sub-decimetre local sigmas.  A long-return
+  # closure starts with metre-scale accumulated drift, so use a larger DCS
+  # transition scale instead of treating a verified correction as an outlier
+  # before it can pull the graph back.
+  visual_loop_dcs_k: 9.0
+  # Allow spatially distinct return segments, but not a dense burst of
+  # correlated constraints from the same reference neighborhood.
+  visual_loop_minimum_interval_sec: 90.0
+  visual_loop_reference_neighborhood: 20
+  visual_loop_max_factors: 4
+  visual_loop_min_support: 2
+  visual_loop_support_reference_neighborhood: 20
+  # Street00 emits the first return pair twelve graph keyframes apart.  Six
+  # discarded that valid pair before it could form consensus.
+  visual_loop_support_current_max_gap: 16
+  visual_loop_support_max_correction_xy: 0.60
+  visual_loop_support_max_correction_yaw_deg: 1.00
+  visual_loop_support_max_correction_z: 0.20
+  # This guards only against a factor that is already incompatible with an
+  # existing graph correction.  The wider raw-PnP gate remains unchanged.
+  visual_loop_graph_consistency_max_xy: 3.00
+  visual_loop_graph_consistency_max_yaw_deg: 4.00
+  # The first long-return candidate measured a coherent 0.837 m vertical
+  # innovation with strong LiDAR geometry. Allow an accumulated drift to be
+  # corrected, but leave the per-loop ground-Z trust region below much smaller.
+  visual_loop_graph_consistency_max_z: 1.75
+  # The graph-side visual-fusion defaults describe short-baseline PnP.  Use
+  # a less overconfident covariance for a multi-frame LiDAR-confirmed return;
+  # DCS remains active above to suppress a residual that later disagrees.
+  visual_loop_sigma_xy: 0.40
+  visual_loop_sigma_yaw_deg: 1.50
+  visual_loop_sigma_z: 0.45
+  visual_loop_ground_z_sigma: 0.25
+  visual_loop_ground_z_max_step: 0.20
+  visual_loop_ground_z_clipped_sigma: 0.50
+
+  # Independent Ranger MINI arc-length factor.  Keep it weaker than the LIO
+  # relative factor and suppress a speed interval that disagrees with raw LIO.
+  wheel_sigma_base: 0.18
+  wheel_sigma_per_meter: 0.05
+  wheel_lateral_sigma: 0.28
+  wheel_min_raw_translation: 0.25
+  wheel_max_arc_disagreement: 0.45
+  wheel_max_relative_arc_disagreement: 0.45
+  wheel_use_dcs: true
+  wheel_dcs_k: 1.0
+
+  # A local ground observation must repeat over two consecutive keyframes.
+  # Each accepted residual is clipped, so a sloped or partially occluded patch
+  # cannot inject a large vertical step into the whole trajectory.
+  sequential_ground_sigma_z: 0.16
+  sequential_ground_interval: 1
+  sequential_ground_min_spread: 5.0
+  sequential_ground_min_spread_ratio: 0.10
+  sequential_ground_min_inlier_ratio: 0.45
+  sequential_ground_min_support: 2
+  sequential_ground_support_max_gap: 2
+  sequential_ground_support_max_z_disagreement: 0.12
+  sequential_ground_max_step: 0.08
+  sequential_ground_use_dcs: true
+  sequential_ground_dcs_k: 1.0

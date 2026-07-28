@@ -1,0 +1,24 @@
+# Robust AT128 ESKF plus a longer-lived direct visual map. This profile is an
+# ablation overlay loaded after hybrid_localization_visual_fusion.yaml.
+lidar_odometry:
+  use_directional_lidar_covariance: true
+  lidar_normalized_huber_delta: 2.5
+  lidar_innovation_gate: 25.0
+  wheel_forward_innovation_gate: 25.0
+  covariance_reset_enabled: true
+  freeze_mature_voxels: true
+  map_insertion_min_translation: 0.20
+  map_insertion_min_rotation_deg: 0.8
+  map_insertion_max_interval: 0.50
+
+visual_frontend:
+  update_interval_sec: 0.20
+  max_landmarks: 2000
+  max_active_landmarks: 550
+  max_missed_frames: 50
+  # Normalized patches tolerate exposure change; keeping the original
+  # reference prevents a rolling map from immediately absorbing pose drift.
+  reference_refresh_observations: 100000
+  information_scale: 0.12
+  max_translation_step: 0.08
+  max_rotation_step_deg: 0.8

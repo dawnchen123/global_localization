@@ -1,0 +1,8 @@
+# Controlled street00 experiment.  A loop reaches this profile only after PnP
+# proposes it and LiDAR mutual-NN, RANSAC/Huber registration, spatial-spread,
+# RMSE, PnP/LiDAR agreement, and raw-pose consistency gates all pass.  The
+# graph factor itself therefore must not suppress the multi-metre innovation
+# that a verified long-return loop is intended to correct.
+graph:
+  visual_loop_lidar_use_pnp_seed: true
+  visual_loop_huber_k: 0.0

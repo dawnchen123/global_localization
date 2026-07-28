@@ -1,0 +1,7 @@
+# Controlled street00 long-return experiment. PnP remains only a revisit
+# proposal: the graph still inserts a factor only after LiDAR mutual nearest
+# neighbours, RANSAC/Huber refinement, spread/RMSE gates, and raw-pose
+# consistency all pass. This avoids anchoring LiDAR geometry to drifted raw
+# odometry when validating the late revisit.
+graph:
+  visual_loop_lidar_use_pnp_seed: true

@@ -1,0 +1,11 @@
+# Controlled street00 experiment: local ground alignment counteracts vertical
+# drift only when the ground inliers cover a real spatial patch. The sampling
+# interval reduces correlation between adjacent keyframes. This is opt-in via
+# graph_tuning_config and does not alter the default visual-loop profile.
+graph:
+  enable_sequential_ground_z: true
+  sequential_ground_sigma_z: 0.12
+  sequential_ground_huber_k: 1.345
+  sequential_ground_interval: 3
+  sequential_ground_min_spread: 4.0
+  sequential_ground_min_spread_ratio: 0.08

@@ -1,0 +1,16 @@
+# Stage-2 frontend ablation: retain the robust map policy and prefer mature
+# same-surface voxel planes before falling back to the smooth neighborhood fit.
+lidar_odometry:
+  use_directional_lidar_covariance: true
+  lidar_normalized_huber_delta: 1.5
+  lidar_innovation_gate: 9.0
+  wheel_forward_innovation_gate: 16.0
+
+  covariance_reset_enabled: true
+  freeze_mature_voxels: true
+  map_insertion_min_translation: 0.20
+  map_insertion_min_rotation_deg: 0.8
+  map_insertion_max_interval: 0.50
+
+  use_compatible_voxel_plane: true
+  compatible_voxel_search_radius: 1

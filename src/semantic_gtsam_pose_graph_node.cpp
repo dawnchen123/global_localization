@@ -84,6 +84,22 @@ struct VisualCloudSample
   VisualLidarPointVector points;
 };
 
+// Image/depth loop verification runs in the registered-cloud callback.  The
+// matching graph keyframe can lag that callback by one or more frames, so keep
+// only the small, already-verified proposal until both graph keys exist.
+struct PendingVisualLoopConstraint
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  double reference_stamp = 0.0;
+  double current_stamp = 0.0;
+  Eigen::Isometry3d reference_from_current = Eigen::Isometry3d::Identity();
+  double quality = 0.0;
+};
+
+using PendingVisualLoopDeque =
+    std::deque<PendingVisualLoopConstraint,
+               Eigen::aligned_allocator<PendingVisualLoopConstraint>>;
+
 // Semantic point clouds can be delivered before their frontend odometry on a
 // separate ROS connection. Keep the source timestamp with the message so the
 // graph can associate it deterministically once odometry catches up.
@@ -128,6 +144,61 @@ double rotationDegrees(const Eigen::Matrix3d &rotation)
   const double cosine = std::max(-1.0, std::min(1.0,
       0.5 * (rotation.trace() - 1.0)));
   return std::acos(cosine) * 180.0 / std::acos(-1.0);
+}
+
+Eigen::Isometry3d projectToSE3(const Eigen::Isometry3d &pose)
+{
+  Eigen::Quaterniond quaternion(pose.rotation());
+  if (!std::isfinite(quaternion.norm()) || quaternion.norm() < 1e-9)
+  {
+    quaternion = Eigen::Quaterniond::Identity();
+  }
+  quaternion.normalize();
+  Eigen::Isometry3d result = Eigen::Isometry3d::Identity();
+  result.linear() = quaternion.toRotationMatrix();
+  result.translation() = pose.translation();
+  return result;
+}
+
+Eigen::Isometry3d rateLimitedCorrection(const Eigen::Isometry3d &current,
+                                        const Eigen::Isometry3d &target,
+                                        double maximum_xy_step,
+                                        double maximum_z_step,
+                                        double maximum_rotation_step_rad)
+{
+  Eigen::Isometry3d result = projectToSE3(current);
+  const Eigen::Vector2d xy_delta =
+      target.translation().head<2>() - current.translation().head<2>();
+  const double xy_distance = xy_delta.norm();
+  if (maximum_xy_step > 0.0 && xy_distance > maximum_xy_step && xy_distance > 1e-12)
+  {
+    result.translation().head<2>() = current.translation().head<2>() +
+        xy_delta * (maximum_xy_step / xy_distance);
+  }
+  else
+  {
+    result.translation().head<2>() = target.translation().head<2>();
+  }
+  const double z_delta = target.translation().z() - current.translation().z();
+  if (maximum_z_step > 0.0 && std::abs(z_delta) > maximum_z_step)
+  {
+    result.translation().z() = current.translation().z() +
+        (z_delta > 0.0 ? maximum_z_step : -maximum_z_step);
+  }
+  else
+  {
+    result.translation().z() = target.translation().z();
+  }
+  Eigen::Quaterniond current_q(current.rotation());
+  Eigen::Quaterniond target_q(target.rotation());
+  if (current_q.dot(target_q) < 0.0) target_q.coeffs() *= -1.0;
+  const Eigen::Matrix3d rotation_delta = current.rotation().transpose() * target.rotation();
+  const double angle = std::acos(std::max(-1.0, std::min(1.0,
+      0.5 * (rotation_delta.trace() - 1.0))));
+  const double ratio = maximum_rotation_step_rad > 0.0 && angle > maximum_rotation_step_rad &&
+      angle > 1e-12 ? maximum_rotation_step_rad / angle : 1.0;
+  result.linear() = current_q.slerp(ratio, target_q).normalized().toRotationMatrix();
+  return projectToSE3(result);
 }
 
 sensor_msgs::Image imageMessage(const cv::Mat &image, double stamp,
@@ -325,8 +396,16 @@ public:
     visual_loop_detector_.reset(new VisualLoopDetector(visual_loop_options_));
     odom_sub_ = nh_.subscribe(frontend_odom_topic_, 100,
                               &SemanticGtsamPoseGraphNode::odomCallback, this);
-    cloud_sub_ = nh_.subscribe(registered_cloud_topic_, 100,
-                               &SemanticGtsamPoseGraphNode::cloudCallback, this);
+    if (process_registered_clouds_ && !registered_cloud_topic_.empty())
+    {
+      cloud_sub_ = nh_.subscribe(registered_cloud_topic_, 100,
+                                 &SemanticGtsamPoseGraphNode::cloudCallback, this);
+    }
+    else
+    {
+      ROS_INFO("[semantic_gtsam] registered-cloud processing disabled; "
+               "publishing frontend odometry without cloud keyframes");
+    }
     if (subscribe_semantic_ && !semantic_cloud_topic_.empty())
     {
       semantic_sub_ = nh_.subscribe(semantic_cloud_topic_, 2,
@@ -443,6 +522,7 @@ private:
 
     private_nh_.param("subscribe_semantic", subscribe_semantic_, false);
     private_nh_.param("subscribe_camera", subscribe_camera_, false);
+    private_nh_.param("process_registered_clouds", process_registered_clouds_, true);
     private_nh_.param("visual_observation_only", visual_observation_only_, true);
     private_nh_.param("publish_visual_debug_images",
                       publish_visual_debug_images_, true);
@@ -467,6 +547,19 @@ private:
     private_nh_.param("semantic_map_publish_rate", semantic_map_publish_rate_, 0.20);
     private_nh_.param("semantic_map_voxel_size", semantic_map_voxel_size_, 0.30);
     private_nh_.param("semantic_map_max_points", semantic_map_max_points_, 120000);
+    // GTSAM remains the source of truth.  This optional output layer only
+    // rate-limits map-from-odom changes after an accepted global factor so a
+    // live controller or mapper does not receive a metre-scale jump in one
+    // odometry callback.
+    private_nh_.param("continuous_correction_enabled", continuous_correction_enabled_, false);
+    private_nh_.param("continuous_correction_max_xy_rate",
+                      continuous_correction_max_xy_rate_, 0.0);
+    private_nh_.param("continuous_correction_max_z_rate",
+                      continuous_correction_max_z_rate_, 0.0);
+    private_nh_.param("continuous_correction_max_rotation_rate_deg",
+                      continuous_correction_max_rotation_rate_deg_, 0.0);
+    private_nh_.param("continuous_correction_reset_gap_sec",
+                      continuous_correction_reset_gap_sec_, 5.0);
 
     max_pending_semantic_clouds_ = std::max(1, max_pending_semantic_clouds_);
     max_semantic_process_per_tick_ = std::max(1, max_semantic_process_per_tick_);
@@ -483,11 +576,11 @@ private:
     private_nh_.param("graph/enable_visual_loop_factors",
                       options_.enable_visual_loop_factors, false);
     private_nh_.param("graph/enable_semantic_observation_factors",
-                      options_.enable_semantic_observation_factors, true);
+                      options_.enable_semantic_observation_factors, false);
     private_nh_.param("graph/enable_semantic_observation_xy_factors",
-                      options_.enable_semantic_observation_xy_factors, true);
+                      options_.enable_semantic_observation_xy_factors, false);
     private_nh_.param("graph/enable_semantic_observation_z_factors",
-                      options_.enable_semantic_observation_z_factors, true);
+                      options_.enable_semantic_observation_z_factors, false);
     private_nh_.param("graph/semantic_observation_require_xy_for_z",
                       options_.semantic_observation_require_xy_for_z, true);
     private_nh_.param("graph/use_semantics", options_.use_semantics, true);
@@ -516,11 +609,17 @@ private:
     private_nh_.param("graph/semantic_observation_min_index_gap",
                       options_.semantic_observation_min_index_gap, 4);
     private_nh_.param("graph/semantic_observation_max_index_gap",
-                      options_.semantic_observation_max_index_gap, 30);
+                      options_.semantic_observation_max_index_gap, 0);
+    private_nh_.param("graph/semantic_observation_min_time_separation_sec",
+                      options_.semantic_observation_min_time_separation_sec, 90.0);
     private_nh_.param("graph/semantic_observation_max_reference_uses",
                       options_.semantic_observation_max_reference_uses, 0);
     private_nh_.param("graph/semantic_observation_interval",
                       options_.semantic_observation_interval, 1);
+    private_nh_.param("graph/semantic_observation_minimum_interval_sec",
+                      options_.semantic_observation_minimum_interval_sec, 180.0);
+    private_nh_.param("graph/semantic_observation_max_factors",
+                      options_.semantic_observation_max_factors, 2);
     private_nh_.param("graph/semantic_observation_min_features",
                       options_.semantic_observation_min_features, 80);
     private_nh_.param("graph/semantic_observation_min_inliers",
@@ -613,8 +712,27 @@ private:
     private_nh_.param("graph/loop_sigma_yaw_deg", options_.loop_sigma_yaw_deg, 0.45);
     private_nh_.param("graph/loop_sigma_z", options_.loop_sigma_z, 0.08);
     private_nh_.param("graph/sequential_ground_sigma_z", options_.sequential_ground_sigma_z, 0.06);
+    private_nh_.param("graph/sequential_ground_interval", options_.sequential_ground_interval, 1);
+    private_nh_.param("graph/sequential_ground_min_spread",
+                      options_.sequential_ground_min_spread, 0.0);
+    private_nh_.param("graph/sequential_ground_min_spread_ratio",
+                      options_.sequential_ground_min_spread_ratio, 0.0);
+    private_nh_.param("graph/sequential_ground_min_support",
+                      options_.sequential_ground_min_support, 1);
+    private_nh_.param("graph/sequential_ground_support_max_gap",
+                      options_.sequential_ground_support_max_gap, 2);
+    private_nh_.param("graph/sequential_ground_support_max_z_disagreement",
+                      options_.sequential_ground_support_max_z_disagreement, 0.0);
+    private_nh_.param("graph/sequential_ground_min_inlier_ratio",
+                      options_.sequential_ground_min_inlier_ratio, 0.0);
+    private_nh_.param("graph/sequential_ground_max_step",
+                      options_.sequential_ground_max_step, 0.0);
     private_nh_.param("graph/loop_huber_k", options_.loop_huber_k, 1.345);
     private_nh_.param("graph/sequential_ground_huber_k", options_.sequential_ground_huber_k, 1.345);
+    private_nh_.param("graph/sequential_ground_use_dcs",
+                      options_.sequential_ground_use_dcs, false);
+    private_nh_.param("graph/sequential_ground_dcs_k",
+                      options_.sequential_ground_dcs_k, 1.0);
     private_nh_.param("graph/wheel_speed_scale", options_.wheel_speed_scale, 0.9865);
     private_nh_.param("graph/wheel_max_gap", options_.wheel_max_gap, 0.08);
     private_nh_.param("graph/wheel_sigma_base", options_.wheel_sigma_base, 0.08);
@@ -622,6 +740,14 @@ private:
     private_nh_.param("graph/wheel_lateral_sigma", options_.wheel_lateral_sigma, 0.15);
     private_nh_.param("graph/wheel_huber_k", options_.wheel_huber_k, 1.345);
     private_nh_.param("graph/wheel_min_samples", options_.wheel_min_samples, 5);
+    private_nh_.param("graph/wheel_min_raw_translation",
+                      options_.wheel_min_raw_translation, 0.0);
+    private_nh_.param("graph/wheel_max_arc_disagreement",
+                      options_.wheel_max_arc_disagreement, 0.0);
+    private_nh_.param("graph/wheel_max_relative_arc_disagreement",
+                      options_.wheel_max_relative_arc_disagreement, 0.0);
+    private_nh_.param("graph/wheel_use_dcs", options_.wheel_use_dcs, false);
+    private_nh_.param("graph/wheel_dcs_k", options_.wheel_dcs_k, 1.0);
     private_nh_.param("graph/visual_max_time_offset", options_.visual_max_time_offset, 0.15);
     private_nh_.param("graph/visual_min_quality", options_.visual_min_quality, 0.30);
     private_nh_.param("graph/visual_max_angular_disagreement_deg",
@@ -647,9 +773,11 @@ private:
     private_nh_.param("graph/visual_loop_min_quality",
                       options_.visual_loop_min_quality, 0.40);
     private_nh_.param("graph/visual_loop_require_lidar_geometry",
-                      options_.visual_loop_require_lidar_geometry, false);
+                      options_.visual_loop_require_lidar_geometry, true);
     private_nh_.param("graph/visual_loop_min_quality_with_lidar_geometry",
                       options_.visual_loop_min_quality_with_lidar_geometry, 0.55);
+    private_nh_.param("graph/visual_loop_lidar_use_pnp_seed",
+                      options_.visual_loop_lidar_use_pnp_seed, false);
     private_nh_.param("graph/visual_loop_lidar_max_pnp_xy_disagreement",
                       options_.visual_loop_lidar_max_pnp_xy_disagreement, 1.20);
     private_nh_.param("graph/visual_loop_lidar_max_pnp_yaw_disagreement_deg",
@@ -676,6 +804,28 @@ private:
                       options_.visual_loop_quality_sigma_scale, 1.5);
     private_nh_.param("graph/visual_loop_huber_k",
                       options_.visual_loop_huber_k, 1.345);
+    private_nh_.param("graph/visual_loop_use_dcs",
+                      options_.visual_loop_use_dcs, false);
+    private_nh_.param("graph/visual_loop_dcs_k",
+                      options_.visual_loop_dcs_k, 1.0);
+    private_nh_.param("graph/visual_loop_min_support",
+                      options_.visual_loop_min_support, 1);
+    private_nh_.param("graph/visual_loop_support_reference_neighborhood",
+                      options_.visual_loop_support_reference_neighborhood, 16);
+    private_nh_.param("graph/visual_loop_support_current_max_gap",
+                      options_.visual_loop_support_current_max_gap, 5);
+    private_nh_.param("graph/visual_loop_support_max_correction_xy",
+                      options_.visual_loop_support_max_correction_xy, 0.0);
+    private_nh_.param("graph/visual_loop_support_max_correction_yaw_deg",
+                      options_.visual_loop_support_max_correction_yaw_deg, 0.0);
+    private_nh_.param("graph/visual_loop_support_max_correction_z",
+                      options_.visual_loop_support_max_correction_z, 0.0);
+    private_nh_.param("graph/visual_loop_graph_consistency_max_xy",
+                      options_.visual_loop_graph_consistency_max_xy, 0.0);
+    private_nh_.param("graph/visual_loop_graph_consistency_max_yaw_deg",
+                      options_.visual_loop_graph_consistency_max_yaw_deg, 0.0);
+    private_nh_.param("graph/visual_loop_graph_consistency_max_z",
+                      options_.visual_loop_graph_consistency_max_z, 0.0);
     private_nh_.param("graph/visual_loop_constrain_roll_pitch",
                       options_.visual_loop_constrain_roll_pitch, false);
     private_nh_.param("graph/visual_loop_refine_z_with_ground",
@@ -692,8 +842,28 @@ private:
                       options_.visual_loop_ground_z_max_mad, 0.08);
     private_nh_.param("graph/visual_loop_ground_z_max_correction",
                       options_.visual_loop_ground_z_max_correction, 1.50);
+    private_nh_.param("graph/visual_loop_ground_z_max_step",
+                      options_.visual_loop_ground_z_max_step, 0.0);
     private_nh_.param("graph/visual_loop_ground_z_sigma",
                       options_.visual_loop_ground_z_sigma, 0.15);
+    private_nh_.param("graph/visual_loop_ground_z_clipped_sigma",
+                      options_.visual_loop_ground_z_clipped_sigma, 0.50);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_min_inliers",
+                      options_.visual_loop_ground_z_sparse_min_inliers, 0);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_min_inlier_ratio",
+                      options_.visual_loop_ground_z_sparse_min_inlier_ratio, 0.0);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_min_spread",
+                      options_.visual_loop_ground_z_sparse_min_spread, 0.0);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_min_spread_ratio",
+                      options_.visual_loop_ground_z_sparse_min_spread_ratio, 0.0);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_max_mad",
+                      options_.visual_loop_ground_z_sparse_max_mad, 0.0);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_min_lidar_xy_inliers",
+                      options_.visual_loop_ground_z_sparse_min_lidar_xy_inliers, 0);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_max_lidar_xy_rmse",
+                      options_.visual_loop_ground_z_sparse_max_lidar_xy_rmse, 0.0);
+    private_nh_.param("graph/visual_loop_ground_z_sparse_min_lidar_xy_spread",
+                      options_.visual_loop_ground_z_sparse_min_lidar_xy_spread, 0.0);
     private_nh_.param("graph/isam_relinearize_threshold", options_.isam_relinearize_threshold, 0.05);
     private_nh_.param("graph/isam_relinearize_skip", options_.isam_relinearize_skip, 1);
 
@@ -813,11 +983,15 @@ private:
     private_nh_.param("visual_loop/minimum_depth_features",
                       visual_loop_options_.minimum_depth_features, 80);
     private_nh_.param("visual_loop/maximum_database_size",
-                      visual_loop_options_.maximum_database_size, 1000);
+                      visual_loop_options_.maximum_database_size, 1600);
+    private_nh_.param("visual_loop/debug_image_history_size",
+                      visual_loop_options_.debug_image_history_size, 96);
     private_nh_.param("visual_loop/keyframe_distance",
                       visual_loop_options_.keyframe_distance, 0.75);
     private_nh_.param("visual_loop/keyframe_interval_sec",
                       visual_loop_options_.keyframe_interval_sec, 1.0);
+    private_nh_.param("visual_loop/retrieval_interval_sec",
+                      visual_loop_options_.retrieval_interval_sec, 4.0);
     private_nh_.param("visual_loop/minimum_index_gap",
                       visual_loop_options_.minimum_index_gap, 25);
     private_nh_.param("visual_loop/minimum_time_separation_sec",
@@ -830,6 +1004,22 @@ private:
                       visual_loop_options_.maximum_retrieval_candidates, 40);
     private_nh_.param("visual_loop/maximum_geometric_candidates",
                       visual_loop_options_.maximum_geometric_candidates, 5);
+    private_nh_.param("visual_loop/enable_global_retrieval_fallback",
+                      visual_loop_options_.enable_global_retrieval_fallback, false);
+    private_nh_.param("visual_loop/maximum_global_retrieval_candidates",
+                      visual_loop_options_.maximum_global_retrieval_candidates, 0);
+    private_nh_.param("visual_loop/global_retrieval_feature_count",
+                      visual_loop_options_.global_retrieval_feature_count, 450);
+    private_nh_.param("visual_loop/global_retrieval_min_votes",
+                      visual_loop_options_.global_retrieval_min_votes, 10);
+    private_nh_.param("visual_loop/global_retrieval_min_table_count",
+                      visual_loop_options_.global_retrieval_min_table_count, 2);
+    private_nh_.param("visual_loop/minimum_global_geometric_candidates",
+                      visual_loop_options_.minimum_global_geometric_candidates, 0);
+    private_nh_.param("visual_loop/maximum_verified_candidates",
+                      visual_loop_options_.maximum_verified_candidates, 1);
+    private_nh_.param("visual_loop/candidate_reference_min_separation_sec",
+                      visual_loop_options_.candidate_reference_min_separation_sec, 0.0);
     private_nh_.param("visual_loop/descriptor_ratio",
                       visual_loop_options_.descriptor_ratio, 0.75);
     private_nh_.param("visual_loop/minimum_descriptor_matches",
@@ -860,6 +1050,11 @@ private:
                       visual_loop_options_.maximum_rotation_disagreement_deg, 10.0);
     private_nh_.param("visual_loop/minimum_quality",
                       visual_loop_options_.minimum_quality, 0.40);
+    private_nh_.param("visual_loop/pending_max_size", max_pending_visual_loops_, 24);
+    private_nh_.param("visual_loop/pending_max_retries_per_tick",
+                      max_pending_visual_loop_retries_per_tick_, 2);
+    private_nh_.param("visual_loop/pending_max_keyframe_lag_sec",
+                      visual_loop_pending_max_keyframe_lag_sec_, 3.0);
   }
 
   bool lookupOdom(double stamp, OdomSample *sample) const
@@ -882,10 +1077,61 @@ private:
     return true;
   }
 
+  Eigen::Isometry3d outputCorrection(const OdomSample &sample)
+  {
+    const Eigen::Isometry3d target = projectToSE3(
+        graph_->correctedPose(sample.pose) * sample.pose.inverse());
+    if (!target.matrix().allFinite()) return Eigen::Isometry3d::Identity();
+    target_map_from_odom_ = target;
+    if (!continuous_correction_enabled_)
+    {
+      applied_map_from_odom_ = target;
+      have_continuous_correction_ = true;
+      last_continuous_correction_stamp_ = sample.stamp;
+    }
+    else if (!have_continuous_correction_ ||
+             !std::isfinite(last_continuous_correction_stamp_) ||
+             sample.stamp + 1e-6 < last_continuous_correction_stamp_ ||
+             sample.stamp - last_continuous_correction_stamp_ >
+                 std::max(0.0, continuous_correction_reset_gap_sec_))
+    {
+      applied_map_from_odom_ = target;
+      have_continuous_correction_ = true;
+      last_continuous_correction_stamp_ = sample.stamp;
+    }
+    else
+    {
+      const double dt = std::max(0.0, sample.stamp - last_continuous_correction_stamp_);
+      if (dt > 0.0)
+      {
+        applied_map_from_odom_ = rateLimitedCorrection(
+            applied_map_from_odom_, target,
+            std::max(0.0, continuous_correction_max_xy_rate_) * dt,
+            std::max(0.0, continuous_correction_max_z_rate_) * dt,
+            std::max(0.0, continuous_correction_max_rotation_rate_deg_) *
+                std::acos(-1.0) / 180.0 * dt);
+        last_continuous_correction_stamp_ = sample.stamp;
+      }
+    }
+    const Eigen::Isometry3d lag = projectToSE3(
+        applied_map_from_odom_.inverse() * target_map_from_odom_);
+    correction_target_xy_ = target_map_from_odom_.translation().head<2>().norm();
+    correction_target_z_ = target_map_from_odom_.translation().z();
+    correction_target_rotation_deg_ = rotationDegrees(target_map_from_odom_.rotation());
+    correction_applied_xy_ = applied_map_from_odom_.translation().head<2>().norm();
+    correction_applied_z_ = applied_map_from_odom_.translation().z();
+    correction_applied_rotation_deg_ = rotationDegrees(applied_map_from_odom_.rotation());
+    correction_lag_xy_ = lag.translation().head<2>().norm();
+    correction_lag_z_ = std::abs(lag.translation().z());
+    correction_lag_rotation_deg_ = rotationDegrees(lag.rotation());
+    return applied_map_from_odom_;
+  }
+
   void publishCorrectedOdometry(const OdomSample &sample)
   {
     if (!graph_) return;
-    const Eigen::Isometry3d optimized = graph_->correctedPose(sample.pose);
+    const Eigen::Isometry3d correction = outputCorrection(sample);
+    const Eigen::Isometry3d optimized = projectToSE3(correction * sample.pose);
     nav_msgs::Odometry output = sample.message;
     const ros::Time stamp = sample.message.header.stamp.isZero() ?
         ros::Time(sample.stamp) : sample.message.header.stamp;
@@ -1144,50 +1390,195 @@ private:
         image.stamp, image.image, cloud.points, odom.pose);
     last_visual_loop_reason_ = result.reason;
     if (result.keyframe_created) ++visual_loop_keyframes_;
+    visual_loop_database_keyframes_ = static_cast<int>(visual_loop_detector_->keyframeCount());
     if (result.candidate_found) ++visual_loop_candidates_;
     last_visual_loop_matches_ = result.descriptor_matches;
     last_visual_loop_inliers_ = result.pnp_inliers;
     last_visual_loop_quality_ = result.quality;
     last_visual_loop_reprojection_rmse_ = result.reprojection_rmse;
+    visual_loop_global_retrieval_candidates_ +=
+        static_cast<std::uint64_t>(std::max(0, result.global_retrieval_candidates));
+    visual_loop_global_retrieval_descriptor_matches_ += static_cast<std::uint64_t>(
+        std::max(0, result.global_retrieval_descriptor_matches));
+    last_visual_loop_global_retrieval_ = result.global_retrieval;
+    last_visual_loop_global_retrieval_votes_ = result.global_retrieval_votes;
+    last_visual_loop_global_retrieval_tables_ = result.global_retrieval_tables;
     if (!result.debug_image.empty() && publish_visual_debug_images_)
     {
       visual_loop_debug_pub_.publish(imageMessage(
           result.debug_image, result.current_stamp, body_frame_));
     }
-    if (!result.accepted) return;
-    ++visual_loop_detector_accepts_;
-    last_accepted_visual_loop_reference_id_ = result.reference_id;
-    last_accepted_visual_loop_current_id_ = result.current_id;
-    last_accepted_visual_loop_matches_ = result.descriptor_matches;
-    last_accepted_visual_loop_inliers_ = result.pnp_inliers;
-    last_accepted_visual_loop_quality_ = result.quality;
-    last_accepted_visual_loop_reprojection_rmse_ = result.reprojection_rmse;
-    last_accepted_visual_loop_time_separation_sec_ = result.temporal_separation_sec;
-    last_accepted_visual_loop_xy_separation_ = result.raw_xy_separation;
-    last_accepted_visual_loop_z_separation_ = result.raw_z_separation;
-    const Eigen::Isometry3d pose_before_loop = graph_->correctedPose(odom.pose);
-    if (graph_->addVisualLoopConstraint(
-            result.reference_stamp, result.current_stamp,
-            result.reference_from_current, result.quality))
+    const auto &verified_candidates =
+        visual_loop_detector_->lastAcceptedCandidates();
+    if (verified_candidates.empty()) return;
+
+    // The detector returns only independently verified, reference-diverse
+    // PnP proposals. The first remains the primary debug result, while later
+    // candidates are a bounded fallback when that reference cannot enter the
+    // graph for a non-geometric reason such as cooldown.
+    visual_loop_detector_accepts_ += static_cast<int>(verified_candidates.size());
+    for (const VisualLoopResult &candidate : verified_candidates)
     {
-      ++visual_loop_graph_applied_;
-      last_visual_loop_reason_ = "visual_loop_applied";
-      const Eigen::Isometry3d pose_after_loop = graph_->correctedPose(odom.pose);
+      if (candidate.global_retrieval) ++visual_loop_global_retrieval_accepts_;
+    }
+    if (verified_candidates.size() > 1U)
+    {
+      visual_loop_alternative_candidates_ +=
+          static_cast<int>(verified_candidates.size() - 1U);
+    }
+    const VisualLoopResult &primary = verified_candidates.front();
+    last_accepted_visual_loop_reference_id_ = primary.reference_id;
+    last_accepted_visual_loop_current_id_ = primary.current_id;
+    last_accepted_visual_loop_matches_ = primary.descriptor_matches;
+    last_accepted_visual_loop_inliers_ = primary.pnp_inliers;
+    last_accepted_visual_loop_quality_ = primary.quality;
+    last_accepted_visual_loop_reprojection_rmse_ = primary.reprojection_rmse;
+    last_accepted_visual_loop_time_separation_sec_ = primary.temporal_separation_sec;
+    last_accepted_visual_loop_xy_separation_ = primary.raw_xy_separation;
+    last_accepted_visual_loop_z_separation_ = primary.raw_z_separation;
+
+    for (std::size_t index = 0U; index < verified_candidates.size(); ++index)
+    {
+      const VisualLoopResult &candidate = verified_candidates[index];
+      if (index > 0U) ++visual_loop_alternative_attempts_;
+      PendingVisualLoopConstraint constraint;
+      constraint.reference_stamp = candidate.reference_stamp;
+      constraint.current_stamp = candidate.current_stamp;
+      constraint.reference_from_current = candidate.reference_from_current;
+      constraint.quality = candidate.quality;
+      if (!visualLoopKeyframesReady(constraint))
+      {
+        // A pending candidate must preserve its future multi-frame support
+        // state. Queue only the best one; adjacent frames will regenerate
+        // alternatives once this pair reaches the graph keyframe timeline.
+        if (index == 0U) enqueueVisualLoop(constraint);
+        else ++visual_loop_alternative_pending_skips_;
+        publishStats();
+        break;
+      }
+      if (applyVisualLoopConstraint(constraint, &odom))
+      {
+        if (candidate.global_retrieval) ++visual_loop_global_retrieval_applied_;
+        if (index > 0U) ++visual_loop_alternative_applied_;
+        break;
+      }
+
+      // Once a candidate is collecting temporal support, evaluating another
+      // reference at the same current keyframe would reset that hypothesis.
+      // A graph-wide factor limit likewise makes all alternatives impossible.
+      const bool support_in_progress =
+          last_visual_loop_reason_ == "visual_loop_awaiting_multiframe_support" ||
+          last_visual_loop_reason_ == "visual_loop_multiframe_disagreement";
+      if (support_in_progress ||
+          last_visual_loop_reason_ == "visual_loop_factor_limit")
+      {
+        break;
+      }
+    }
+  }
+
+  bool visualLoopKeyframesReady(const PendingVisualLoopConstraint &constraint) const
+  {
+    return graph_ && graph_->hasKeyframeNear(constraint.reference_stamp) &&
+        graph_->hasKeyframeNear(constraint.current_stamp);
+  }
+
+  void enqueueVisualLoop(const PendingVisualLoopConstraint &constraint)
+  {
+    const auto duplicate = std::find_if(
+        pending_visual_loops_.begin(), pending_visual_loops_.end(),
+        [&](const PendingVisualLoopConstraint &candidate)
+        {
+          return std::abs(candidate.reference_stamp - constraint.reference_stamp) < 1e-6 &&
+              std::abs(candidate.current_stamp - constraint.current_stamp) < 1e-6;
+        });
+    if (duplicate != pending_visual_loops_.end()) return;
+    const std::size_t maximum = static_cast<std::size_t>(
+        std::max(1, max_pending_visual_loops_));
+    if (pending_visual_loops_.size() >= maximum)
+    {
+      ++visual_loop_graph_rejections_;
+      ++visual_loop_pending_drops_;
+      pending_visual_loops_.pop_front();
+    }
+    pending_visual_loops_.push_back(constraint);
+    ++visual_loop_pending_enqueued_;
+    last_visual_loop_reason_ = "visual_loop_waiting_for_keyframe";
+  }
+
+  bool applyVisualLoopConstraint(const PendingVisualLoopConstraint &constraint,
+                                 const OdomSample *current_odom)
+  {
+    if (!graph_) return false;
+    const Eigen::Isometry3d pose_before_loop = current_odom != nullptr ?
+        graph_->correctedPose(current_odom->pose) : Eigen::Isometry3d::Identity();
+    if (!graph_->addVisualLoopConstraint(
+            constraint.reference_stamp, constraint.current_stamp,
+            constraint.reference_from_current, constraint.quality))
+    {
+      const SemanticPoseGraphStats stats = graph_->stats();
+      last_visual_loop_reason_ = stats.last_visual_loop_reason.empty() ?
+          "visual_loop_graph_rejected" : stats.last_visual_loop_reason;
+      if (last_visual_loop_reason_ == "visual_loop_awaiting_multiframe_support")
+      {
+        ++visual_loop_graph_consensus_waits_;
+      }
+      else
+      {
+        ++visual_loop_graph_rejections_;
+      }
+      publishStats();
+      return false;
+    }
+    ++visual_loop_graph_applied_;
+    last_visual_loop_reason_ = "visual_loop_applied";
+    if (current_odom != nullptr)
+    {
+      const Eigen::Isometry3d pose_after_loop = graph_->correctedPose(current_odom->pose);
       const Eigen::Isometry3d correction = pose_before_loop.inverse() * pose_after_loop;
       last_visual_loop_correction_translation_ = correction.translation().norm();
       last_visual_loop_correction_rotation_deg_ = rotationDegrees(correction.rotation());
-      // The factor is inserted from the image/cloud queue, after this sample
-      // may already have been published by odomCallback. Re-emit it so the
-      // live odometry and path reflect the iSAM2 update immediately.
-      publishCorrectedOdometry(odom);
-      publishPath();
-      publishSemanticMap(false);
-      publishStats();
+      // A graph factor is inserted after this odometry sample can already be
+      // published. Re-emit it so live output reflects the iSAM2 update.
+      publishCorrectedOdometry(*current_odom);
     }
-    else
+    publishPath();
+    publishSemanticMap(false);
+    publishStats();
+    return true;
+  }
+
+  void processPendingVisualLoops()
+  {
+    int processed = 0;
+    const int maximum = std::max(1, max_pending_visual_loop_retries_per_tick_);
+    while (processed < maximum && !pending_visual_loops_.empty())
     {
-      ++visual_loop_graph_rejections_;
-      last_visual_loop_reason_ = "visual_loop_graph_rejected";
+      const PendingVisualLoopConstraint constraint = pending_visual_loops_.front();
+      if (!visualLoopKeyframesReady(constraint))
+      {
+        const double latest_keyframe_stamp = graph_ ? graph_->latestKeyframeStamp() :
+            std::numeric_limits<double>::quiet_NaN();
+        if (!std::isfinite(latest_keyframe_stamp) ||
+            latest_keyframe_stamp <= constraint.current_stamp +
+                std::max(0.0, visual_loop_pending_max_keyframe_lag_sec_))
+        {
+          break;
+        }
+        pending_visual_loops_.pop_front();
+        ++visual_loop_graph_rejections_;
+        ++visual_loop_pending_expired_;
+        last_visual_loop_reason_ = "visual_loop_keyframe_unavailable";
+        ++processed;
+        continue;
+      }
+      pending_visual_loops_.pop_front();
+      ++visual_loop_pending_retries_;
+      OdomSample odom;
+      const OdomSample *current_odom = lookupOdom(constraint.current_stamp, &odom) ?
+          &odom : nullptr;
+      applyVisualLoopConstraint(constraint, current_odom);
+      ++processed;
     }
   }
 
@@ -1379,9 +1770,9 @@ private:
       while (visual_cloud_queue_.size() > 6U) visual_cloud_queue_.pop_front();
       processVisualQueues();
     }
+    if (keyframe_added) processPendingVisualLoops();
 
-    const Eigen::Isometry3d corrected = graph_->correctedPose(odom.pose);
-    const Eigen::Isometry3d correction = corrected * odom.pose.inverse();
+    const Eigen::Isometry3d correction = outputCorrection(odom);
     corrected_cloud_pub_.publish(correctedCloudMessage(*message, map_points, correction));
     if (keyframe_added)
     {
@@ -1425,6 +1816,7 @@ private:
 
   void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &message)
   {
+    if (!process_registered_clouds_ || !message) return;
     pending_registered_clouds_.push_back(message);
     const std::size_t maximum = static_cast<std::size_t>(
         std::max(1, max_pending_registered_clouds_));
@@ -1532,7 +1924,13 @@ private:
     stream << "{\"keyframes\":" << stats.keyframes
            << ",\"odom_factors\":" << stats.odometry_factors
            << ",\"sequential_ground_factors\":" << stats.sequential_ground_factors
+           << ",\"sequential_ground_rejections\":" << stats.sequential_ground_rejections
+           << ",\"sequential_ground_support_waits\":"
+           << stats.sequential_ground_support_waits
+           << ",\"sequential_ground_support_confirmations\":"
+           << stats.sequential_ground_support_confirmations
            << ",\"wheel_factors\":" << stats.wheel_factors
+           << ",\"wheel_rejections\":" << stats.wheel_rejections
            << ",\"visual_rotation_factors\":" << stats.visual_rotation_factors
            << ",\"visual_translation_factors\":" << stats.visual_translation_factors
            << ",\"visual_rotation_rejections\":" << stats.visual_rotation_rejections
@@ -1541,6 +1939,10 @@ private:
            << ",\"visual_loop_factors\":" << stats.visual_loop_factors
            << ",\"visual_loop_ground_z_refinements\":"
            << stats.visual_loop_ground_z_refinements
+           << ",\"visual_loop_ground_z_clipped_refinements\":"
+           << stats.visual_loop_ground_z_clipped_refinements
+           << ",\"visual_loop_ground_z_sparse_refinements\":"
+           << stats.visual_loop_ground_z_sparse_refinements
            << ",\"visual_loop_cooldown_rejections\":"
            << stats.visual_loop_cooldown_rejections
            << ",\"visual_loop_factor_limit_rejections\":"
@@ -1549,35 +1951,108 @@ private:
            << stats.visual_loop_z_without_ground_suppressed
            << ",\"visual_loop_lidar_geometry_validations\":"
            << stats.visual_loop_lidar_geometry_validations
+           << ",\"visual_loop_lidar_seeded_validations\":"
+           << stats.visual_loop_lidar_seeded_validations
            << ",\"visual_loop_lidar_geometry_rejections\":"
            << stats.visual_loop_lidar_geometry_rejections
+           << ",\"visual_loop_support_waits\":" << stats.visual_loop_support_waits
+           << ",\"visual_loop_support_confirmations\":"
+           << stats.visual_loop_support_confirmations
+           << ",\"visual_loop_support_resets\":"
+           << stats.visual_loop_support_resets
+           << ",\"visual_loop_support_disagreements\":"
+           << stats.visual_loop_support_disagreements
+           << ",\"visual_loop_last_support\":" << stats.last_visual_loop_support
+           << ",\"visual_loop_support_xy_disagreement\":"
+           << metric(stats.last_visual_loop_support_xy_disagreement)
+           << ",\"visual_loop_support_yaw_disagreement_deg\":"
+           << metric(stats.last_visual_loop_support_yaw_disagreement_deg)
+           << ",\"visual_loop_support_z_disagreement\":"
+           << metric(stats.last_visual_loop_support_z_disagreement)
            << ",\"visual_loop_lidar_candidates\":"
            << stats.last_visual_loop_lidar_candidates
            << ",\"visual_loop_lidar_inliers\":"
            << stats.last_visual_loop_lidar_inliers
            << ",\"visual_loop_lidar_accepted\":"
            << (stats.last_visual_loop_lidar_accepted ? "true" : "false")
+           << ",\"visual_loop_lidar_seeded\":"
+           << (stats.last_visual_loop_lidar_seeded ? "true" : "false")
            << ",\"visual_loop_lidar_rmse\":"
            << metric(stats.last_visual_loop_lidar_rmse)
            << ",\"visual_loop_lidar_spread\":"
            << metric(stats.last_visual_loop_lidar_spread)
+           << ",\"visual_loop_lidar_pnp_xy_disagreement\":"
+           << metric(stats.last_visual_loop_lidar_pnp_xy_disagreement)
+           << ",\"visual_loop_lidar_pnp_yaw_disagreement_deg\":"
+           << metric(stats.last_visual_loop_lidar_pnp_yaw_disagreement_deg)
            << ",\"visual_loop_ground_z_candidates\":"
            << stats.last_visual_loop_ground_z_candidates
+           << ",\"visual_loop_ground_z_broad_candidates\":"
+           << stats.last_visual_loop_ground_z_broad_candidates
            << ",\"visual_loop_ground_z_inliers\":"
            << stats.last_visual_loop_ground_z_inliers
            << ",\"visual_loop_ground_z_accepted\":"
            << (stats.last_visual_loop_ground_z_accepted ? "true" : "false")
+           << ",\"visual_loop_ground_z_sparse_accepted\":"
+           << (stats.last_visual_loop_ground_z_sparse_accepted ? "true" : "false")
            << ",\"visual_loop_z_constrained\":"
            << (stats.last_visual_loop_z_constrained ? "true" : "false")
            << ",\"visual_loop_ground_z_correction\":"
            << metric(stats.last_visual_loop_ground_z_correction)
+           << ",\"visual_loop_ground_z_applied_correction\":"
+           << metric(stats.last_visual_loop_ground_z_applied_correction)
            << ",\"visual_loop_ground_z_mad\":"
            << metric(stats.last_visual_loop_ground_z_mad)
+           << ",\"visual_loop_ground_z_inlier_ratio\":"
+           << metric(stats.last_visual_loop_ground_z_inlier_ratio)
+           << ",\"visual_loop_ground_z_spread\":"
+           << metric(stats.last_visual_loop_ground_z_spread)
+           << ",\"visual_loop_ground_z_spread_ratio\":"
+           << metric(stats.last_visual_loop_ground_z_spread_ratio)
+           << ",\"visual_loop_graph_xy_innovation\":"
+           << metric(stats.last_visual_loop_graph_xy_innovation)
+           << ",\"visual_loop_graph_yaw_innovation_deg\":"
+           << metric(stats.last_visual_loop_graph_yaw_innovation_deg)
+           << ",\"visual_loop_graph_z_innovation\":"
+           << metric(stats.last_visual_loop_graph_z_innovation)
+           << ",\"visual_loop_graph_reason\":\""
+           << stats.last_visual_loop_reason << "\""
            << ",\"visual_loop_keyframes\":" << visual_loop_keyframes_
+           << ",\"visual_loop_database_keyframes\":"
+           << visual_loop_database_keyframes_
            << ",\"visual_loop_candidates\":" << visual_loop_candidates_
            << ",\"visual_loop_detector_accepts\":" << visual_loop_detector_accepts_
+           << ",\"visual_loop_alternative_candidates\":"
+           << visual_loop_alternative_candidates_
+           << ",\"visual_loop_alternative_attempts\":"
+           << visual_loop_alternative_attempts_
+           << ",\"visual_loop_alternative_applied\":"
+           << visual_loop_alternative_applied_
+           << ",\"visual_loop_alternative_pending_skips\":"
+           << visual_loop_alternative_pending_skips_
+           << ",\"visual_loop_global_retrieval_candidates\":"
+           << visual_loop_global_retrieval_candidates_
+           << ",\"visual_loop_global_retrieval_descriptor_matches\":"
+           << visual_loop_global_retrieval_descriptor_matches_
+           << ",\"visual_loop_global_retrieval_accepts\":"
+           << visual_loop_global_retrieval_accepts_
+           << ",\"visual_loop_global_retrieval_applied\":"
+           << visual_loop_global_retrieval_applied_
+           << ",\"visual_loop_last_global_retrieval\":"
+           << (last_visual_loop_global_retrieval_ ? "true" : "false")
+           << ",\"visual_loop_last_global_votes\":"
+           << last_visual_loop_global_retrieval_votes_
+           << ",\"visual_loop_last_global_tables\":"
+           << last_visual_loop_global_retrieval_tables_
            << ",\"visual_loop_graph_applied\":" << visual_loop_graph_applied_
            << ",\"visual_loop_graph_rejections\":" << visual_loop_graph_rejections_
+           << ",\"visual_loop_graph_consensus_waits\":"
+           << visual_loop_graph_consensus_waits_
+           << ",\"visual_loop_pending\":" << pending_visual_loops_.size()
+           << ",\"visual_loop_pending_enqueued\":" << visual_loop_pending_enqueued_
+           << ",\"visual_loop_pending_retries\":" << visual_loop_pending_retries_
+           << ",\"visual_loop_pending_expired\":" << visual_loop_pending_expired_
+           << ",\"visual_loop_pending_drops\":" << visual_loop_pending_drops_
            << ",\"visual_loop_pose_drops\":" << visual_loop_pose_drops_
            << ",\"visual_loop_matches\":" << last_visual_loop_matches_
            << ",\"visual_loop_inliers\":" << last_visual_loop_inliers_
@@ -1607,6 +2082,20 @@ private:
            << ",\"visual_loop_last_accepted_z_separation\":"
            << metric(last_accepted_visual_loop_z_separation_)
            << ",\"visual_loop_reason\":\"" << last_visual_loop_reason_ << "\""
+           << ",\"continuous_correction_enabled\":"
+           << (continuous_correction_enabled_ ? "true" : "false")
+           << ",\"correction_target_xy\":" << metric(correction_target_xy_)
+           << ",\"correction_target_z\":" << metric(correction_target_z_)
+           << ",\"correction_target_rotation_deg\":"
+           << metric(correction_target_rotation_deg_)
+           << ",\"correction_applied_xy\":" << metric(correction_applied_xy_)
+           << ",\"correction_applied_z\":" << metric(correction_applied_z_)
+           << ",\"correction_applied_rotation_deg\":"
+           << metric(correction_applied_rotation_deg_)
+           << ",\"correction_lag_xy\":" << metric(correction_lag_xy_)
+           << ",\"correction_lag_z\":" << metric(correction_lag_z_)
+           << ",\"correction_lag_rotation_deg\":"
+           << metric(correction_lag_rotation_deg_)
            << ",\"visual_observation_only\":"
            << (visual_observation_only_ ? "true" : "false")
            << ",\"visual_tracker_accepts\":" << visual_tracker_accepts_
@@ -1818,12 +2307,15 @@ private:
 
   bool subscribe_semantic_ = false;
   bool subscribe_camera_ = false;
+  bool process_registered_clouds_ = true;
   bool visual_observation_only_ = true;
   bool publish_visual_debug_images_ = true;
   bool semantic_cloud_in_map_frame_ = true;
   bool broadcast_tf_ = true;
   bool save_on_shutdown_ = true;
+  bool continuous_correction_enabled_ = false;
   bool have_output_ = false;
+  bool have_continuous_correction_ = false;
   double max_pose_lookup_dt_ = 0.15;
   double odom_history_sec_ = 120.0;
   double path_publish_rate_ = 0.5;
@@ -1831,6 +2323,21 @@ private:
   double semantic_map_voxel_size_ = 0.30;
   double camera_time_offset_ = 0.0;
   double visual_sync_tolerance_ = 0.06;
+  double continuous_correction_max_xy_rate_ = 0.0;
+  double continuous_correction_max_z_rate_ = 0.0;
+  double continuous_correction_max_rotation_rate_deg_ = 0.0;
+  double continuous_correction_reset_gap_sec_ = 5.0;
+  double last_continuous_correction_stamp_ =
+      std::numeric_limits<double>::quiet_NaN();
+  double correction_target_xy_ = 0.0;
+  double correction_target_z_ = 0.0;
+  double correction_target_rotation_deg_ = 0.0;
+  double correction_applied_xy_ = 0.0;
+  double correction_applied_z_ = 0.0;
+  double correction_applied_rotation_deg_ = 0.0;
+  double correction_lag_xy_ = 0.0;
+  double correction_lag_z_ = 0.0;
+  double correction_lag_rotation_deg_ = 0.0;
   double last_visual_time_difference_ = std::numeric_limits<double>::quiet_NaN();
   double latest_semantic_age_ = -1.0;
   int max_registered_points_ = 8000;
@@ -1851,11 +2358,28 @@ private:
   int visual_sync_drops_ = 0;
   int visual_decode_failures_ = 0;
   int visual_loop_keyframes_ = 0;
+  int visual_loop_database_keyframes_ = 0;
   int visual_loop_candidates_ = 0;
   int visual_loop_detector_accepts_ = 0;
+  int visual_loop_alternative_candidates_ = 0;
+  int visual_loop_alternative_attempts_ = 0;
+  int visual_loop_alternative_applied_ = 0;
+  int visual_loop_alternative_pending_skips_ = 0;
+  std::uint64_t visual_loop_global_retrieval_candidates_ = 0U;
+  std::uint64_t visual_loop_global_retrieval_descriptor_matches_ = 0U;
+  int visual_loop_global_retrieval_accepts_ = 0;
+  int visual_loop_global_retrieval_applied_ = 0;
   int visual_loop_graph_applied_ = 0;
   int visual_loop_graph_rejections_ = 0;
+  int visual_loop_graph_consensus_waits_ = 0;
   int visual_loop_pose_drops_ = 0;
+  int max_pending_visual_loops_ = 24;
+  int max_pending_visual_loop_retries_per_tick_ = 2;
+  double visual_loop_pending_max_keyframe_lag_sec_ = 3.0;
+  std::uint64_t visual_loop_pending_enqueued_ = 0U;
+  std::uint64_t visual_loop_pending_retries_ = 0U;
+  std::uint64_t visual_loop_pending_expired_ = 0U;
+  std::uint64_t visual_loop_pending_drops_ = 0U;
   int last_visual_loop_matches_ = 0;
   int last_visual_loop_inliers_ = 0;
   int last_accepted_visual_loop_reference_id_ = -1;
@@ -1885,6 +2409,9 @@ private:
   double last_visual_loop_quality_ = 0.0;
   double last_visual_loop_reprojection_rmse_ =
       std::numeric_limits<double>::quiet_NaN();
+  bool last_visual_loop_global_retrieval_ = false;
+  int last_visual_loop_global_retrieval_votes_ = 0;
+  int last_visual_loop_global_retrieval_tables_ = 0;
   double last_visual_loop_correction_translation_ =
       std::numeric_limits<double>::quiet_NaN();
   double last_visual_loop_correction_rotation_deg_ =
@@ -1913,6 +2440,9 @@ private:
   std::deque<VisualImageSample> visual_image_queue_;
   std::deque<VisualCloudSample, Eigen::aligned_allocator<VisualCloudSample>>
       visual_cloud_queue_;
+  PendingVisualLoopDeque pending_visual_loops_;
+  Eigen::Isometry3d target_map_from_odom_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d applied_map_from_odom_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d last_corrected_pose_ = Eigen::Isometry3d::Identity();
   ros::Time last_stamp_;
   ros::WallTime last_semantic_map_publish_wall_;

@@ -1,0 +1,18 @@
+# Dense smooth-plane ESKF ablation for AT128. The point budget remains below
+# the measured real-time limit while retaining more structure than the sensor
+# default profile.
+lidar_odometry:
+  scan_voxel_size: 0.24
+  map_insert_voxel_size: 0.15
+  max_scan_points: 9000
+  point_knn_fallback_max_queries: 1200
+
+  use_directional_lidar_covariance: true
+  lidar_normalized_huber_delta: 2.5
+  lidar_innovation_gate: 25.0
+  wheel_forward_innovation_gate: 25.0
+  covariance_reset_enabled: true
+  freeze_mature_voxels: true
+  map_insertion_min_translation: 0.20
+  map_insertion_min_rotation_deg: 0.8
+  map_insertion_max_interval: 0.50

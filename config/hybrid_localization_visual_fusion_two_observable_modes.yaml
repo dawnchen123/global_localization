@@ -1,0 +1,7 @@
+# Controlled street00 direct-visual ESKF experiment. The measurement is
+# already projected into its observable Hessian eigenspace before fusion. A
+# forward-looking road camera frequently observes two independent yaw/planar
+# combinations but not all three configured visual axes. Keep the third axis
+# protected by the projection and accept the two well-conditioned modes.
+visual_frontend:
+  min_observable_directions: 2

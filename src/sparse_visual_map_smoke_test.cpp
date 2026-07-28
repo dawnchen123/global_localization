@@ -31,6 +31,27 @@ int main()
   options.local_map_radius = 100.0;
   SparseVisualMap visual_map(options);
 
+  // Pixel sampling must remain in the exact same camera model used by the
+  // projection/Jacobian. A pre-rectified stream and an intentionally raw
+  // radial-tangential stream must both retain their own pixel coordinates.
+  cv::Mat calibration_probe(240, 320, CV_8U, cv::Scalar(0));
+  calibration_probe.at<uint8_t>(24, 24) = 255U;
+  SparseVisualMapOptions probe_options = options;
+  probe_options.distortion = {{-0.15, 0.09, 0.001, -0.001, -0.02}};
+  probe_options.rectify_input = false;
+  probe_options.apply_distortion = false;
+  SparseVisualMap rectified_probe_map(probe_options);
+  const SparseVisualFrame rectified_probe = rectified_probe_map.prepareFrame(
+      0.5, calibration_probe);
+  assert(rectified_probe.valid());
+  assert(rectified_probe.gray.at<float>(24, 24) == 255.0F);
+  probe_options.apply_distortion = true;
+  SparseVisualMap raw_probe_map(probe_options);
+  const SparseVisualFrame raw_probe = raw_probe_map.prepareFrame(0.5,
+                                                                   calibration_probe);
+  assert(raw_probe.valid());
+  assert(raw_probe.gray.at<float>(24, 24) == 255.0F);
+
   cv::Mat image(240, 320, CV_8U);
   for (int row = 0; row < image.rows; ++row)
   {
@@ -99,6 +120,7 @@ int main()
   // point, while the calibrated model must reproduce the same reference view.
   SparseVisualMapOptions distorted_options = options;
   distorted_options.distortion = {{-0.15, 0.09, 0.001, -0.001, -0.02}};
+  distorted_options.rectify_input = false;
   distorted_options.apply_distortion = true;
   SparseVisualMap distorted_map(distorted_options);
   cv::Mat distorted_image(image.size(), CV_8U, cv::Scalar(0));

@@ -284,6 +284,7 @@ struct MatchResult
   int xy_candidates = 0;
   int xy_inliers = 0;
   int z_candidates = 0;
+  int z_broad_candidates = 0;
   int z_inliers = 0;
   double xy_rmse = std::numeric_limits<double>::infinity();
   double xy_inlier_ratio = 0.0;
@@ -291,6 +292,9 @@ struct MatchResult
   double spread_ratio = 0.0;
   double z_median = 0.0;
   double z_mad = std::numeric_limits<double>::infinity();
+  double z_inlier_ratio = 0.0;
+  double z_spread = 0.0;
+  double z_spread_ratio = 0.0;
   double descriptor_similarity = 0.0;
   double score = -std::numeric_limits<double>::infinity();
   std::string reason = "not_matched";
@@ -310,6 +314,22 @@ struct GenericLoopSupport
   int reference_id = -1;
   int last_current_id = -1;
   int support = 0;
+};
+
+struct VisualLoopSupport
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  int reference_id = -1;
+  int last_current_id = -1;
+  int support = 0;
+  Eigen::Isometry3d map_from_raw = Eigen::Isometry3d::Identity();
+};
+
+struct SequentialGroundSupport
+{
+  int last_current_id = -1;
+  int support = 0;
+  double z_correction = 0.0;
 };
 
 class SpatialIndex
@@ -846,6 +866,7 @@ void evaluateZ(const Keyframe &reference, const Keyframe &current,
     if (std::abs(pair.residual) <= options.z_candidate_residual_gate)
     {
       broad_residuals.push_back(pair.residual);
+      ++result->z_broad_candidates;
       pair.stage = DebugPairStage::Candidate;
     }
     else
@@ -874,9 +895,12 @@ void evaluateZ(const Keyframe &reference, const Keyframe &current,
     }
   }
   result->z_inliers = static_cast<int>(inlier_residuals.size());
+  result->z_inlier_ratio = result->z_candidates > 0 ?
+      static_cast<double>(result->z_inliers) / static_cast<double>(result->z_candidates) : 0.0;
   result->z_median = inlier_residuals.empty() ? center : median(inlier_residuals);
   result->z_mad = inlier_residuals.empty() ? std::numeric_limits<double>::infinity()
                                            : mad(inlier_residuals, result->z_median);
+  computeSpread(pairs, xy_measurement, &result->z_spread, &result->z_spread_ratio);
   result->z_accepted = result->z_inliers >= options.min_z_inliers &&
       std::abs(result->z_median) <= options.max_z_correction &&
       result->z_mad <= options.max_z_mad;
@@ -884,11 +908,14 @@ void evaluateZ(const Keyframe &reference, const Keyframe &current,
 }
 
 MatchResult matchKeyframes(const Keyframe &reference, const Keyframe &current,
-                           const SemanticPoseGraphOptions &options)
+                           const SemanticPoseGraphOptions &options,
+                           const Eigen::Isometry3d *initial_measurement = nullptr)
 {
   MatchResult result;
   result.valid = true;
-  result.measurement = reference.raw_pose.inverse() * current.raw_pose;
+  result.measurement = initial_measurement != nullptr ?
+      projectToSE3(*initial_measurement) :
+      reference.raw_pose.inverse() * current.raw_pose;
   result.descriptor_similarity = descriptorSimilarity(reference.descriptor, current.descriptor);
   const Eigen::Isometry3d raw = result.measurement;
   double coarse_score = 0.0;
@@ -982,6 +1009,21 @@ gtsam::SharedNoiseModel robustDiagonal(const gtsam::Vector6 &sigmas, double hube
       gtsam::noiseModel::mEstimator::Huber::Create(huber_k), diagonal);
 }
 
+gtsam::SharedNoiseModel robustDiagonalWithDcs(const gtsam::Vector6 &sigmas,
+                                               double huber_k, bool use_dcs,
+                                               double dcs_k)
+{
+  const auto diagonal = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
+  if (use_dcs && dcs_k > 0.0)
+  {
+    return gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::DCS::Create(dcs_k), diagonal);
+  }
+  if (huber_k <= 0.0) return diagonal;
+  return gtsam::noiseModel::Robust::Create(
+      gtsam::noiseModel::mEstimator::Huber::Create(huber_k), diagonal);
+}
+
 Eigen::Isometry3d interpolateTransform(const Eigen::Isometry3d &first,
                                       const Eigen::Isometry3d &second, double ratio)
 {
@@ -1014,6 +1056,16 @@ struct SemanticPoseGraph::Impl
     isam.reset(new gtsam::ISAM2(parameters));
   }
 
+  bool optimizationEnabled() const
+  {
+    return options.enable_xy_loops || options.enable_z_loops ||
+        options.enable_sequential_ground_z || options.enable_wheel_factors ||
+        options.enable_visual_rotation_factors || options.enable_visual_loop_factors ||
+        (options.enable_semantic_observation_factors &&
+         (options.enable_semantic_observation_xy_factors ||
+          options.enable_semantic_observation_z_factors));
+  }
+
   void updateOptimizedPoses()
   {
     if (keyframes.empty()) return;
@@ -1029,6 +1081,7 @@ struct SemanticPoseGraph::Impl
 
   Eigen::Isometry3d effectivePose(const Keyframe &keyframe) const
   {
+    if (!optimizationEnabled()) return keyframe.raw_pose;
     if (stats.wheel_factors > 0 || stats.visual_rotation_factors > 0 ||
         stats.visual_loop_factors > 0 ||
         stats.xy_loop_factors >= options.min_loops_for_xy_output ||
@@ -1059,40 +1112,172 @@ struct SemanticPoseGraph::Impl
     return &*nearest;
   }
 
+  bool visualLoopGraphConsistency(const Keyframe &reference, const Keyframe &current,
+                                  const Eigen::Isometry3d &measurement)
+  {
+    const Eigen::Isometry3d predicted = projectToSE3(
+        effectivePose(reference).inverse() * effectivePose(current));
+    const Eigen::Isometry3d innovation = projectToSE3(predicted.inverse() * measurement);
+    const double xy = innovation.translation().head<2>().norm();
+    const double yaw = std::abs(wrapAngle(yawOf(innovation)));
+    const double z = std::abs(innovation.translation().z());
+    stats.last_visual_loop_graph_xy_innovation = xy;
+    stats.last_visual_loop_graph_yaw_innovation_deg = yaw * 180.0 / kPi;
+    stats.last_visual_loop_graph_z_innovation = z;
+    if (!std::isfinite(xy) || !std::isfinite(yaw) || !std::isfinite(z)) return false;
+    if (options.visual_loop_graph_consistency_max_xy > 0.0 &&
+        xy > options.visual_loop_graph_consistency_max_xy)
+    {
+      return false;
+    }
+    if (options.visual_loop_graph_consistency_max_yaw_deg > 0.0 &&
+        yaw > options.visual_loop_graph_consistency_max_yaw_deg * kPi / 180.0)
+    {
+      return false;
+    }
+    if (options.visual_loop_graph_consistency_max_z > 0.0 &&
+        z > options.visual_loop_graph_consistency_max_z)
+    {
+      return false;
+    }
+    return true;
+  }
+
+  bool visualLoopHasMultiframeSupport(const Keyframe &reference, const Keyframe &current,
+                                      const Eigen::Isometry3d &measurement,
+                                      std::string *reason)
+  {
+    const int minimum_support = std::max(1, options.visual_loop_min_support);
+    if (minimum_support <= 1)
+    {
+      stats.last_visual_loop_support = 1;
+      stats.last_visual_loop_support_xy_disagreement = 0.0;
+      stats.last_visual_loop_support_yaw_disagreement_deg = 0.0;
+      stats.last_visual_loop_support_z_disagreement = 0.0;
+      return true;
+    }
+    const Eigen::Isometry3d map_from_raw = projectToSE3(
+        reference.raw_pose * measurement * current.raw_pose.inverse());
+    if (!map_from_raw.matrix().allFinite())
+    {
+      if (reason) *reason = "visual_loop_multiframe_invalid_correction";
+      return false;
+    }
+    const int reference_neighborhood =
+        std::max(0, options.visual_loop_support_reference_neighborhood);
+    const int current_gap = std::max(1, options.visual_loop_support_current_max_gap);
+    const bool same_hypothesis = visual_loop_support.support > 0 &&
+        std::abs(reference.id - visual_loop_support.reference_id) <= reference_neighborhood &&
+        current.id > visual_loop_support.last_current_id &&
+        current.id - visual_loop_support.last_current_id <= current_gap;
+    const auto restart = [&]()
+    {
+      if (visual_loop_support.support > 0) ++stats.visual_loop_support_resets;
+      visual_loop_support.reference_id = reference.id;
+      visual_loop_support.last_current_id = current.id;
+      visual_loop_support.support = 1;
+      visual_loop_support.map_from_raw = map_from_raw;
+      stats.last_visual_loop_support = visual_loop_support.support;
+      stats.last_visual_loop_support_xy_disagreement = 0.0;
+      stats.last_visual_loop_support_yaw_disagreement_deg = 0.0;
+      stats.last_visual_loop_support_z_disagreement = 0.0;
+    };
+    if (!same_hypothesis)
+    {
+      restart();
+      ++stats.visual_loop_support_waits;
+      if (reason) *reason = "visual_loop_awaiting_multiframe_support";
+      return false;
+    }
+
+    const Eigen::Isometry3d support_delta = projectToSE3(
+        visual_loop_support.map_from_raw.inverse() * map_from_raw);
+    const double xy = support_delta.translation().head<2>().norm();
+    const double yaw = std::abs(wrapAngle(yawOf(support_delta)));
+    const double z = std::abs(support_delta.translation().z());
+    stats.last_visual_loop_support_xy_disagreement = xy;
+    stats.last_visual_loop_support_yaw_disagreement_deg = yaw * 180.0 / kPi;
+    stats.last_visual_loop_support_z_disagreement = z;
+    const bool valid = std::isfinite(xy) && std::isfinite(yaw) && std::isfinite(z);
+    const bool xy_accepted = options.visual_loop_support_max_correction_xy <= 0.0 ||
+        xy <= options.visual_loop_support_max_correction_xy;
+    const bool yaw_accepted = options.visual_loop_support_max_correction_yaw_deg <= 0.0 ||
+        yaw <= options.visual_loop_support_max_correction_yaw_deg * kPi / 180.0;
+    const bool z_accepted = options.visual_loop_support_max_correction_z <= 0.0 ||
+        z <= options.visual_loop_support_max_correction_z;
+    if (!valid || !xy_accepted || !yaw_accepted || !z_accepted)
+    {
+      ++stats.visual_loop_support_disagreements;
+      restart();
+      if (reason) *reason = "visual_loop_multiframe_disagreement";
+      return false;
+    }
+
+    const int previous_support = visual_loop_support.support;
+    const int updated_support = std::min(minimum_support, previous_support + 1);
+    visual_loop_support.map_from_raw = interpolateTransform(
+        visual_loop_support.map_from_raw, map_from_raw,
+        1.0 / static_cast<double>(std::max(1, previous_support + 1)));
+    visual_loop_support.last_current_id = current.id;
+    visual_loop_support.support = updated_support;
+    stats.last_visual_loop_support = updated_support;
+    if (updated_support < minimum_support)
+    {
+      ++stats.visual_loop_support_waits;
+      if (reason) *reason = "visual_loop_awaiting_multiframe_support";
+      return false;
+    }
+    ++stats.visual_loop_support_confirmations;
+    return true;
+  }
+
   bool addVisualLoopConstraint(double reference_stamp, double current_stamp,
                                const Eigen::Isometry3d &reference_from_current,
                                double quality)
   {
-    if (!options.enable_visual_loop_factors) return false;
+    if (!options.enable_visual_loop_factors)
+    {
+      stats.last_visual_loop_reason = "visual_loop_disabled";
+      return false;
+    }
     ++stats.visual_loop_attempts;
+    const auto reject = [this](const std::string &reason)
+    {
+      stats.last_visual_loop_reason = reason;
+      ++stats.visual_loop_rejections;
+      return false;
+    };
     const bool visual_quality_accepted = quality >= options.visual_loop_min_quality;
     const bool lidar_validated_quality_accepted =
         options.visual_loop_require_lidar_geometry &&
         quality >= options.visual_loop_min_quality_with_lidar_geometry;
     if (!std::isfinite(reference_stamp) || !std::isfinite(current_stamp) ||
-        !std::isfinite(quality) || !reference_from_current.matrix().allFinite() ||
-        (!visual_quality_accepted && !lidar_validated_quality_accepted) ||
-        current_stamp <= reference_stamp ||
+        !std::isfinite(quality) || !reference_from_current.matrix().allFinite())
+    {
+      return reject("visual_loop_invalid_input");
+    }
+    if (!visual_quality_accepted && !lidar_validated_quality_accepted)
+    {
+      return reject("visual_loop_quality_gate");
+    }
+    if (current_stamp <= reference_stamp ||
         current_stamp - reference_stamp <
             std::max(0.0, options.visual_loop_min_time_separation_sec))
     {
-      ++stats.visual_loop_rejections;
-      return false;
+      return reject("visual_loop_temporal_gate");
     }
     const Keyframe *reference = nearestKeyframe(reference_stamp);
     const Keyframe *current = nearestKeyframe(current_stamp);
     if (reference == nullptr || current == nullptr ||
         current->id - reference->id < options.visual_loop_min_index_gap)
     {
-      ++stats.visual_loop_rejections;
-      return false;
+      return reject("visual_loop_keyframe_lookup_gate");
     }
     if (options.visual_loop_max_factors > 0 &&
         stats.visual_loop_factors >= options.visual_loop_max_factors)
     {
-      ++stats.visual_loop_rejections;
       ++stats.visual_loop_factor_limit_rejections;
-      return false;
+      return reject("visual_loop_factor_limit");
     }
     const bool same_reference_event = last_visual_loop_reference_id >= 0 &&
         std::abs(reference->id - last_visual_loop_reference_id) <=
@@ -1102,9 +1287,8 @@ struct SemanticPoseGraph::Impl
          current->stamp - last_visual_loop_factor_stamp <
              std::max(0.0, options.visual_loop_minimum_interval_sec)))
     {
-      ++stats.visual_loop_rejections;
       ++stats.visual_loop_cooldown_rejections;
-      return false;
+      return reject("visual_loop_cooldown");
     }
     Eigen::Isometry3d measurement = projectToSE3(reference_from_current);
     MatchResult lidar_geometry;
@@ -1114,16 +1298,28 @@ struct SemanticPoseGraph::Impl
     stats.last_visual_loop_lidar_rmse = 0.0;
     stats.last_visual_loop_lidar_spread = 0.0;
     stats.last_visual_loop_lidar_accepted = false;
+    stats.last_visual_loop_lidar_seeded = options.visual_loop_lidar_use_pnp_seed;
+    stats.last_visual_loop_lidar_pnp_xy_disagreement = 0.0;
+    stats.last_visual_loop_lidar_pnp_yaw_disagreement_deg = 0.0;
     if (options.visual_loop_require_lidar_geometry)
     {
       ++stats.visual_loop_lidar_geometry_validations;
+      const Eigen::Isometry3d *geometry_seed = nullptr;
+      if (options.visual_loop_lidar_use_pnp_seed)
+      {
+        // PnP only initializes the LiDAR search near a long-return proposal.
+        // Mutual-NN, RANSAC/Huber, spatial spread, RMSE, and raw-pose gates
+        // below remain independent acceptance tests.
+        geometry_seed = &measurement;
+        ++stats.visual_loop_lidar_seeded_validations;
+      }
       // Reuse the existing one-to-one mutual-NN, RANSAC, and Huber matcher as
       // an independent verifier. Generic LiDAR loops remain disabled as a
       // proposal source; this path is reachable only from a visual candidate.
       SemanticPoseGraphOptions geometry_options = options;
       geometry_options.enable_xy_loops = true;
       geometry_options.enable_z_loops = false;
-      lidar_geometry = matchKeyframes(*reference, *current, geometry_options);
+      lidar_geometry = matchKeyframes(*reference, *current, geometry_options, geometry_seed);
       stats.last_visual_loop_lidar_candidates = lidar_geometry.xy_candidates;
       stats.last_visual_loop_lidar_inliers = lidar_geometry.xy_inliers;
       stats.last_visual_loop_lidar_rmse = lidar_geometry.xy_rmse;
@@ -1134,8 +1330,7 @@ struct SemanticPoseGraph::Impl
         lidar_geometry.reason = "visual_loop_lidar_geometry_" + lidar_geometry.reason;
         populateDebug(*reference, *current, lidar_geometry, false);
         ++stats.visual_loop_lidar_geometry_rejections;
-        ++stats.visual_loop_rejections;
-        return false;
+        return reject(lidar_geometry.reason);
       }
       const Eigen::Isometry3d pnp_from_lidar = projectToSE3(
           lidar_geometry.measurement.inverse() * measurement);
@@ -1143,6 +1338,9 @@ struct SemanticPoseGraph::Impl
           pnp_from_lidar.translation().head<2>().norm();
       const double pnp_yaw_disagreement = std::abs(wrapAngle(
           yawOf(measurement) - yawOf(lidar_geometry.measurement)));
+      stats.last_visual_loop_lidar_pnp_xy_disagreement = pnp_xy_disagreement;
+      stats.last_visual_loop_lidar_pnp_yaw_disagreement_deg =
+          pnp_yaw_disagreement * 180.0 / kPi;
       if (!std::isfinite(pnp_xy_disagreement) || !std::isfinite(pnp_yaw_disagreement) ||
           pnp_xy_disagreement > options.visual_loop_lidar_max_pnp_xy_disagreement ||
           pnp_yaw_disagreement > options.visual_loop_lidar_max_pnp_yaw_disagreement_deg *
@@ -1152,30 +1350,28 @@ struct SemanticPoseGraph::Impl
         populateDebug(*reference, *current, lidar_geometry, false);
         stats.last_visual_loop_lidar_accepted = false;
         ++stats.visual_loop_lidar_geometry_rejections;
-        ++stats.visual_loop_rejections;
-        return false;
+        return reject(lidar_geometry.reason);
       }
       measurement = lidar_geometry.measurement;
       lidar_geometry_verified = true;
     }
 
-    const std::uint64_t pair_key =
-        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(reference->id)) << 32U) |
-        static_cast<std::uint32_t>(current->id);
-    if (!visual_loop_pairs.insert(pair_key).second)
-    {
-      ++stats.visual_loop_rejections;
-      return false;
-    }
-
     MatchResult ground_z;
     bool ground_z_refined = false;
     stats.last_visual_loop_ground_z_candidates = 0;
+    stats.last_visual_loop_ground_z_broad_candidates = 0;
     stats.last_visual_loop_ground_z_inliers = 0;
     stats.last_visual_loop_ground_z_correction = 0.0;
+    stats.last_visual_loop_ground_z_applied_correction = 0.0;
     stats.last_visual_loop_ground_z_mad = 0.0;
+    stats.last_visual_loop_ground_z_inlier_ratio = 0.0;
+    stats.last_visual_loop_ground_z_spread = 0.0;
+    stats.last_visual_loop_ground_z_spread_ratio = 0.0;
     stats.last_visual_loop_ground_z_accepted = false;
+    stats.last_visual_loop_ground_z_sparse_accepted = false;
     stats.last_visual_loop_z_constrained = false;
+    bool ground_z_clipped = false;
+    bool ground_z_sparse_accepted = false;
     if (options.visual_loop_refine_z_with_ground)
     {
       SemanticPoseGraphOptions z_options = options;
@@ -1188,23 +1384,74 @@ struct SemanticPoseGraph::Impl
       z_options.max_z_correction = options.visual_loop_ground_z_max_correction;
       evaluateZ(*reference, *current, measurement, z_options, &ground_z);
       stats.last_visual_loop_ground_z_candidates = ground_z.z_candidates;
+      stats.last_visual_loop_ground_z_broad_candidates = ground_z.z_broad_candidates;
       stats.last_visual_loop_ground_z_inliers = ground_z.z_inliers;
       stats.last_visual_loop_ground_z_correction = ground_z.z_median;
       stats.last_visual_loop_ground_z_mad = ground_z.z_mad;
-      if (ground_z.z_accepted)
+      stats.last_visual_loop_ground_z_inlier_ratio = ground_z.z_inlier_ratio;
+      stats.last_visual_loop_ground_z_spread = ground_z.z_spread;
+      stats.last_visual_loop_ground_z_spread_ratio = ground_z.z_spread_ratio;
+
+      // A late return pass can expose only a small, but spatially distributed,
+      // patch of common ground.  Preserve the normal high-count gate, then
+      // allow this deliberately stricter fallback only after the visual loop
+      // has independently passed LiDAR structural registration.
+      const bool sparse_fallback_enabled =
+          options.visual_loop_ground_z_sparse_min_inliers > 0;
+      ground_z_sparse_accepted = !ground_z.z_accepted && sparse_fallback_enabled &&
+          lidar_geometry_verified &&
+          ground_z.z_inliers >= options.visual_loop_ground_z_sparse_min_inliers &&
+          std::isfinite(ground_z.z_inlier_ratio) &&
+          ground_z.z_inlier_ratio >=
+              std::max(0.0, options.visual_loop_ground_z_sparse_min_inlier_ratio) &&
+          std::isfinite(ground_z.z_spread) &&
+          ground_z.z_spread >=
+              std::max(0.0, options.visual_loop_ground_z_sparse_min_spread) &&
+          std::isfinite(ground_z.z_spread_ratio) &&
+          ground_z.z_spread_ratio >=
+              std::max(0.0, options.visual_loop_ground_z_sparse_min_spread_ratio) &&
+          std::isfinite(ground_z.z_mad) &&
+          ground_z.z_mad <=
+              std::max(0.0, options.visual_loop_ground_z_sparse_max_mad) &&
+          std::abs(ground_z.z_median) <= options.visual_loop_ground_z_max_correction &&
+          lidar_geometry.xy_inliers >=
+              options.visual_loop_ground_z_sparse_min_lidar_xy_inliers &&
+          std::isfinite(lidar_geometry.xy_rmse) &&
+          lidar_geometry.xy_rmse <=
+              std::max(0.0, options.visual_loop_ground_z_sparse_max_lidar_xy_rmse) &&
+          std::isfinite(lidar_geometry.spread) &&
+          lidar_geometry.spread >=
+              std::max(0.0, options.visual_loop_ground_z_sparse_min_lidar_xy_spread);
+      const bool ground_z_accepted = ground_z.z_accepted || ground_z_sparse_accepted;
+      if (ground_z_accepted)
       {
-        measurement.translation().z() += ground_z.z_median;
+        const double maximum_step = std::max(0.0, options.visual_loop_ground_z_max_step);
+        const double applied_correction = maximum_step > 0.0 ?
+            clampValue(ground_z.z_median, -maximum_step, maximum_step) :
+            ground_z.z_median;
+        ground_z_clipped = std::abs(applied_correction - ground_z.z_median) > 1e-9;
+        measurement.translation().z() += applied_correction;
         ground_z_refined = true;
         stats.last_visual_loop_ground_z_accepted = true;
+        stats.last_visual_loop_ground_z_sparse_accepted = ground_z_sparse_accepted;
+        stats.last_visual_loop_ground_z_applied_correction = applied_correction;
+        if (ground_z_clipped) ++stats.visual_loop_ground_z_clipped_refinements;
       }
+      // The debug path and the copied LiDAR result describe the effective
+      // visual-loop decision, not merely the original high-count branch.
+      ground_z.z_accepted = ground_z_accepted;
     }
     if (lidar_geometry_verified)
     {
       lidar_geometry.measurement = measurement;
       lidar_geometry.z_candidates = ground_z.z_candidates;
+      lidar_geometry.z_broad_candidates = ground_z.z_broad_candidates;
       lidar_geometry.z_inliers = ground_z.z_inliers;
       lidar_geometry.z_median = ground_z.z_median;
       lidar_geometry.z_mad = ground_z.z_mad;
+      lidar_geometry.z_inlier_ratio = ground_z.z_inlier_ratio;
+      lidar_geometry.z_spread = ground_z.z_spread;
+      lidar_geometry.z_spread_ratio = ground_z.z_spread_ratio;
       lidar_geometry.z_accepted = ground_z_refined;
       lidar_geometry.z_pairs = ground_z.z_pairs;
     }
@@ -1221,14 +1468,58 @@ struct SemanticPoseGraph::Impl
         rotation_disagreement >
             options.visual_loop_max_rotation_disagreement_deg * kPi / 180.0)
     {
-      visual_loop_pairs.erase(pair_key);
       if (lidar_geometry_verified)
       {
         lidar_geometry.reason = "visual_loop_raw_pose_disagreement";
         populateDebug(*reference, *current, lidar_geometry, false);
       }
-      ++stats.visual_loop_rejections;
-      return false;
+      return reject("visual_loop_raw_pose_disagreement");
+    }
+
+    std::string support_reason;
+    if (!visualLoopHasMultiframeSupport(*reference, *current, measurement,
+                                        &support_reason))
+    {
+      if (lidar_geometry_verified)
+      {
+        lidar_geometry.reason = support_reason;
+        populateDebug(*reference, *current, lidar_geometry, false);
+      }
+      if (support_reason == "visual_loop_awaiting_multiframe_support")
+      {
+        stats.last_visual_loop_reason = support_reason;
+        return false;
+      }
+      return reject(support_reason.empty() ? "visual_loop_multiframe_gate" : support_reason);
+    }
+
+    // A graph-state innovation can legitimately be large on the return pass:
+    // its purpose is to expose accumulated drift.  It therefore must not
+    // prevent the independent LiDAR observations from forming their required
+    // multi-frame consensus.  Once consensus exists, retain this as a final
+    // hard safety gate before inserting a robust switchable factor.
+    if (!visualLoopGraphConsistency(*reference, *current, measurement))
+    {
+      if (lidar_geometry_verified)
+      {
+        lidar_geometry.reason = "visual_loop_graph_consistency_gate";
+        populateDebug(*reference, *current, lidar_geometry, false);
+      }
+      if (visual_loop_support.support > 0)
+      {
+        ++stats.visual_loop_support_resets;
+        visual_loop_support = VisualLoopSupport();
+        stats.last_visual_loop_support = 0;
+      }
+      return reject("visual_loop_graph_consistency_gate");
+    }
+
+    const std::uint64_t pair_key =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(reference->id)) << 32U) |
+        static_cast<std::uint32_t>(current->id);
+    if (!visual_loop_pairs.insert(pair_key).second)
+    {
+      return reject("visual_loop_duplicate_pair");
     }
 
     const double factor_quality = lidar_geometry_verified ? std::max(
@@ -1239,27 +1530,46 @@ struct SemanticPoseGraph::Impl
         options.visual_loop_allow_pnp_z_without_ground;
     if (!constrain_z) ++stats.visual_loop_z_without_ground_suppressed;
     stats.last_visual_loop_z_constrained = constrain_z;
-    const double visual_z_sigma = !constrain_z ? 1e3 : (ground_z_refined ?
-        std::min(options.visual_loop_sigma_z, options.visual_loop_ground_z_sigma) :
-        options.visual_loop_sigma_z);
+    const double visual_z_sigma = ground_z_refined ?
+        (ground_z_clipped ?
+            std::max(options.visual_loop_sigma_z,
+                     options.visual_loop_ground_z_clipped_sigma) :
+            std::min(options.visual_loop_sigma_z, options.visual_loop_ground_z_sigma)) :
+        options.visual_loop_sigma_z;
     const double roll_pitch_sigma = options.visual_loop_constrain_roll_pitch ?
         options.visual_loop_sigma_roll_pitch_deg * quality_scale * kPi / 180.0 : 1e3;
-    gtsam::Vector6 sigmas;
-    sigmas << roll_pitch_sigma,
-              roll_pitch_sigma,
-              options.visual_loop_sigma_yaw_deg * quality_scale * kPi / 180.0,
-              options.visual_loop_sigma_xy * quality_scale,
-              options.visual_loop_sigma_xy * quality_scale,
-              visual_z_sigma * quality_scale;
     gtsam::NonlinearFactorGraph factors;
+    // Keep the ground-derived height channel separate from XY/yaw.  A valid
+    // return pass often begins with metre-scale horizontal drift, which should
+    // invoke the planar Huber kernel without also suppressing coherent ground Z.
+    gtsam::Vector6 planar_sigmas;
+    planar_sigmas << roll_pitch_sigma,
+                     roll_pitch_sigma,
+                     options.visual_loop_sigma_yaw_deg * quality_scale * kPi / 180.0,
+                     options.visual_loop_sigma_xy * quality_scale,
+                     options.visual_loop_sigma_xy * quality_scale,
+                     1e3;
     factors.add(gtsam::BetweenFactor<gtsam::Pose3>(
         poseKey(reference->id), poseKey(current->id), toGtsam(measurement),
-        robustDiagonal(sigmas, options.visual_loop_huber_k)));
+        robustDiagonalWithDcs(planar_sigmas, options.visual_loop_huber_k,
+                              options.visual_loop_use_dcs,
+                              options.visual_loop_dcs_k)));
+    if (constrain_z)
+    {
+      gtsam::Vector6 z_sigmas;
+      z_sigmas << 1e3, 1e3, 1e3, 1e3, 1e3, visual_z_sigma * quality_scale;
+      factors.add(gtsam::BetweenFactor<gtsam::Pose3>(
+          poseKey(reference->id), poseKey(current->id), toGtsam(measurement),
+          robustDiagonalWithDcs(z_sigmas, options.visual_loop_huber_k,
+                                options.visual_loop_use_dcs,
+                                options.visual_loop_dcs_k)));
+    }
     isam->update(factors, gtsam::Values());
     isam->update();
     updateOptimizedPoses();
     ++stats.visual_loop_factors;
     if (ground_z_refined) ++stats.visual_loop_ground_z_refinements;
+    if (ground_z_sparse_accepted) ++stats.visual_loop_ground_z_sparse_refinements;
     if (lidar_geometry_verified)
     {
       lidar_geometry.reason = "visual_loop_lidar_geometry_applied";
@@ -1267,6 +1577,8 @@ struct SemanticPoseGraph::Impl
     }
     last_visual_loop_factor_stamp = current->stamp;
     last_visual_loop_reference_id = reference->id;
+    visual_loop_support = VisualLoopSupport();
+    stats.last_visual_loop_reason = "visual_loop_applied";
     return true;
   }
 
@@ -1526,6 +1838,21 @@ struct SemanticPoseGraph::Impl
       ++stats.semantic_observation_skips;
       return false;
     }
+    if (options.semantic_observation_max_factors > 0 &&
+        stats.semantic_observation_factors >= options.semantic_observation_max_factors)
+    {
+      ++stats.semantic_observation_skips;
+      setSemanticObservationStatus(current, "semantic_factor_limit_reached");
+      return false;
+    }
+    if (std::isfinite(last_semantic_factor_stamp) &&
+        current.stamp - last_semantic_factor_stamp <
+            std::max(0.0, options.semantic_observation_minimum_interval_sec))
+    {
+      ++stats.semantic_observation_skips;
+      setSemanticObservationStatus(current, "semantic_factor_interval_gate");
+      return false;
+    }
     if (!current.has_semantics)
     {
       ++stats.semantic_observation_skips;
@@ -1533,8 +1860,7 @@ struct SemanticPoseGraph::Impl
       return false;
     }
     const int minimum_gap = std::max(1, options.semantic_observation_min_index_gap);
-    const int maximum_gap = std::max(
-        minimum_gap, options.semantic_observation_max_index_gap);
+    const int maximum_gap = options.semantic_observation_max_index_gap;
     const int maximum_reference_uses = std::max(
         0, options.semantic_observation_max_reference_uses);
     if (current.id < minimum_gap)
@@ -1567,7 +1893,14 @@ struct SemanticPoseGraph::Impl
         continue;
       }
       const int gap = current.id - reference.id;
-      if (gap < minimum_gap || gap > maximum_gap) continue;
+      if (gap < minimum_gap || (maximum_gap > 0 && gap > maximum_gap)) continue;
+      if (!std::isfinite(reference.stamp) ||
+          current.stamp - reference.stamp <
+              std::max(0.0, options.semantic_observation_min_time_separation_sec))
+      {
+        ++stats.semantic_observation_reference_rejections;
+        continue;
+      }
       const Eigen::Isometry3d raw_measurement =
           reference.raw_pose.inverse() * current.raw_pose;
       if (raw_measurement.translation().head<2>().norm() <
@@ -1707,6 +2040,7 @@ struct SemanticPoseGraph::Impl
     }
     if (applied_inliers <= 0) return false;
     ++semantic_reference_uses[reference.id];
+    last_semantic_factor_stamp = current.stamp;
     ++stats.semantic_observation_factors;
     stats.semantic_observation_inliers += applied_inliers;
     best_match.reason = "semantic_observation_applied";
@@ -1718,16 +2052,77 @@ struct SemanticPoseGraph::Impl
                                  gtsam::NonlinearFactorGraph *factors)
   {
     if (!options.enable_sequential_ground_z) return false;
+    const int interval = std::max(1, options.sequential_ground_interval);
+    if (current.id % interval != 0) return false;
     MatchResult result;
     result.measurement = previous.raw_pose.inverse() * current.raw_pose;
     evaluateZ(previous, current, result.measurement, options, &result);
-    if (!result.z_accepted) return false;
-    result.measurement.translation().z() += result.z_median;
+    if (!result.z_accepted ||
+        (options.sequential_ground_min_spread > 0.0 &&
+         (!std::isfinite(result.z_spread) ||
+          result.z_spread < options.sequential_ground_min_spread)) ||
+        (options.sequential_ground_min_spread_ratio > 0.0 &&
+         (!std::isfinite(result.z_spread_ratio) ||
+          result.z_spread_ratio < options.sequential_ground_min_spread_ratio)) ||
+        (options.sequential_ground_min_inlier_ratio > 0.0 &&
+         (!std::isfinite(result.z_inlier_ratio) ||
+          result.z_inlier_ratio < options.sequential_ground_min_inlier_ratio)))
+    {
+      ++stats.sequential_ground_rejections;
+      sequential_ground_support = SequentialGroundSupport();
+      return false;
+    }
+    const int minimum_support = std::max(1, options.sequential_ground_min_support);
+    if (minimum_support > 1)
+    {
+      const bool consecutive = sequential_ground_support.support > 0 &&
+          current.id > sequential_ground_support.last_current_id &&
+          current.id - sequential_ground_support.last_current_id <=
+              std::max(1, options.sequential_ground_support_max_gap);
+      if (!consecutive)
+      {
+        sequential_ground_support.last_current_id = current.id;
+        sequential_ground_support.support = 1;
+        sequential_ground_support.z_correction = result.z_median;
+        ++stats.sequential_ground_support_waits;
+        return false;
+      }
+      const double disagreement = std::abs(result.z_median -
+                                            sequential_ground_support.z_correction);
+      if (!std::isfinite(disagreement) ||
+          (options.sequential_ground_support_max_z_disagreement > 0.0 &&
+           disagreement > options.sequential_ground_support_max_z_disagreement))
+      {
+        ++stats.sequential_ground_rejections;
+        sequential_ground_support.last_current_id = current.id;
+        sequential_ground_support.support = 1;
+        sequential_ground_support.z_correction = result.z_median;
+        return false;
+      }
+      const int previous_support = sequential_ground_support.support;
+      sequential_ground_support.z_correction =
+          (static_cast<double>(previous_support) * sequential_ground_support.z_correction +
+           result.z_median) / static_cast<double>(previous_support + 1);
+      sequential_ground_support.last_current_id = current.id;
+      sequential_ground_support.support = std::min(minimum_support, previous_support + 1);
+      if (sequential_ground_support.support < minimum_support)
+      {
+        ++stats.sequential_ground_support_waits;
+        return false;
+      }
+      ++stats.sequential_ground_support_confirmations;
+    }
+    const double maximum_step = std::max(0.0, options.sequential_ground_max_step);
+    const double applied_correction = maximum_step > 0.0 ?
+        clampValue(result.z_median, -maximum_step, maximum_step) : result.z_median;
+    result.measurement.translation().z() += applied_correction;
     gtsam::Vector6 sigmas;
     sigmas << 1e3, 1e3, 1e3, 1e3, 1e3, options.sequential_ground_sigma_z;
     factors->add(gtsam::BetweenFactor<gtsam::Pose3>(
         poseKey(previous.id), poseKey(current.id), toGtsam(result.measurement),
-        robustDiagonal(sigmas, options.sequential_ground_huber_k)));
+        robustDiagonalWithDcs(sigmas, options.sequential_ground_huber_k,
+                              options.sequential_ground_use_dcs,
+                              options.sequential_ground_dcs_k)));
     ++stats.sequential_ground_factors;
     return true;
   }
@@ -1803,6 +2198,20 @@ struct SemanticPoseGraph::Impl
   {
     double arc_length = 0.0;
     if (!integrateWheel(previous.stamp, current.stamp, &arc_length)) return false;
+    const double raw_translation = raw_relative.translation().head<2>().norm();
+    const double arc_disagreement = std::abs(std::abs(arc_length) - raw_translation);
+    const double relative_arc_disagreement = arc_disagreement /
+        std::max(0.05, raw_translation);
+    if (raw_translation >= options.wheel_min_raw_translation &&
+        ((!std::isfinite(arc_disagreement) || !std::isfinite(relative_arc_disagreement)) ||
+         (options.wheel_max_arc_disagreement > 0.0 &&
+          arc_disagreement > options.wheel_max_arc_disagreement) ||
+         (options.wheel_max_relative_arc_disagreement > 0.0 &&
+          relative_arc_disagreement > options.wheel_max_relative_arc_disagreement)))
+    {
+      ++stats.wheel_rejections;
+      return false;
+    }
     const double delta_yaw = wrapAngle(yawOf(raw_relative));
     Eigen::Isometry3d measurement = raw_relative;
     if (std::abs(delta_yaw) < 1e-5)
@@ -1822,7 +2231,8 @@ struct SemanticPoseGraph::Impl
               std::max(0.02, options.wheel_lateral_sigma), 1e3;
     factors->add(gtsam::BetweenFactor<gtsam::Pose3>(
         poseKey(previous.id), poseKey(current.id), toGtsam(measurement),
-        robustDiagonal(sigmas, options.wheel_huber_k)));
+        robustDiagonalWithDcs(sigmas, options.wheel_huber_k,
+                              options.wheel_use_dcs, options.wheel_dcs_k)));
     ++stats.wheel_factors;
     return true;
   }
@@ -2145,41 +2555,45 @@ struct SemanticPoseGraph::Impl
     }
 
     const auto start = std::chrono::steady_clock::now();
-    gtsam::NonlinearFactorGraph factors;
-    gtsam::Values values;
-    if (keyframes.empty())
+    const bool optimize = optimizationEnabled();
+    if (optimize)
     {
-      gtsam::Vector6 prior_sigmas;
-      prior_sigmas << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;
-      factors.add(gtsam::PriorFactor<gtsam::Pose3>(poseKey(current.id),
-                                                   toGtsam(current.raw_pose),
-                                                   gtsam::noiseModel::Diagonal::Sigmas(prior_sigmas)));
-      values.insert(poseKey(current.id), toGtsam(current.raw_pose));
+      gtsam::NonlinearFactorGraph factors;
+      gtsam::Values values;
+      if (keyframes.empty())
+      {
+        gtsam::Vector6 prior_sigmas;
+        prior_sigmas << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;
+        factors.add(gtsam::PriorFactor<gtsam::Pose3>(poseKey(current.id),
+                                                     toGtsam(current.raw_pose),
+                                                     gtsam::noiseModel::Diagonal::Sigmas(prior_sigmas)));
+        values.insert(poseKey(current.id), toGtsam(current.raw_pose));
+      }
+      else
+      {
+        const Keyframe &previous = keyframes.back();
+        const Eigen::Isometry3d relative = previous.raw_pose.inverse() * current.raw_pose;
+        const double distance = std::max(0.1, relative.translation().norm());
+        gtsam::Vector6 sigmas;
+        sigmas << options.odom_sigma_roll_pitch, options.odom_sigma_roll_pitch,
+                  options.odom_sigma_yaw,
+                  options.odom_sigma_xy_base + options.odom_sigma_xy_per_meter * distance,
+                  options.odom_sigma_xy_base + options.odom_sigma_xy_per_meter * distance,
+                  options.odom_sigma_z_base + options.odom_sigma_xy_per_meter * distance;
+        factors.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            poseKey(previous.id), poseKey(current.id), toGtsam(relative),
+            gtsam::noiseModel::Diagonal::Sigmas(sigmas)));
+        ++stats.odometry_factors;
+        addVisualRotationFactor(previous, current, relative, &factors);
+        addWheelFactor(previous, current, relative, &factors);
+        addSequentialGroundFactor(previous, current, &factors);
+        const Eigen::Isometry3d initial = previous.optimized_pose * relative;
+        values.insert(poseKey(current.id), toGtsam(initial));
+      }
+      isam->update(factors, values);
     }
-    else
-    {
-      const Keyframe &previous = keyframes.back();
-      const Eigen::Isometry3d relative = previous.raw_pose.inverse() * current.raw_pose;
-      const double distance = std::max(0.1, relative.translation().norm());
-      gtsam::Vector6 sigmas;
-      sigmas << options.odom_sigma_roll_pitch, options.odom_sigma_roll_pitch,
-                options.odom_sigma_yaw,
-                options.odom_sigma_xy_base + options.odom_sigma_xy_per_meter * distance,
-                options.odom_sigma_xy_base + options.odom_sigma_xy_per_meter * distance,
-                options.odom_sigma_z_base + options.odom_sigma_xy_per_meter * distance;
-      factors.add(gtsam::BetweenFactor<gtsam::Pose3>(
-          poseKey(previous.id), poseKey(current.id), toGtsam(relative),
-          gtsam::noiseModel::Diagonal::Sigmas(sigmas)));
-      ++stats.odometry_factors;
-      addVisualRotationFactor(previous, current, relative, &factors);
-      addWheelFactor(previous, current, relative, &factors);
-      addSequentialGroundFactor(previous, current, &factors);
-      const Eigen::Isometry3d initial = previous.optimized_pose * relative;
-      values.insert(poseKey(current.id), toGtsam(initial));
-    }
-    isam->update(factors, values);
     keyframes.push_back(current);
-    updateOptimizedPoses();
+    if (optimize) updateOptimizedPoses();
     stats.keyframes = static_cast<int>(keyframes.size());
 
     if ((options.enable_xy_loops || options.enable_z_loops) &&
@@ -2255,8 +2669,11 @@ struct SemanticPoseGraph::Impl
   std::deque<VisualObservation, Eigen::aligned_allocator<VisualObservation>> visual;
   std::unordered_set<std::uint64_t> visual_loop_pairs;
   GenericLoopSupport generic_loop_support;
+  VisualLoopSupport visual_loop_support;
+  SequentialGroundSupport sequential_ground_support;
   double last_generic_loop_stamp = -std::numeric_limits<double>::infinity();
   double last_visual_loop_factor_stamp = -std::numeric_limits<double>::infinity();
+  double last_semantic_factor_stamp = -std::numeric_limits<double>::infinity();
   int last_visual_loop_reference_id = -1;
   SemanticLoopDebug debug;
   SemanticLoopDebug semantic_debug;
@@ -2405,6 +2822,17 @@ bool SemanticPoseGraph::addVisualLoopConstraint(
 bool SemanticPoseGraph::initialized() const
 {
   return !impl_->keyframes.empty();
+}
+
+bool SemanticPoseGraph::hasKeyframeNear(double stamp) const
+{
+  return impl_->nearestKeyframe(stamp) != nullptr;
+}
+
+double SemanticPoseGraph::latestKeyframeStamp() const
+{
+  return impl_->keyframes.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                  : impl_->keyframes.back().stamp;
 }
 
 Eigen::Isometry3d SemanticPoseGraph::correctedPose(const Eigen::Isometry3d &raw_pose) const

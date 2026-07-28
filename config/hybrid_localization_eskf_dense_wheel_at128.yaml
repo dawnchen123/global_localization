@@ -1,0 +1,21 @@
+# Dense AT128 frontend with a gated high-quality wheel/NHC update. The NIS
+# gate rejects forward wheel slip instead of globally weakening all samples.
+lidar_odometry:
+  scan_voxel_size: 0.24
+  map_insert_voxel_size: 0.15
+  max_scan_points: 9000
+  point_knn_fallback_max_queries: 1200
+
+  use_directional_lidar_covariance: true
+  lidar_normalized_huber_delta: 2.5
+  lidar_innovation_gate: 25.0
+  covariance_reset_enabled: true
+  freeze_mature_voxels: true
+  map_insertion_min_translation: 0.20
+  map_insertion_min_rotation_deg: 0.8
+  map_insertion_max_interval: 0.50
+
+  wheel_forward_noise: 0.07
+  wheel_lateral_noise: 0.06
+  wheel_vertical_noise: 0.10
+  wheel_forward_innovation_gate: 9.0
