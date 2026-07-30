@@ -110,7 +110,7 @@ private:
     const ros::WallTime now = ros::WallTime::now();
     if (input_msg_count_ == 0) {
       ROS_WARN("livox_custom_to_pointcloud2 has not received Livox CustomMsg on %s. "
-               "Check FAST-LIVO2/livox driver lid_topic and the launch arg livox_custom_topic.",
+               "Check the Livox driver or rosbag topic and the launch arg livox_custom_topic.",
                input_topic_.c_str());
       return;
     }

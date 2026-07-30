@@ -1,0 +1,154 @@
+# i2Nav camera + Hesai AT128 projection for the optional SAM3 semantic path.
+queue_dir: /tmp/sam3_projected_semantic_queue
+opencv_num_threads: 1
+
+image_topic: /avt_camera/left/image/compressed
+image_input_type: compressed
+lidar_topic: /hesai/at128/points
+lidar_input_type: pointcloud2_lidar
+cloud_in_map_frame: false
+odom_topic: /hybrid/frontend/odometry
+use_latest_odom: true
+odom_match_mode: stamp
+max_odom_age_sec: 0.20
+# In stamp mode a pair remains valid while the standalone LIO is catching up
+# with rosbag sensor time. Keep a bounded sensor-time backlog and do not expire
+# it using wall time.
+max_pending_sync_pairs: 60
+max_pending_sync_wait_sec: 0.0
+max_odom_receipt_age_sec: 0.50
+defer_odom_lookup_sec: 0.0
+odom_buffer_size: 2000
+# Callbacks only enqueue raw ROS messages; one foreground loop performs all
+# OpenCV/PointCloud2/disk work to avoid native OpenCV callback-thread crashes.
+max_raw_sync_pairs: 12
+process_batch_size: 1
+process_rate_hz: 40.0
+require_queue_session: true
+queue_poll_hz: 5.0
+
+use_camera_info: false
+camera_info_topic: /camera/camera_info
+cam_width: 1600
+cam_height: 1200
+image_scale: 1.0
+cam_fx: 1064.8950
+cam_fy: 1065.2546
+cam_cx: 801.4049
+cam_cy: 624.6878
+cam_d0: -0.1516
+cam_d1: 0.0942
+cam_d2: 0.000169
+cam_d3: -0.000142
+cam_d4: -0.0229
+auto_resize_intrinsics_to_image: true
+
+export_rate: 1.0
+max_pending_requests: 8
+approx_sync_slop: 0.08
+debug_sync: true
+point_stride: 2
+max_export_points: 60000
+queue_image_format: jpg
+queue_jpeg_quality: 95
+min_range_m: 0.5
+max_range_m: 100.0
+z_min_lidar: -5.0
+z_max_lidar: 8.0
+
+# p_camera = T_cam_lidar * p_lidar, directly supplied by i2Nav.
+T_cam_lidar:
+  [-0.00224527, -0.99998819, -0.00430966,  0.182,
+   -0.01005690,  0.00433203, -0.99994004, -0.009,
+    0.99994691, -0.00220179, -0.01006650, -0.049,
+    0.0,         0.0,         0.0,         1.0]
+
+# ROS FLU body_from_lidar, identical to hybrid_localization_hesai.yaml.
+T_body_lidar:
+  [0.99993817, -0.00770257, -0.00802099, 0.042,
+   0.00771320,  0.99996941,  0.00129509, 0.018,
+   0.00801077, -0.00135687,  0.99996699, 0.063,
+   0.0,         0.0,         0.0,        1.0]
+
+use_distortion_projection: true
+min_project_depth_m: 0.2
+enable_projection_depth_filter: true
+projection_depth_tolerance_m: 0.60
+enable_semantic_support_filter: true
+semantic_support_kernel_px: 5
+min_semantic_support_ratio: 0.28
+enable_range_edge_weight: true
+range_edge_kernel_px: 5
+range_edge_soft_m: 0.8
+range_edge_hard_m: 2.5
+enable_lidar_geometry_refinement: true
+geometry_grid_resolution: 0.60
+road_max_ground_height_m: 0.35
+road_reject_ground_height_m: 1.10
+low_vegetation_max_ground_height_m: 0.75
+building_min_ground_height_m: 0.45
+tree_min_ground_height_m: 0.40
+structure_min_z_span_m: 0.80
+flat_cell_max_z_span_m: 0.45
+min_geometry_score: 0.18
+
+bev_resolution: 0.20
+bev_size_m: 80.0
+bev_center_mode: latest_pose
+# Zero means an entire session is retained.  BEV remains latest-pose centred,
+# while /sam3/semantic_cloud_map is a true global accumulated cloud.
+accumulation_window_sec: 0.0
+max_semantic_points: 6000000
+min_votes_per_cell: 1
+publish_rate: 1.0
+morph_open_kernel: 1
+morph_close_kernel: 3
+min_region_area_px: 2
+enable_dense_bev: true
+road_splat_radius_px: 5
+building_splat_radius_px: 3
+tree_splat_radius_px: 5
+grass_splat_radius_px: 5
+enable_road_ray_fill: true
+road_ray_max_range_m: 40.0
+road_ray_weight: 0.35
+road_ray_max_points: 3000
+
+label_weights:
+  road: 1.4
+  building: 1.5
+  tree: 1.0
+  grass: 0.8
+  dynamic: 0.8
+
+label_topic: /sam3/bev/label
+camera_label_topic: /sam3/camera/label
+camera_dynamic_mask_topic: /sam3/camera/dynamic_mask
+color_topic: /sam3/bev/color
+confidence_topic: /sam3/bev/confidence
+debug_topic: /sam3/bev/debug
+stats_topic: /sam3/bev/stats
+projection_debug_topic: /sam3/projection/debug
+projection_stats_topic: /sam3/projection/stats
+publish_projection_debug: true
+projection_debug_max_points: 4000
+
+publish_projected_points: true
+projected_points_topic: /sam3/projected_semantic_points
+publish_lidar_frame_projected_points: false
+lidar_frame_projected_points_topic: /sam3/projected_semantic_points_lidar
+publish_semantic_cloud: true
+semantic_cloud_topic: /sam3/semantic_cloud_map
+semantic_cloud_stats_topic: /sam3/semantic_cloud_map/stats
+semantic_cloud_frame: map
+semantic_cloud_output_label_mode: internal
+semantic_cloud_voxel_size: 0.20
+# A moving platform normally observes new voxels only once or twice.  These
+# gates preserve high-quality new areas instead of showing only the repeatedly
+# observed start region; graph factors consume projected observations directly.
+semantic_cloud_min_votes: 0.20
+semantic_cloud_min_confidence: 0.48
+semantic_cloud_max_points: 600000
+semantic_cloud_confidence_vote_scale: 2.0
+semantic_cloud_save_path: ''
+semantic_cloud_save_every_sec: 0.0

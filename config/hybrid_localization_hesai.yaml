@@ -1,0 +1,84 @@
+# i2Nav Hesai AT128 raw PointCloud2 interface.
+lidar_cloud_topic: /hesai/at128/points
+imu_topic: /adi/adis16465/imu
+wheel_topic: /insprobe/ranger/odometer
+wheel_message_type: insprobe_ranger
+subscribe_wheel: false
+lidar_frame: hesai_at128
+
+# The i2Nav Pandar128 `timestamp` field contains absolute Unix time in seconds.
+lidar_deskew_enabled: true
+lidar_point_time_mode: absolute
+lidar_point_time_scale: 1.0
+lidar_stamp_is_end: false
+lidar_imu_wait_sec: 0.12
+max_lidar_points: 40000
+
+lidar_odometry:
+  scan_voxel_size: 0.32
+  map_voxel_size: 0.45
+  map_insert_voxel_size: 0.20
+  max_correspondence_distance: 1.00
+  max_plane_distance: 0.28
+  plane_max_eigen_ratio: 0.20
+  huber_delta: 0.12
+  max_rmse: 0.24
+  min_inlier_ratio: 0.22
+  max_translation_per_scan: 0.70
+  max_rotation_per_scan_deg: 8.0
+  max_translation_speed: 4.0
+  max_rotation_speed_deg: 40.0
+  max_lidar_correction_translation: 0.28
+  max_lidar_correction_rotation_deg: 2.8
+  degenerate_min_inlier_ratio: 0.30
+  degenerate_max_rmse: 0.16
+  lidar_loss_hold_after_rejections: 3
+  lidar_loss_freeze_after_rejections: 12
+  lidar_loss_max_vertical_offset: 0.35
+  lidar_loss_max_horizontal_speed: 3.0
+  lidar_loss_max_horizontal_step: 0.75
+  lidar_loss_velocity_decay: 0.98
+  min_scan_points: 400
+  min_correspondences: 150
+  max_scan_points: 7000
+  max_map_points: 90000
+  local_map_radius: 70.0
+  max_iterations: 5
+  map_insertion_max_plane_distance: 0.25
+  min_voxel_plane_points: 8
+  max_voxel_points: 140
+  max_plane_variance: 0.025
+  plane_uncertainty_scale: 0.8
+  plane_fit_residual_gate: 0.14
+  use_point_knn_plane: false
+  use_compatible_voxel_plane: false
+  # AT128's wide field of view includes many valid new-scene points outside
+  # the mature local submap. Keep the normal ratio gate, but retain an update
+  # with broad, low-residual absolute support instead of freezing on it.
+  point_knn_fallback: true
+  point_knn_fallback_max_queries: 1600
+  strong_support_min_correspondences: 700
+  strong_support_min_azimuth_sectors: 5
+  strong_support_max_rmse: 0.13
+  recovery_after_rejections: 3
+  recovery_max_lidar_correction_translation: 0.60
+  recovery_max_lidar_correction_rotation_deg: 5.0
+  max_voxel_samples: 12
+  wheel_speed_scale: 0.9865
+  wheel_forward_noise: 0.15
+  wheel_lateral_noise: 0.12
+  wheel_vertical_noise: 1.00
+  wheel_huber_delta: 1.5
+  imu_init_duration: 1.5
+  imu_init_samples: 250
+  imu_max_gap: 0.02
+
+# The supplied calibration is LiDAR -> IMU(FRD). Convert it to ROS FLU.
+body_from_lidar: [0.99993817, -0.00770257, -0.00802099, 0.042,
+                  0.00771320, 0.99996941, 0.00129509, 0.018,
+                  0.00801077, -0.00135687, 0.99996699, 0.063,
+                  0.0, 0.0, 0.0, 1.0]
+body_from_imu: [1.0, 0.0, 0.0, 0.0,
+                0.0, -1.0, 0.0, 0.0,
+                0.0, 0.0, -1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]

@@ -1,0 +1,137 @@
+<launch>
+  <arg name="pointcloud_topic" default="/hesai/at128/points" />
+  <arg name="imu_topic" default="/adi/adis16465/imu" />
+  <arg name="wheel_topic" default="/insprobe/ranger/odometer" />
+  <arg name="subscribe_wheel" default="false" />
+  <arg name="enable_wheel_factors" default="false" />
+  <arg name="camera_topic" default="/avt_camera/left/image/compressed" />
+  <arg name="subscribe_camera" default="false" />
+  <arg name="enable_visual_frontend" default="false" />
+  <arg name="visual_observation_only" default="true" />
+  <arg name="enable_visual_rotation_factors" default="false" />
+  <arg name="enable_visual_translation_factors" default="false" />
+  <arg name="enable_visual_loop_factors" default="false" />
+  <arg name="enable_xy_loops" default="false" />
+  <arg name="enable_z_loops" default="false" />
+  <arg name="enable_sequential_ground_z" default="false" />
+  <arg name="enable_semantic_observation_factors" default="true" />
+  <arg name="enable_semantic_observation_xy_factors" default="true" />
+  <arg name="enable_semantic_observation_z_factors" default="true" />
+  <arg name="enable_sam3_semantics" default="true" />
+  <arg name="sam3_config" default="$(find fast_livo2_global_localization)/config/sam3_hesai.yaml" />
+  <arg name="sam3_queue_dir" default="/tmp/sam3_projected_semantic_queue" />
+  <arg name="semantic_cloud_save_path" default="" />
+  <arg name="lidar_point_time_mode" default="absolute" />
+  <arg name="lidar_point_time_scale" default="1.0" />
+  <arg name="semantic_cloud_topic" default="/rangenet/semantic_points" />
+  <arg name="subscribe_semantic" default="false" />
+  <arg name="semantic_label_mode" default="semantic_kitti" />
+  <arg name="semantic_cloud_in_map_frame" default="false" />
+  <arg name="prior_pcd_path" default="" />
+  <arg name="trajectory_save_path" default="" />
+  <arg name="frontend_trajectory_save_path" default="" />
+  <arg name="object_save_path" default="" />
+  <arg name="rviz" default="true" />
+
+  <node pkg="fast_livo2_global_localization"
+        type="pdf_hybrid_localization_node"
+        name="pdf_hybrid_localization_node"
+        output="screen">
+    <rosparam command="load"
+              file="$(find fast_livo2_global_localization)/config/hybrid_localization_common.yaml" />
+    <rosparam command="load"
+              file="$(find fast_livo2_global_localization)/config/hybrid_localization_hesai.yaml" />
+    <param name="lidar_cloud_topic" value="$(arg pointcloud_topic)" />
+    <param name="imu_topic" value="$(arg imu_topic)" />
+    <param name="wheel_topic" value="$(arg wheel_topic)" />
+    <param name="wheel_message_type" value="insprobe_ranger" />
+    <param name="subscribe_wheel" value="$(arg subscribe_wheel)" />
+    <param name="camera_topic" value="$(arg camera_topic)" />
+    <param name="subscribe_camera_frontend" value="$(arg subscribe_camera)" />
+    <param name="visual_frontend/enabled" value="$(arg enable_visual_frontend)" />
+    <param name="visual_frontend/observation_only"
+           value="$(arg visual_observation_only)" />
+    <param name="visual_frontend/use_sam3" value="$(arg enable_sam3_semantics)" />
+    <param name="lidar_point_time_mode" value="$(arg lidar_point_time_mode)" />
+    <param name="lidar_point_time_scale" value="$(arg lidar_point_time_scale)" />
+    <param unless="$(arg enable_sam3_semantics)" name="semantic_cloud_topic" value="$(arg semantic_cloud_topic)" />
+    <param unless="$(arg enable_sam3_semantics)" name="subscribe_semantic" value="$(arg subscribe_semantic)" />
+    <param unless="$(arg enable_sam3_semantics)" name="semantic_label_mode" value="$(arg semantic_label_mode)" />
+    <param unless="$(arg enable_sam3_semantics)" name="semantic_cloud_in_map_frame" value="$(arg semantic_cloud_in_map_frame)" />
+    <param if="$(arg enable_sam3_semantics)" name="semantic_cloud_topic" value="/sam3/projected_semantic_points" />
+    <param if="$(arg enable_sam3_semantics)" name="subscribe_semantic" value="true" />
+    <param if="$(arg enable_sam3_semantics)" name="semantic_label_mode" value="internal" />
+    <param if="$(arg enable_sam3_semantics)" name="semantic_cloud_in_map_frame" value="true" />
+    <param name="prior_pcd_path" value="$(arg prior_pcd_path)" />
+    <param name="output_odom_topic" value="/hybrid/frontend/odometry" />
+    <param name="output_path_topic" value="/hybrid/frontend/path" />
+    <param name="broadcast_tf" value="false" />
+    <param name="trajectory_save_path" value="$(arg frontend_trajectory_save_path)" />
+    <param name="object_save_path" value="$(arg object_save_path)" />
+  </node>
+
+  <node pkg="fast_livo2_global_localization"
+        type="semantic_gtsam_pose_graph_node"
+        name="semantic_gtsam_pose_graph_node"
+        output="screen">
+    <rosparam command="load"
+              file="$(find fast_livo2_global_localization)/config/semantic_gtsam_pose_graph.yaml" />
+    <param name="wheel_topic" value="$(arg wheel_topic)" />
+    <param name="graph/enable_wheel_factors" value="$(arg enable_wheel_factors)" />
+    <param name="camera_topic" value="$(arg camera_topic)" />
+    <param name="subscribe_camera" value="$(arg subscribe_camera)" />
+    <param name="visual_observation_only" value="$(arg visual_observation_only)" />
+    <param name="graph/enable_visual_rotation_factors"
+           value="$(arg enable_visual_rotation_factors)" />
+    <param name="graph/enable_visual_translation_factors"
+           value="$(arg enable_visual_translation_factors)" />
+    <param name="graph/enable_visual_loop_factors"
+           value="$(arg enable_visual_loop_factors)" />
+    <param name="graph/enable_xy_loops" value="$(arg enable_xy_loops)" />
+    <param name="graph/enable_z_loops" value="$(arg enable_z_loops)" />
+    <param name="graph/enable_sequential_ground_z"
+           value="$(arg enable_sequential_ground_z)" />
+    <param name="graph/enable_semantic_observation_factors"
+           value="$(arg enable_semantic_observation_factors)" />
+    <param name="graph/enable_semantic_observation_xy_factors"
+           value="$(arg enable_semantic_observation_xy_factors)" />
+    <param name="graph/enable_semantic_observation_z_factors"
+           value="$(arg enable_semantic_observation_z_factors)" />
+    <param unless="$(arg enable_sam3_semantics)" name="subscribe_semantic" value="$(arg subscribe_semantic)" />
+    <param if="$(arg enable_sam3_semantics)" name="subscribe_semantic" value="true" />
+    <param name="trajectory_save_path" value="$(arg trajectory_save_path)" />
+  </node>
+
+  <group if="$(arg enable_sam3_semantics)">
+    <node pkg="fast_livo2_global_localization"
+          type="camera_lidar_queue_exporter.py"
+          name="camera_lidar_queue_exporter"
+          output="screen">
+      <env name="PYTHONNOUSERSITE" value="1" />
+      <env name="PYTHONPATH"
+           value="/opt/ros/noetic/lib/python3/dist-packages:/usr/lib/python3/dist-packages" />
+      <rosparam command="load" file="$(arg sam3_config)" />
+      <param name="queue_dir" value="$(arg sam3_queue_dir)" />
+      <param name="image_topic" value="$(arg camera_topic)" />
+      <param name="lidar_topic" value="$(arg pointcloud_topic)" />
+      <param name="odom_topic" value="/hybrid/frontend/odometry" />
+    </node>
+    <node pkg="fast_livo2_global_localization"
+          type="projected_semantic_bev_mapper.py"
+          name="projected_semantic_bev_mapper"
+          output="screen">
+      <env name="PYTHONNOUSERSITE" value="1" />
+      <env name="PYTHONPATH"
+           value="/opt/ros/noetic/lib/python3/dist-packages:/usr/lib/python3/dist-packages" />
+      <rosparam command="load" file="$(arg sam3_config)" />
+      <param name="queue_dir" value="$(arg sam3_queue_dir)" />
+      <param name="semantic_cloud_save_path" value="$(arg semantic_cloud_save_path)" />
+    </node>
+  </group>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="hybrid_localization_rviz"
+        args="-d $(find fast_livo2_global_localization)/rviz/hybrid_localization.rviz"
+        output="screen">
+    <env name="DISABLE_ROS1_EOL_WARNINGS" value="1" />
+  </node>
+</launch>

@@ -4,6 +4,7 @@ import json
 import math
 import os
 import subprocess
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -143,6 +144,19 @@ def run_command(cmd, log_path, env):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(proc.stdout)
     return proc.returncode, proc.stdout
+
+
+def parse_evo_statistics(output):
+    statistics = {}
+    pattern = re.compile(
+        r"^\s*(max|mean|median|min|rmse|sse|std)\s+"
+        r"([-+0-9.eE]+)\s*$"
+    )
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match:
+            statistics[match.group(1)] = float(match.group(2))
+    return statistics
 
 
 def quat_to_yaw(qx, qy, qz, qw):
@@ -289,6 +303,11 @@ def configure_evo(evo_bin, evo_home):
     env = os.environ.copy()
     env["HOME"] = str(evo_home)
     env["MPLBACKEND"] = "Agg"
+    # Keep evo's NumPy/BLAS subprocesses deterministic and avoid native
+    # thread-pool crashes when plots and alignment run in constrained hosts.
+    for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS"):
+        env[name] = "1"
     cmd = [str(evo_bin / "evo_config"), "set", "plot_backend", "Agg"]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     return env
@@ -411,12 +430,15 @@ def main():
         "est_time_shift": args.est_time_shift,
         "align": args.align,
         "max_time_diff": args.max_time_diff,
+        "rpe_delta": args.rpe_delta,
+        "rpe_delta_unit": args.rpe_delta_unit,
         "gt": convert_file(
             args.gt, gt_tum, args.time_mode, args.gt_time_cluster,
             args.cluster_width, args.gt_time_shift, args.t_start, args.t_end),
         "estimates": {},
         "commands": {},
         "component_metrics": {},
+        "metrics": {},
     }
 
     env = configure_evo(args.evo_bin, args.evo_home)
@@ -438,6 +460,7 @@ def main():
             "returncode": code,
             "log": str(args.out_dir / ("ape_%s.log" % name)),
         }
+        summary["metrics"].setdefault(name, {})["ape"] = parse_evo_statistics(out)
         print("\n[APE %s] returncode=%d" % (name, code))
         print(out)
 
@@ -449,6 +472,7 @@ def main():
                 "returncode": code,
                 "log": str(args.out_dir / ("rpe_%s.log" % name)),
             }
+            summary["metrics"].setdefault(name, {})["rpe"] = parse_evo_statistics(out)
             print("\n[RPE %s] returncode=%d" % (name, code))
             print(out)
 

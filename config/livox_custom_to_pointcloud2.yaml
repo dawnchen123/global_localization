@@ -1,8 +1,5 @@
-# Legacy only: convert livox_ros_driver/CustomMsg into sensor_msgs/PointCloud2 for RangeNet++.
-#
-# RangeNet++ should receive one raw LiDAR frame in the sensor frame. For the
-# current i2Nav AT128 setup this converter is not used; RangeNet++ subscribes
-# directly to /hesai/at128/points. Keep this file only for old Mid-360 bags.
+# Mid360 raw input adapter used by hybrid_localization_mid360.launch.
+# It preserves line and offset_time so the standalone frontend can deskew scans.
 
 input_custom_topic: /livox/mid360/points
 output_cloud_topic: /livox/mid360/points_xyzirt

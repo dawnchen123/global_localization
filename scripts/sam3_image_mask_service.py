@@ -5,7 +5,7 @@ SAM3 image segmentation service running in a separate conda environment.
 
 Input queue:
   input/ready_<id>.json
-  input/image_<id>.png
+  input/image_<id>.{jpg,png}
   input/cloud_<id>.npz
 
 Output queue:
@@ -236,15 +236,22 @@ class SAM3Wrapper(object):
                 scores = result.scores
         return masks, scores
 
-    def prompt_masks(self, image_rgb, prompt):
+    def prepare_image(self, image_rgb):
         if not self.enabled:
-            return []
+            return None
         import torch
         from PIL import Image as PILImage
         pil = PILImage.fromarray(image_rgb)
         with torch.no_grad():
             with self._autocast_ctx():
-                state = self.processor.set_image(pil)
+                return self.processor.set_image(pil)
+
+    def prompt_masks(self, state, prompt):
+        if not self.enabled:
+            return []
+        import torch
+        with torch.no_grad():
+            with self._autocast_ctx():
                 # Try several SAM3 API variants.
                 try:
                     result = self.processor.set_text_prompt(state=state, prompt=prompt)
@@ -316,10 +323,43 @@ class Sam3ImageMaskService(object):
         self.output_dir = self.queue_dir / "output"
         self.failed_dir = self.queue_dir / "failed_sam3"
         self.done_dir = self.queue_dir / "segmented"
-        for d in [self.input_dir, self.output_dir, self.failed_dir, self.done_dir]:
+        self.session_path = self.queue_dir / "queue_session.json"
+        self.stale_dir = self.queue_dir / "stale_sessions"
+        for d in [self.input_dir, self.output_dir, self.failed_dir, self.done_dir, self.stale_dir]:
             d.mkdir(parents=True, exist_ok=True)
         self.sam3 = SAM3Wrapper(args)
-        print("[INFO] v20 SAM3 image mask service ready queue=%s backend=%s" % (str(self.queue_dir), args.backend))
+        print("[INFO] v23 SAM3 image mask service ready queue=%s backend=%s" % (str(self.queue_dir), args.backend))
+
+    @staticmethod
+    def _sanitize_session_component(value):
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(value))
+
+    def active_session_id(self):
+        try:
+            with open(str(self.session_path), "r") as stream:
+                return str(json.load(stream).get("session_id", ""))
+        except Exception:
+            return ""
+
+    def archive_stale_request(self, meta_path, request_session_id, reason):
+        label = self._sanitize_session_component(request_session_id or "no_session")
+        destination = self.stale_dir / label / "input"
+        destination.mkdir(parents=True, exist_ok=True)
+        destination_path = destination / meta_path.name
+        if destination_path.exists():
+            destination_path = destination / ("%d_%s" % (time.time_ns(), meta_path.name))
+        try:
+            os.replace(str(meta_path), str(destination_path))
+        except OSError:
+            pass
+        print("[WARN] ignored stale SAM3 request id=%s session=%s active=%s reason=%s" %
+              (meta_path.stem[len("ready_"):], request_session_id or "missing",
+               self.active_session_id() or "waiting", reason))
+
+    def request_is_active(self, meta):
+        request_session_id = str(meta.get("queue_session_id", ""))
+        active_session_id = self.active_session_id()
+        return bool(active_session_id) and request_session_id == active_session_id
 
     def segment_image(self, image_bgr):
         if self.args.backend == "heuristic":
@@ -328,11 +368,12 @@ class Sam3ImageMaskService(object):
         h, w = image_bgr.shape[:2]
         label = np.zeros((h, w), dtype=np.uint8)
         score_map = np.zeros((h, w), dtype=np.float32)
+        state = self.sam3.prepare_image(image_rgb)
 
         for lab in PRIORITY:
             for prompt in PROMPTS[lab]:
                 try:
-                    masks = self.sam3.prompt_masks(image_rgb, prompt)
+                    masks = self.sam3.prompt_masks(state, prompt)
                 except Exception as e:
                     print("[WARN] SAM3 prompt failed prompt=%s err=%s" % (prompt, e))
                     continue
@@ -376,9 +417,14 @@ class Sam3ImageMaskService(object):
         return instance
 
     def process_request(self, meta_path):
+        process_start = time.time()
         with open(str(meta_path), "r") as f:
             meta = json.load(f)
         req_id = meta["id"]
+        request_session_id = str(meta.get("queue_session_id", ""))
+        if not self.request_is_active(meta):
+            self.archive_stale_request(meta_path, request_session_id, "session_mismatch_before_segmentation")
+            return False
         image_path = Path(meta["image_path"])
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
@@ -387,11 +433,18 @@ class Sam3ImageMaskService(object):
         instance = self.build_instance_image(label)
         color = colorize_label(label)
         debug = cv2.addWeighted(image, 0.55, color, 0.45, 0.0)
+        if not self.request_is_active(meta):
+            self.archive_stale_request(meta_path, request_session_id, "session_changed_during_segmentation")
+            return False
 
         label_path = self.output_dir / ("label_%s.png" % req_id)
         instance_path = self.output_dir / ("instance_%s.png" % req_id)
         color_path = self.output_dir / ("color_%s.png" % req_id)
         debug_path = self.output_dir / ("debug_%s.png" % req_id)
+        label_tmp = self.output_dir / ("label_%s.tmp.png" % req_id)
+        instance_tmp = self.output_dir / ("instance_%s.tmp.png" % req_id)
+        color_tmp = self.output_dir / ("color_%s.tmp.png" % req_id)
+        debug_tmp = self.output_dir / ("debug_%s.tmp.png" % req_id)
         result_tmp = self.output_dir / ("result_%s.json.tmp" % req_id)
         result_path = self.output_dir / ("result_%s.json" % req_id)
         # v25: copy request meta to output. The mapper may run after this service
@@ -403,12 +456,19 @@ class Sam3ImageMaskService(object):
             json.dump(meta, f, indent=2)
         os.replace(str(meta_copy_tmp), str(meta_copy_path))
 
-        cv2.imwrite(str(label_path), label)
-        cv2.imwrite(str(instance_path), instance)
-        cv2.imwrite(str(color_path), color)
-        cv2.imwrite(str(debug_path), debug)
+        image_outputs = (
+            (label_tmp, label_path, label),
+            (instance_tmp, instance_path, instance),
+            (color_tmp, color_path, color),
+            (debug_tmp, debug_path, debug),
+        )
+        for tmp_path, final_path, image in image_outputs:
+            if not cv2.imwrite(str(tmp_path), image):
+                raise RuntimeError("failed to write SAM3 output image: %s" % tmp_path)
+            os.replace(str(tmp_path), str(final_path))
         stats = {
             "id": req_id,
+            "queue_session_id": request_session_id,
             "status": "ok",
             "meta_path": str(meta_copy_path),
             "original_meta_path": str(meta_path),
@@ -423,6 +483,7 @@ class Sam3ImageMaskService(object):
             "dynamic_px": int((label == LABEL_DYNAMIC).sum()),
             "unknown_px": int((label == LABEL_UNKNOWN).sum()),
             "instances": int(instance.max()),
+            "processing_sec": float(time.time() - process_start),
         }
         with open(str(result_tmp), "w") as f:
             json.dump(stats, f, indent=2)
@@ -431,9 +492,10 @@ class Sam3ImageMaskService(object):
             os.replace(str(meta_path), str(self.done_dir / meta_path.name))
         except Exception:
             pass
-        print("[INFO] segmented id=%s road=%d building=%d tree=%d grass=%d dynamic=%d instances=%d" %
+        print("[INFO] segmented id=%s road=%d building=%d tree=%d grass=%d dynamic=%d instances=%d processing_sec=%.3f" %
               (req_id, stats["road_px"], stats["building_px"], stats["tree_px"], stats["grass_px"],
-               stats["dynamic_px"], stats["instances"]))
+               stats["dynamic_px"], stats["instances"], stats["processing_sec"]))
+        return True
 
     def run(self):
         while True:

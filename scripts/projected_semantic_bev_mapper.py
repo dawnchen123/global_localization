@@ -8,21 +8,47 @@ Reads SAM3 label results from file queue. For each result:
   -> project LiDAR points into camera label map
   -> assign semantic labels to 3D points
   -> transform points to FAST-LIVO2 map frame
-  -> accumulate sliding-window semantic points
+  -> accumulate global or bounded-window semantic points
   -> publish local semantic BEV map.
 """
 
+import faulthandler
 import json
 import os
 import struct
+import sys
 import time
 from pathlib import Path
 from collections import deque
 
+
+def prefer_ros_binary_modules():
+    """Use the distro NumPy/OpenCV pair with the ROS Noetic interpreter.
+
+    User-local pip wheels can shadow the Ubuntu packages with a different
+    NumPy C ABI. The allocator mismatch only surfaced after dozens of
+    projected frames, so choose the coherent distro pair before importing
+    either extension module.
+    """
+    system_dist = "/usr/lib/python3/dist-packages"
+    if not os.path.isdir(system_dist):
+        return
+    home_local = os.path.join(os.path.expanduser("~"), ".local", "lib", "python")
+    filtered = []
+    for entry in sys.path:
+        normalized = os.path.abspath(entry or ".")
+        if normalized.startswith(home_local) or normalized.startswith("/usr/local/lib/python"):
+            continue
+        filtered.append(entry)
+    sys.path[:] = [entry for entry in filtered if entry != system_dist]
+    sys.path.insert(0, system_dist)
+
+
+prefer_ros_binary_modules()
+
 import cv2
 import numpy as np
 import rospy
-from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import Header, String
 
@@ -105,14 +131,203 @@ def colorize_label(label):
     return out
 
 
+def numpy_to_image(array, encoding, stamp, frame_id):
+    """Create a ROS Image without mixing pip and cv_bridge OpenCV ABIs."""
+    image = np.ascontiguousarray(array, dtype=np.uint8)
+    if encoding == "mono8":
+        if image.ndim != 2:
+            raise ValueError("mono8 image must be HxW")
+        channels = 1
+    elif encoding == "bgr8":
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("bgr8 image must be HxWx3")
+        channels = 3
+    else:
+        raise ValueError("unsupported ROS image encoding: %s" % encoding)
+
+    msg = Image()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.height = int(image.shape[0])
+    msg.width = int(image.shape[1])
+    msg.encoding = encoding
+    msg.is_bigendian = 0
+    msg.step = int(msg.width * channels)
+    msg.data = image.tobytes()
+    return msg
+
+
+def unique_integer_rows(keys):
+    """Return unique integer rows and inverse ids using only a plain sort.
+
+    The system NumPy build used by ROS Noetic has shown native faults in both
+    ``unique(..., axis=0)`` and ufunc ``.at`` scatter operations under long
+    replay.  Keep grouping on contiguous int64 arrays and construct the
+    inverse map from a stable one-dimensional sort instead.
+    """
+    rows = np.ascontiguousarray(keys, dtype=np.int64)
+    if rows.ndim != 2:
+        raise ValueError("integer row keys must be a 2D array")
+    if rows.shape[0] == 0:
+        return rows.copy(), np.empty((0,), dtype=np.int64)
+
+    mins = rows.min(axis=0)
+    maxs = rows.max(axis=0)
+    spans = [
+        int(maxs[col]) - int(mins[col]) + 1
+        for col in range(rows.shape[1])
+    ]
+    max_int64 = int(np.iinfo(np.int64).max)
+    cardinality = 1
+    encodable = True
+    for span in spans:
+        if span <= 0 or cardinality > max_int64 // span:
+            encodable = False
+            break
+        cardinality *= span
+
+    if encodable:
+        codes = np.zeros((rows.shape[0],), dtype=np.int64)
+        stride = 1
+        for col in range(rows.shape[1] - 1, -1, -1):
+            codes += (rows[:, col] - mins[col]) * stride
+            stride *= spans[col]
+        order = np.argsort(codes, kind="stable")
+        sorted_codes = codes[order]
+        starts_mask = np.empty((sorted_codes.shape[0],), dtype=bool)
+        starts_mask[0] = True
+        starts_mask[1:] = sorted_codes[1:] != sorted_codes[:-1]
+        starts = np.flatnonzero(starts_mask)
+        inverse = np.empty((rows.shape[0],), dtype=np.int64)
+        inverse[order] = np.cumsum(starts_mask, dtype=np.int64) - 1
+        return np.ascontiguousarray(rows[order[starts]]), inverse
+
+    # Coordinates spanning the full int64 domain are not expected for a
+    # metric map, but retain a collision-free fallback for malformed input.
+    lookup = {}
+    unique_rows = []
+    inverse = np.empty((rows.shape[0],), dtype=np.int64)
+    for i, row in enumerate(rows):
+        key = tuple(int(value) for value in row)
+        index = lookup.get(key)
+        if index is None:
+            index = len(unique_rows)
+            lookup[key] = index
+            unique_rows.append(key)
+        inverse[i] = index
+    return np.asarray(unique_rows, dtype=np.int64), inverse
+
+
+def grouped_layout(group_ids, group_count):
+    """Return a stable sorted layout for non-negative dense group ids."""
+    ids = np.ascontiguousarray(group_ids, dtype=np.int64).reshape(-1)
+    if ids.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty, empty
+    if group_count <= 0 or ids.min() < 0 or ids.max() >= group_count:
+        raise ValueError("group ids are outside the declared dense range")
+    order = np.argsort(ids, kind="stable")
+    sorted_ids = ids[order]
+    starts_mask = np.empty((sorted_ids.shape[0],), dtype=bool)
+    starts_mask[0] = True
+    starts_mask[1:] = sorted_ids[1:] != sorted_ids[:-1]
+    starts = np.flatnonzero(starts_mask)
+    return order, starts, sorted_ids[starts]
+
+
+def grouped_min_max_count(group_ids, values, group_count):
+    """Compute dense per-group min/max/count without ufunc scatter updates."""
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    order, starts, present = grouped_layout(group_ids, group_count)
+    minimum = np.full((group_count,), np.inf, dtype=np.float32)
+    maximum = np.full((group_count,), -np.inf, dtype=np.float32)
+    count = np.zeros((group_count,), dtype=np.int32)
+    if order.size == 0:
+        return minimum, maximum, count
+    sorted_values = values[order]
+    minimum[present] = np.minimum.reduceat(sorted_values, starts)
+    maximum[present] = np.maximum.reduceat(sorted_values, starts)
+    ends = np.empty((starts.shape[0] + 1,), dtype=np.int64)
+    ends[:-1] = starts
+    ends[-1] = sorted_values.shape[0]
+    count[present] = np.diff(ends).astype(np.int32)
+    return minimum, maximum, count
+
+
+def grouped_minimum(group_ids, values, group_count, fill_value):
+    """Compute a dense minimum image/vector without ``np.minimum.at``."""
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    order, starts, present = grouped_layout(group_ids, group_count)
+    out = np.full((group_count,), fill_value, dtype=np.float32)
+    if order.size:
+        out[present] = np.minimum.reduceat(values[order], starts)
+    return out
+
+
+def spatially_select_cloud_indices(points, score, max_points, base_voxel):
+    """Bound a cloud while retaining its spatial coverage.
+
+    Selecting globally by vote count favors repeatedly observed start-area
+    voxels. Group by a coarser global grid instead, then retain the strongest
+    representative only inside each cell. The output therefore continues to
+    show newly mapped regions after the point limit is reached.
+    """
+    count = int(points.shape[0])
+    if max_points <= 0 or count <= max_points:
+        return np.arange(count, dtype=np.int64), float(base_voxel)
+    score = np.asarray(score, dtype=np.float32).reshape(-1)
+    if score.shape[0] != count:
+        raise ValueError("semantic cloud score length does not match points")
+
+    # Most outdoor semantic points lie on surfaces, so the square-root scale
+    # is a good first estimate for the coarser grid. A few retries cover dense
+    # vegetation and facade volumes without repeatedly sorting the cloud.
+    selection_voxel = max(1e-3, float(base_voxel)) * max(
+        1.0, np.sqrt(float(count) / float(max_points)))
+    group_ids = None
+    group_count = count
+    for _ in range(3):
+        keys = np.floor(points / selection_voxel).astype(np.int64)
+        _, group_ids = unique_integer_rows(keys)
+        group_count = int(group_ids.max()) + 1 if group_ids.size else 0
+        if group_count <= max_points:
+            break
+        selection_voxel *= 1.35
+
+    # ``lexsort`` orders by group first and score second, so the first member
+    # of each group is its highest-confidence representative. It avoids the
+    # unstable global score truncation that kept only the frequently revisited
+    # origin region.
+    order = np.lexsort((-score, group_ids))
+    sorted_groups = group_ids[order]
+    starts = np.empty((sorted_groups.shape[0],), dtype=bool)
+    starts[0] = True
+    starts[1:] = sorted_groups[1:] != sorted_groups[:-1]
+    selected = order[np.flatnonzero(starts)]
+    if selected.shape[0] > max_points:
+        # This only occurs for unusually volumetric clouds after the bounded
+        # retries above. Sampling ordered spatial groups still preserves map
+        # extent, unlike a global confidence ranking.
+        keep = np.linspace(0, selected.shape[0] - 1, max_points).astype(np.int64)
+        selected = selected[keep]
+    return selected.astype(np.int64, copy=False), float(selection_voxel)
+
+
 class ProjectedSemanticBEVMapper(object):
     def __init__(self):
         self.queue_dir = Path(rospy.get_param("~queue_dir", "/tmp/sam3_projected_semantic_queue"))
         self.output_dir = self.queue_dir / "output"
         self.done_dir = self.queue_dir / "done"
         self.failed_dir = self.queue_dir / "failed_mapper"
+        self.session_path = self.queue_dir / "queue_session.json"
+        self.stale_dir = self.queue_dir / "stale_sessions"
         self.done_dir.mkdir(parents=True, exist_ok=True)
         self.failed_dir.mkdir(parents=True, exist_ok=True)
+        self.stale_dir.mkdir(parents=True, exist_ok=True)
+        self.opencv_num_threads = max(
+            1, int(rospy.get_param("~opencv_num_threads", 1)))
+        cv2.setNumThreads(self.opencv_num_threads)
+        cv2.ocl.setUseOpenCL(False)
 
         self.T_cam_lidar = as_T(rospy.get_param("~T_cam_lidar"), "T_cam_lidar")
         self.T_body_lidar = as_T(rospy.get_param("~T_body_lidar"), "T_body_lidar")
@@ -193,6 +408,9 @@ class ProjectedSemanticBEVMapper(object):
         self.semantic_cloud_save_path = rospy.get_param("~semantic_cloud_save_path", "")
         self.semantic_cloud_save_every_sec = float(rospy.get_param("~semantic_cloud_save_every_sec", 0.0))
         self.last_semantic_cloud_save = 0.0
+        self.require_queue_session = bool(rospy.get_param("~require_queue_session", True))
+        self.poll_period_sec = 1.0 / max(
+            1.0, float(rospy.get_param("~queue_poll_hz", 5.0)))
 
         label_weights = rospy.get_param("~label_weights", {})
         self.label_weights = {
@@ -203,32 +421,144 @@ class ProjectedSemanticBEVMapper(object):
             LABEL_DYNAMIC: float(label_weights.get("dynamic", 0.8)),
         }
 
-        self.bridge = CvBridge()
-        self.label_pub = rospy.Publisher(rospy.get_param("~label_topic", "/local_semantic_map/label"), Image, queue_size=1)
-        self.color_pub = rospy.Publisher(rospy.get_param("~color_topic", "/local_semantic_map/color"), Image, queue_size=1)
-        self.conf_pub = rospy.Publisher(rospy.get_param("~confidence_topic", "/local_semantic_map/confidence"), Image, queue_size=1)
-        self.debug_pub = rospy.Publisher(rospy.get_param("~debug_topic", "/local_semantic_map/debug"), Image, queue_size=1)
+        self.label_pub = rospy.Publisher(
+            rospy.get_param("~label_topic", "/local_semantic_map/label"),
+            Image, queue_size=1, latch=True)
+        self.camera_label_pub = rospy.Publisher(
+            rospy.get_param("~camera_label_topic", "/sam3/camera/label"),
+            Image, queue_size=2)
+        self.camera_dynamic_mask_pub = rospy.Publisher(
+            rospy.get_param("~camera_dynamic_mask_topic", "/sam3/camera/dynamic_mask"),
+            Image, queue_size=2)
+        self.color_pub = rospy.Publisher(
+            rospy.get_param("~color_topic", "/local_semantic_map/color"),
+            Image, queue_size=1, latch=True)
+        self.conf_pub = rospy.Publisher(
+            rospy.get_param("~confidence_topic", "/local_semantic_map/confidence"),
+            Image, queue_size=1, latch=True)
+        self.debug_pub = rospy.Publisher(
+            rospy.get_param("~debug_topic", "/local_semantic_map/debug"),
+            Image, queue_size=1, latch=True)
         self.proj_debug_pub = rospy.Publisher(rospy.get_param("~projection_debug_topic", "/local_semantic_map/projection_debug"), Image, queue_size=1)
         self.proj_stats_pub = rospy.Publisher(rospy.get_param("~projection_stats_topic", "/local_semantic_map/projection_stats"), String, queue_size=1)
         self.publish_projection_debug = bool(rospy.get_param("~publish_projection_debug", True))
         self.projection_debug_max_points = int(rospy.get_param("~projection_debug_max_points", 12000))
-        self.stats_pub = rospy.Publisher(rospy.get_param("~stats_topic", "/local_semantic_map/stats"), String, queue_size=1)
-        self.semantic_cloud_pub = rospy.Publisher(self.semantic_cloud_topic, PointCloud2, queue_size=1)
-        self.semantic_cloud_stats_pub = rospy.Publisher(rospy.get_param("~semantic_cloud_stats_topic", "/semantic_cloud_map/stats"), String, queue_size=1)
+        self.stats_pub = rospy.Publisher(
+            rospy.get_param("~stats_topic", "/local_semantic_map/stats"),
+            String, queue_size=1, latch=True)
+        self.semantic_cloud_pub = rospy.Publisher(
+            self.semantic_cloud_topic, PointCloud2, queue_size=1, latch=True)
+        self.semantic_cloud_stats_pub = rospy.Publisher(
+            rospy.get_param(
+                "~semantic_cloud_stats_topic", "/semantic_cloud_map/stats"),
+            String, queue_size=1, latch=True)
         self.projected_points_pub = rospy.Publisher(self.projected_points_topic, PointCloud2, queue_size=1)
         self.lidar_frame_projected_points_pub = rospy.Publisher(self.lidar_frame_projected_points_topic, PointCloud2, queue_size=1)
 
-        self.semantic_batches = deque()  # list of dict: {time, pts_map, labels, weights}
+        self.semantic_batches = deque()  # {time, pose, pts, labels, weights, request_id}
         self.latest_T_map_body = np.eye(4)
         self.processed = set()
         self.last_pub = 0.0
         self.last_queue_wait_log = 0.0
+        self.map_dirty = False
+        self.queue_session_id = ""
 
-        rospy.Timer(rospy.Duration(0.2), self.timer_cb)
-        rospy.loginfo("v30 projected_semantic_bev_mapper started queue=%s projected_points=%s semantic_cloud=%s voxel=%.2fm output_label_mode=%s lidar_debug=%s",
+        self.refresh_queue_session(force=True)
+        self.reconcile_completed_metadata()
+        rospy.on_shutdown(self.shutdown)
+        rospy.loginfo("v37 projected_semantic_bev_mapper started session=%s queue=%s projected_points=%s semantic_cloud=%s voxel=%.2fm output_label_mode=%s lidar_debug=%s opencv_threads=%d",
+                      self.queue_session_id or "waiting",
                       str(self.queue_dir), self.projected_points_topic, self.semantic_cloud_topic,
                       self.semantic_cloud_voxel_size, self.semantic_cloud_output_label_mode,
-                      self.lidar_frame_projected_points_topic if self.publish_lidar_frame_projected_points else "disabled")
+                      self.lidar_frame_projected_points_topic if self.publish_lidar_frame_projected_points else "disabled",
+                      self.opencv_num_threads)
+
+    @staticmethod
+    def _sanitize_session_component(value):
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(value))
+
+    def load_queue_session_id(self):
+        try:
+            with open(str(self.session_path), "r") as stream:
+                return str(json.load(stream).get("session_id", ""))
+        except Exception:
+            return ""
+
+    def publish_empty_semantic_cloud(self):
+        if not self.publish_semantic_cloud:
+            return
+        empty_points = np.empty((0, 3), dtype=np.float32)
+        empty_labels = np.empty((0,), dtype=np.uint8)
+        empty_confidence = np.empty((0,), dtype=np.float32)
+        self.semantic_cloud_pub.publish(self.semantic_points_to_msg(
+            empty_points, empty_labels, empty_confidence, rospy.Time.now()))
+
+    def refresh_queue_session(self, force=False):
+        active_session = self.load_queue_session_id()
+        if self.require_queue_session and not active_session:
+            return False
+        if not force and active_session == self.queue_session_id:
+            return bool(active_session) or not self.require_queue_session
+        previous_session = self.queue_session_id
+        self.queue_session_id = active_session
+        if previous_session and previous_session != active_session:
+            self.semantic_batches.clear()
+            self.processed.clear()
+            self.map_dirty = False
+            self.publish_empty_semantic_cloud()
+            rospy.loginfo("SAM3 mapper switched queue session old=%s new=%s; cleared old map state",
+                          previous_session, active_session or "waiting")
+        elif active_session:
+            rospy.loginfo("SAM3 mapper using queue session=%s", active_session)
+        return bool(active_session) or not self.require_queue_session
+
+    def archive_stale_result(self, result_path, result_session_id, reason):
+        label = self._sanitize_session_component(result_session_id or "no_session")
+        destination = self.stale_dir / label / "output"
+        destination.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(str(result_path), str(destination / result_path.name))
+            rospy.logwarn("ignored stale SAM3 result=%s session=%s active=%s reason=%s",
+                          result_path.name, result_session_id or "missing",
+                          self.queue_session_id or "waiting", reason)
+        except OSError:
+            pass
+
+    def current_session_control_count(self, directory, pattern):
+        count = 0
+        for path in directory.glob(pattern):
+            try:
+                with open(str(path), "r") as stream:
+                    if json.load(stream).get("queue_session_id", "") == self.queue_session_id:
+                        count += 1
+            except Exception:
+                continue
+        return count
+
+    def reconcile_completed_metadata(self):
+        segmented_dir = self.queue_dir / "segmented"
+        if not segmented_dir.exists():
+            return
+        moved = 0
+        for ready_path in segmented_dir.glob("ready_*.json"):
+            try:
+                with open(str(ready_path), "r") as stream:
+                    if self.require_queue_session and (
+                            json.load(stream).get("queue_session_id", "") != self.queue_session_id):
+                        continue
+            except Exception:
+                continue
+            req_id = ready_path.stem[len("ready_"):]
+            if not (self.done_dir / ("result_%s.json" % req_id)).exists():
+                continue
+            try:
+                os.replace(str(ready_path), str(self.done_dir / ready_path.name))
+                moved += 1
+            except Exception:
+                pass
+        if moved:
+            rospy.loginfo("reconciled %d completed SAM3 metadata files into %s",
+                          moved, str(self.done_dir))
 
     def read_result(self, result_path):
         with open(str(result_path), "r") as f:
@@ -305,9 +635,8 @@ class ProjectedSemanticBEVMapper(object):
                 cv2.putText(out, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
                 y += 24
 
-            msg = self.bridge.cv2_to_imgmsg(out, encoding="bgr8")
-            msg.header.stamp = rospy.Time.now()
-            msg.header.frame_id = meta.get("camera_frame_id", "camera")
+            msg = numpy_to_image(
+                out, "bgr8", rospy.Time.now(), meta.get("camera_frame_id", "camera"))
             self.proj_debug_pub.publish(msg)
         except Exception as e:
             rospy.logwarn("failed to publish projection debug image: %s", e)
@@ -384,15 +713,10 @@ class ProjectedSemanticBEVMapper(object):
             return None
         res = max(0.10, self.geometry_grid_resolution)
         keys = np.floor(pts[:, :2] / res).astype(np.int64)
-        unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
+        unique_keys, inverse = unique_integer_rows(keys)
         ncell = unique_keys.shape[0]
-        zmin = np.full((ncell,), np.inf, dtype=np.float32)
-        zmax = np.full((ncell,), -np.inf, dtype=np.float32)
-        count = np.zeros((ncell,), dtype=np.int32)
         z = pts[:, 2].astype(np.float32)
-        np.minimum.at(zmin, inverse, z)
-        np.maximum.at(zmax, inverse, z)
-        np.add.at(count, inverse, 1)
+        zmin, zmax, count = grouped_min_max_count(inverse, z, ncell)
         lookup = {
             (int(unique_keys[i, 0]), int(unique_keys[i, 1])): i
             for i in range(ncell)
@@ -426,13 +750,14 @@ class ProjectedSemanticBEVMapper(object):
         zmin = grid_stats["zmin"]
         zmax = grid_stats["zmax"]
         count = grid_stats["count"]
-        for i, key in enumerate(qkeys):
-            idx = lookup.get((int(key[0]), int(key[1])))
-            if idx is None:
-                continue
-            ground[i] = zmin[idx]
-            zspan[i] = zmax[idx] - zmin[idx]
-            cell_count[i] = count[idx]
+        indices = np.fromiter(
+            (lookup.get((int(key[0]), int(key[1])), -1) for key in qkeys),
+            dtype=np.int64, count=n)
+        found = (indices >= 0) & (indices < zmin.shape[0])
+        found_indices = indices[found]
+        ground[found] = zmin[found_indices]
+        zspan[found] = zmax[found_indices] - zmin[found_indices]
+        cell_count[found] = count[found_indices]
 
         known = np.isfinite(ground)
         info["geometry_known"] = int(known.sum())
@@ -481,6 +806,10 @@ class ProjectedSemanticBEVMapper(object):
 
     def project_and_accumulate(self, result_path):
         req_id, result = self.read_result(result_path)
+        result_session_id = str(result.get("queue_session_id", ""))
+        if self.require_queue_session and result_session_id != self.queue_session_id:
+            self.archive_stale_result(result_path, result_session_id, "result_session_mismatch")
+            return
         if req_id in self.processed:
             return
 
@@ -503,6 +832,10 @@ class ProjectedSemanticBEVMapper(object):
 
         with open(str(meta_path), "r") as f:
             meta = json.load(f)
+        meta_session_id = str(meta.get("queue_session_id", ""))
+        if self.require_queue_session and meta_session_id != self.queue_session_id:
+            self.archive_stale_result(result_path, meta_session_id, "metadata_session_mismatch")
+            return
 
         label_path = Path(result.get("label_path", ""))
         if not label_path.exists():
@@ -520,6 +853,21 @@ class ProjectedSemanticBEVMapper(object):
         if label_img.ndim == 3:
             label_img = label_img[:, :, 0]
         label_img = label_img.astype(np.uint8)
+
+        source_stamp = meta.get("stamp", {}) or {}
+        camera_stamp = rospy.Time(
+            int(source_stamp.get("secs", 0)), int(source_stamp.get("nsecs", 0)))
+        if camera_stamp == rospy.Time():
+            try:
+                camera_stamp = rospy.Time.from_sec(float(req_id) * 1.0e-9)
+            except Exception:
+                camera_stamp = rospy.Time.now()
+        camera_frame = meta.get("camera_frame_id", "camera")
+        self.camera_label_pub.publish(numpy_to_image(
+            label_img, "mono8", camera_stamp, camera_frame))
+        dynamic_mask = (label_img == LABEL_DYNAMIC).astype(np.uint8) * 255
+        self.camera_dynamic_mask_pub.publish(numpy_to_image(
+            dynamic_mask, "mono8", camera_stamp, camera_frame))
 
         instance_path = Path(result.get("instance_path", ""))
         if not instance_path.exists():
@@ -544,12 +892,15 @@ class ProjectedSemanticBEVMapper(object):
                 cloud_in_map_frame = False
         odom_diag = meta.get("odom_diag", {}) or {}
         receipt_age = odom_diag.get("odom_receipt_age_sec", None)
-        if receipt_age is not None and abs(float(receipt_age)) > 0.50:
+        odom_mode = str(odom_diag.get("odom_match_mode", ""))
+        odom_stamp_dt = float(odom_diag.get("odom_stamp_dt", 0.0))
+        if (odom_mode != "stamp" and receipt_age is not None and
+                abs(float(receipt_age)) > 0.50):
             rospy.logwarn_throttle(
                 2.0,
                 "SAM3 projected mapper is using an old odom for id=%s: receipt_age=%.3fs stamp_dt=%.3fs. "
                 "Map-frame semantic points can look rotated/scattered.",
-                req_id, float(receipt_age), float(odom_diag.get("odom_stamp_dt", 0.0)))
+                req_id, float(receipt_age), odom_stamp_dt)
         T_map_body = np.asarray(meta["T_map_body"], dtype=np.float64).reshape(4, 4)
         self.latest_T_map_body = T_map_body.copy()
         T_map_lidar = T_map_body.dot(self.T_body_lidar)
@@ -621,8 +972,11 @@ class ProjectedSemanticBEVMapper(object):
             need_depth_image = self.enable_projection_depth_filter or self.enable_range_edge_weight
             if need_depth_image:
                 z_inside = p_cam_v[:, 2][inside]
-                depth_min = np.full((h, w), np.inf, dtype=np.float32)
-                np.minimum.at(depth_min, (vi_inside, ui_inside), z_inside.astype(np.float32))
+                flat_pixels = (
+                    vi_inside.astype(np.int64) * int(w) +
+                    ui_inside.astype(np.int64))
+                depth_min = grouped_minimum(
+                    flat_pixels, z_inside, int(h * w), np.inf).reshape(h, w)
                 depth_ref = depth_min[vi_inside, ui_inside]
                 if self.enable_projection_depth_filter:
                     depth_delta = z_inside - depth_ref
@@ -710,28 +1064,84 @@ class ProjectedSemanticBEVMapper(object):
                     pts_lidar, labels, confidence, msg_stamp, instance_ids, frame_id=lidar_frame)
                 self.lidar_frame_projected_points_pub.publish(lidar_msg)
 
-        self.semantic_batches.append({"time": t, "pts": pts_map, "labels": labels, "weights": weights})
+        self.semantic_batches.append({
+            "time": t,
+            "pose": T_map_body[:3, 3].astype(np.float64).copy(),
+            "pts": pts_map,
+            "labels": labels,
+            "weights": weights,
+            "request_id": req_id,
+        })
         self.trim_batches(t)
+        self.map_dirty = True
         self.processed.add(req_id)
 
         try:
             os.replace(str(result_path), str(self.done_dir / result_path.name))
         except Exception:
             pass
+        segmented_meta = self.queue_dir / "segmented" / ("ready_%s.json" % req_id)
+        if segmented_meta.exists():
+            try:
+                os.replace(str(segmented_meta),
+                           str(self.done_dir / segmented_meta.name))
+            except Exception:
+                pass
 
         counts = {int(k): int((labels == k).sum()) for k in np.unique(labels)}
-        rospy.loginfo("semantic projected id=%s raw_pts=%d in_img=%d sem_pts=%d refined=%d cloud_frame=%s counts=%s geom=%s",
-                      req_id, n, int(inside.sum()), int(sem_mask.sum()), int(labels.shape[0]),
+        rospy.loginfo("semantic projected id=%s stamp=%.6f pose=[%.3f %.3f %.3f] "
+                      "raw_pts=%d in_img=%d sem_pts=%d refined=%d cloud_frame=%s counts=%s geom=%s",
+                      req_id, t, T_map_body[0, 3], T_map_body[1, 3],
+                      T_map_body[2, 3],
+                      n, int(inside.sum()), int(sem_mask.sum()), int(labels.shape[0]),
                       "map" if cloud_in_map_frame else "lidar", counts, geom_info)
 
     def trim_batches(self, current_t):
-        while self.semantic_batches and current_t - self.semantic_batches[0]["time"] > self.accumulation_window_sec:
-            self.semantic_batches.popleft()
+        if self.accumulation_window_sec > 0.0:
+            while (self.semantic_batches and
+                   current_t - self.semantic_batches[0]["time"] > self.accumulation_window_sec):
+                self.semantic_batches.popleft()
         # Keep global max point count bounded.
         total = sum(b["pts"].shape[0] for b in self.semantic_batches)
         while self.semantic_batches and total > self.max_semantic_points:
             b = self.semantic_batches.popleft()
             total -= b["pts"].shape[0]
+
+    def semantic_batch_diagnostics(self):
+        if not self.semantic_batches:
+            return {
+                "oldest_stamp": None,
+                "latest_stamp": None,
+                "stamp_span_sec": 0.0,
+                "latest_request_id": "",
+                "latest_pose_xyz": [],
+                "pose_extent_m": 0.0,
+                "pose_path_length_m": 0.0,
+            }
+        times = np.asarray([b["time"] for b in self.semantic_batches],
+                           dtype=np.float64)
+        poses = np.asarray([
+            b.get("pose", np.zeros((3,), dtype=np.float64))
+            for b in self.semantic_batches
+        ], dtype=np.float64).reshape(-1, 3)
+        pose_min = poses.min(axis=0)
+        pose_max = poses.max(axis=0)
+        path_length = 0.0
+        if poses.shape[0] > 1:
+            path_length = float(
+                np.linalg.norm(np.diff(poses, axis=0), axis=1).sum())
+        return {
+            "oldest_stamp": float(times[0]),
+            "latest_stamp": float(times[-1]),
+            "stamp_span_sec": float(max(0.0, times[-1] - times[0])),
+            "latest_request_id": str(
+                self.semantic_batches[-1].get("request_id", "")),
+            "latest_pose_xyz": [float(v) for v in poses[-1]],
+            "pose_bounds_min_xyz": [float(v) for v in pose_min],
+            "pose_bounds_max_xyz": [float(v) for v in pose_max],
+            "pose_extent_m": float(np.linalg.norm(pose_max - pose_min)),
+            "pose_path_length_m": path_length,
+        }
 
     def build_semantic_cloud(self):
         if not self.semantic_batches:
@@ -748,18 +1158,22 @@ class ProjectedSemanticBEVMapper(object):
 
         voxel = max(0.03, self.semantic_cloud_voxel_size)
         keys = np.floor(pts / voxel).astype(np.int64)
-        unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
+        unique_keys, inverse = unique_integer_rows(keys)
         nvox = unique_keys.shape[0]
         vote = np.zeros((LABEL_DYNAMIC + 1, nvox), dtype=np.float32)
-        sum_xyz = np.zeros((nvox, 3), dtype=np.float64)
-        sum_w = np.zeros((nvox,), dtype=np.float64)
-
-        np.add.at(sum_xyz, inverse, pts.astype(np.float64) * weights[:, None].astype(np.float64))
-        np.add.at(sum_w, inverse, weights.astype(np.float64))
+        weights64 = weights.astype(np.float64)
+        sum_w = np.bincount(inverse, weights=weights64, minlength=nvox)
+        sum_xyz = np.empty((nvox, 3), dtype=np.float64)
+        for axis in range(3):
+            sum_xyz[:, axis] = np.bincount(
+                inverse, weights=pts[:, axis].astype(np.float64) * weights64,
+                minlength=nvox)
         for lab in SAM3_LABELS:
             m = labels == lab
             if m.any():
-                np.add.at(vote[lab], inverse[m], weights[m])
+                vote[lab] = np.bincount(
+                    inverse[m], weights=weights64[m], minlength=nvox).astype(
+                        np.float32, copy=False)
 
         best_label = np.argmax(vote, axis=0).astype(np.uint8)
         best_vote = vote[best_label, np.arange(nvox)]
@@ -788,11 +1202,12 @@ class ProjectedSemanticBEVMapper(object):
         conf_out = confidence[keep].astype(np.float32)
         votes_out = total_vote[keep].astype(np.float32)
 
+        pre_limit_points = int(pts_out.shape[0])
+        selection_voxel = voxel
         if self.semantic_cloud_max_points > 0 and pts_out.shape[0] > self.semantic_cloud_max_points:
             score = votes_out * conf_out
-            idx = np.argpartition(score, -self.semantic_cloud_max_points)[-self.semantic_cloud_max_points:]
-            order = np.argsort(score[idx])[::-1]
-            idx = idx[order]
+            idx, selection_voxel = spatially_select_cloud_indices(
+                pts_out, score, self.semantic_cloud_max_points, voxel)
             pts_out = pts_out[idx]
             labels_out = labels_out[idx]
             conf_out = conf_out[idx]
@@ -806,6 +1221,8 @@ class ProjectedSemanticBEVMapper(object):
             "votes": votes_out,
             "raw_points": int(pts.shape[0]),
             "voxels": int(nvox),
+            "pre_limit_points": pre_limit_points,
+            "selection_voxel": float(selection_voxel),
             "counts": counts,
         }
 
@@ -923,16 +1340,24 @@ class ProjectedSemanticBEVMapper(object):
         cloud = self.build_semantic_cloud()
         if cloud is None:
             return None
-        msg = self.semantic_cloud_to_msg(cloud, stamp)
+        batch_diag = self.semantic_batch_diagnostics()
+        cloud_stamp = stamp
+        latest_stamp = batch_diag.get("latest_stamp")
+        if latest_stamp is not None and latest_stamp > 0.0:
+            cloud_stamp = rospy.Time.from_sec(latest_stamp)
+        msg = self.semantic_cloud_to_msg(cloud, cloud_stamp)
         self.semantic_cloud_pub.publish(msg)
         try:
             self.save_semantic_cloud_ply(cloud)
         except Exception as e:
             rospy.logwarn_throttle(5.0, "failed saving semantic cloud ply: %s", e)
         stats = {
+            "queue_session_id": self.queue_session_id,
             "points": int(cloud["pts"].shape[0]),
             "raw_projected_points": int(cloud["raw_points"]),
             "voxels": int(cloud["voxels"]),
+            "pre_limit_points": int(cloud["pre_limit_points"]),
+            "selection_voxel": float(cloud["selection_voxel"]),
             "voxel_size": float(self.semantic_cloud_voxel_size),
             "min_votes": float(self.semantic_cloud_min_votes),
             "min_confidence": float(self.semantic_cloud_min_confidence),
@@ -940,11 +1365,18 @@ class ProjectedSemanticBEVMapper(object):
             "counts": {str(k): int(v) for k, v in cloud["counts"].items()},
             "batches": int(len(self.semantic_batches)),
         }
+        stats.update(batch_diag)
         self.semantic_cloud_stats_pub.publish(String(data=json.dumps(stats)))
         rospy.loginfo_throttle(
             5.0,
-            "semantic cloud points=%d raw=%d voxels=%d road=%d building=%d tree=%d grass=%d dynamic=%d",
-            stats["points"], stats["raw_projected_points"], stats["voxels"],
+            "semantic cloud points=%d pre_limit=%d raw=%d voxels=%d select_voxel=%.2f batches=%d latest_stamp=%s "
+            "latest_pose=%s path=%.2fm road=%d building=%d tree=%d grass=%d dynamic=%d",
+            stats["points"], stats["pre_limit_points"], stats["raw_projected_points"], stats["voxels"],
+            stats["selection_voxel"],
+            stats["batches"],
+            "none" if stats["latest_stamp"] is None else
+            "%.6f" % stats["latest_stamp"],
+            stats["latest_pose_xyz"], stats["pose_path_length_m"],
             cloud["counts"].get(LABEL_ROAD, 0), cloud["counts"].get(LABEL_BUILDING, 0),
             cloud["counts"].get(LABEL_TREE, 0), cloud["counts"].get(LABEL_GRASS, 0),
             cloud["counts"].get(LABEL_DYNAMIC, 0),
@@ -1024,10 +1456,14 @@ class ProjectedSemanticBEVMapper(object):
             return None
 
         vote_sparse = np.zeros((LABEL_DYNAMIC + 1, size_px, size_px), dtype=np.float32)
+        flat_pixels = iy.astype(np.int64) * int(size_px) + ix.astype(np.int64)
         for lab in BEV_LABELS:
             m = labs == lab
             if m.any():
-                np.add.at(vote_sparse[lab], (iy[m], ix[m]), wts[m])
+                vote_sparse[lab] = np.bincount(
+                    flat_pixels[m], weights=wts[m].astype(np.float64),
+                    minlength=size_px * size_px).reshape(size_px, size_px).astype(
+                        np.float32, copy=False)
 
         vote = vote_sparse.copy()
         if self.enable_dense_bev:
@@ -1100,15 +1536,9 @@ class ProjectedSemanticBEVMapper(object):
         else:
             label, color, conf, total_pts, sparse_color, extra = out
         stamp = rospy.Time.now()
-        label_msg = self.bridge.cv2_to_imgmsg(label, encoding="mono8")
-        color_msg = self.bridge.cv2_to_imgmsg(color, encoding="bgr8")
-        conf_msg = self.bridge.cv2_to_imgmsg(conf, encoding="mono8")
-        label_msg.header.stamp = stamp
-        color_msg.header.stamp = stamp
-        conf_msg.header.stamp = stamp
-        label_msg.header.frame_id = "camera_init"
-        color_msg.header.frame_id = "camera_init"
-        conf_msg.header.frame_id = "camera_init"
+        label_msg = numpy_to_image(label, "mono8", stamp, self.semantic_cloud_frame)
+        color_msg = numpy_to_image(color, "bgr8", stamp, self.semantic_cloud_frame)
+        conf_msg = numpy_to_image(conf, "mono8", stamp, self.semantic_cloud_frame)
         self.label_pub.publish(label_msg)
         self.color_pub.publish(color_msg)
         self.conf_pub.publish(conf_msg)
@@ -1119,9 +1549,7 @@ class ProjectedSemanticBEVMapper(object):
             debug = np.hstack([sparse_color, color, heat])
         else:
             debug = np.hstack([color, heat])
-        debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")
-        debug_msg.header.stamp = stamp
-        debug_msg.header.frame_id = "camera_init"
+        debug_msg = numpy_to_image(debug, "bgr8", stamp, self.semantic_cloud_frame)
         self.debug_pub.publish(debug_msg)
 
         stats = {
@@ -1138,6 +1566,7 @@ class ProjectedSemanticBEVMapper(object):
             "dense_bev": bool(self.enable_dense_bev),
             "road_ray_fill": bool(self.enable_road_ray_fill),
         }
+        stats.update(self.semantic_batch_diagnostics())
         self.stats_pub.publish(String(data=json.dumps(stats)))
         rospy.loginfo_throttle(5.0, "projected semantic map pts=%d fg=%.3f road=%d building=%d tree=%d grass=%d conf=%.1f batches=%d",
                                stats["total_accumulated_points"], stats["fg_ratio"], stats["road_px"],
@@ -1147,20 +1576,28 @@ class ProjectedSemanticBEVMapper(object):
         return True
 
     def timer_cb(self, event):
+        if not self.refresh_queue_session():
+            rospy.logwarn_throttle(
+                5.0, "semantic mapper waiting for camera_lidar_queue_exporter session marker: %s",
+                str(self.session_path))
+            return
         results = sorted(self.output_dir.glob("result_*.json"))
         if not results:
             now_log = time.time()
             if now_log - self.last_queue_wait_log > 5.0:
-                pending = len(list((self.queue_dir / "input").glob("ready_*.json")))
-                segmented = len(list((self.queue_dir / "segmented").glob("ready_*.json")))
-                failed = len(list((self.queue_dir / "failed_sam3").glob("ready_*.json")))
+                pending = self.current_session_control_count(
+                    self.queue_dir / "input", "ready_*.json")
+                segmented = self.current_session_control_count(
+                    self.queue_dir / "segmented", "ready_*.json")
+                failed = self.current_session_control_count(
+                    self.queue_dir / "failed_sam3", "ready_*.json")
                 if pending > 0 or segmented > 0:
                     rospy.logwarn(
                         "semantic mapper has no completed SAM3 result right now: output/result_*.json=0 "
                         "input_ready=%d segmented=%d failed_sam3=%d. SAM3 is slower than the exporter or is still "
                         "processing backlog; this is normal while the queue drains.",
                         pending, segmented, failed)
-                else:
+                elif not self.processed:
                     rospy.logwarn(
                         "semantic mapper waiting for SAM3 results: output/result_*.json=0 "
                         "input_ready=%d segmented=%d failed_sam3=%d. Start camera_lidar_queue_exporter and "
@@ -1177,13 +1614,38 @@ class ProjectedSemanticBEVMapper(object):
                 except Exception:
                     pass
         now = time.time()
-        if self.publish_rate <= 0.0 or now - self.last_pub >= 1.0 / self.publish_rate:
+        publish_due = (
+            self.publish_rate <= 0.0 or
+            now - self.last_pub >= 1.0 / self.publish_rate)
+        if self.map_dirty and publish_due:
             self.last_pub = now
             if not self.publish_bev():
                 self.publish_semantic_cloud_map(rospy.Time.now())
+            self.map_dirty = False
+
+    def run(self):
+        """Poll the queue on the process foreground thread.
+
+        OpenCV's image decode/projection operations are no longer invoked from
+        a background thread.  This avoids the native crashes observed after
+        several dozen asynchronous SAM3 results on AT128 bags.
+        """
+        while not rospy.is_shutdown():
+            try:
+                self.timer_cb(None)
+            except Exception as error:
+                rospy.logerr_throttle(
+                    2.0, "projected semantic mapper foreground loop failed: %s", error)
+            time.sleep(self.poll_period_sec)
+
+    def shutdown(self):
+        pass
 
 
 if __name__ == "__main__":
+    faulthandler.enable(all_threads=True)
     rospy.init_node("projected_semantic_bev_mapper")
+    rospy.loginfo("semantic mapper runtime: numpy=%s (%s) cv2=%s (%s)",
+                  np.__version__, np.__file__, cv2.__version__, cv2.__file__)
     node = ProjectedSemanticBEVMapper()
-    rospy.spin()
+    node.run()

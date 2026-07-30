@@ -1,0 +1,7 @@
+estimate_topic: /hybrid/odometry
+ground_truth_topic: /ground_truth/odom
+metrics_topic: /hybrid/evaluation
+metrics_array_topic: /hybrid/evaluation/values
+max_association_dt: 0.05
+align_initial_pose: true
+save_path: ''

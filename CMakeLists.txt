@@ -4,145 +4,188 @@ project(fast_livo2_global_localization)
 add_compile_options(-std=c++14 -O2)
 
 find_package(catkin REQUIRED COMPONENTS
-  roscpp rospy std_msgs sensor_msgs nav_msgs geometry_msgs
+  roscpp
+  std_msgs
+  sensor_msgs
+  nav_msgs
+  geometry_msgs
   visualization_msgs
-  tf2 tf2_ros tf2_geometry_msgs
-  cv_bridge image_transport pcl_ros pcl_conversions
+  diagnostic_msgs
   livox_ros_driver
+  tf2
+  tf2_ros
 )
-find_package(OpenCV REQUIRED)
-find_package(PCL REQUIRED)
-find_package(Eigen3 REQUIRED)
+# The locally installed GTSAM 4.0.2 was built against Ubuntu's Eigen 3.3.7.
+# Prefer that matching ABI over a newer /usr/local Eigen installation.
+if(EXISTS "/usr/lib/cmake/eigen3/Eigen3Config.cmake")
+  set(Eigen3_DIR "/usr/lib/cmake/eigen3" CACHE PATH
+      "Eigen version matching the installed GTSAM ABI" FORCE)
+endif()
+find_package(Eigen3 REQUIRED NO_MODULE)
+find_package(GTSAM REQUIRED)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc imgcodecs calib3d video features2d)
+set(GTSAM_INCLUDE_DIRS ${GTSAM_INCLUDE_DIR})
+set(GTSAM_LIBRARIES gtsam)
 
 catkin_package(
-  CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs nav_msgs geometry_msgs visualization_msgs tf2 tf2_ros tf2_geometry_msgs cv_bridge image_transport pcl_ros pcl_conversions livox_ros_driver
-  DEPENDS OpenCV PCL Eigen3
+  INCLUDE_DIRS include
+  LIBRARIES hybrid_semantic_pose_graph hybrid_visual_rotation hybrid_sparse_visual_map
+            hybrid_visual_loop
+  CATKIN_DEPENDS roscpp std_msgs sensor_msgs nav_msgs geometry_msgs
+                 visualization_msgs diagnostic_msgs livox_ros_driver tf2 tf2_ros
+  DEPENDS GTSAM OpenCV
 )
 
-include_directories(${catkin_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIRS})
-
-set(RANGENETPP_ROOT "/home/dawn/software/rangenet_ws" CACHE PATH "RangeNet++ rangenet_lib catkin workspace")
-set(TENSORRT_ROOT "/usr/local/TensorRT-10.8.0.43" CACHE PATH "TensorRT root used by rangenet_lib")
-set(RANGENETPP_INCLUDE_DIR "${RANGENETPP_ROOT}/src/rangenet_lib/include")
-set(RANGENETPP_LIB_DIR "${RANGENETPP_ROOT}/devel/lib")
-set(TENSORRT_INCLUDE_DIR "${TENSORRT_ROOT}/include")
-if(EXISTS "${TENSORRT_ROOT}/targets/x86_64-linux-gnu/lib")
-  set(TENSORRT_LIB_DIR "${TENSORRT_ROOT}/targets/x86_64-linux-gnu/lib")
-else()
-  set(TENSORRT_LIB_DIR "${TENSORRT_ROOT}/lib")
+if(NOT EIGEN3_INCLUDE_DIRS AND EIGEN3_INCLUDE_DIR)
+  set(EIGEN3_INCLUDE_DIRS ${EIGEN3_INCLUDE_DIR})
 endif()
-set(CUDA_INCLUDE_DIR "/usr/local/cuda/include" CACHE PATH "CUDA include directory used by TensorRT headers")
-
-if(EXISTS "${RANGENETPP_INCLUDE_DIR}/selector.hpp" AND
-   EXISTS "${RANGENETPP_LIB_DIR}/librangenet_lib.so" AND
-   EXISTS "${TENSORRT_INCLUDE_DIR}/NvInfer.h" AND
-   EXISTS "${TENSORRT_LIB_DIR}/libnvinfer.so")
-  set(HAVE_REAL_RANGENETPP ON)
-  include_directories(${RANGENETPP_INCLUDE_DIR} ${TENSORRT_INCLUDE_DIR} ${CUDA_INCLUDE_DIR})
-  link_directories(${RANGENETPP_LIB_DIR} ${TENSORRT_LIB_DIR})
-else()
-  set(HAVE_REAL_RANGENETPP OFF)
-  message(WARNING "Real RangeNet++ rangenet_lib/TensorRT files not found; rangenetpp_ros_node will not be built.")
-endif()
-
-add_executable(global_localizer_node src/global_localizer_node.cpp)
-target_link_libraries(global_localizer_node ${catkin_LIBRARIES} ${OpenCV_LIBRARIES} ${PCL_LIBRARIES})
-
-
-add_executable(cloud_topic_probe_node src/cloud_topic_probe_node.cpp)
-target_link_libraries(cloud_topic_probe_node
-  ${catkin_LIBRARIES}
+include_directories(
+  include
+  ${catkin_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIRS}
+  ${GTSAM_INCLUDE_DIR}
+  ${OpenCV_INCLUDE_DIRS}
 )
 
-add_executable(semantic_voxel_mapper_node src/semantic_voxel_mapper_node.cpp)
-target_link_libraries(semantic_voxel_mapper_node
+add_library(hybrid_semantic_pose_graph
+  src/semantic_pose_graph.cpp
+)
+target_link_libraries(hybrid_semantic_pose_graph gtsam)
+
+add_library(hybrid_visual_rotation
+  src/visual_rotation_tracker.cpp
+)
+# GTSAM exports the Eigen vectorization flags used by the pose-graph consumer
+# (notably -march=native on the local 4.0.2 build).  Inheriting that interface
+# keeps fixed-size Eigen objects ABI-compatible across this shared-library API.
+target_link_libraries(hybrid_visual_rotation ${OpenCV_LIBRARIES} gtsam)
+
+add_library(hybrid_sparse_visual_map
+  src/sparse_visual_map.cpp
+)
+target_link_libraries(hybrid_sparse_visual_map ${OpenCV_LIBRARIES})
+
+add_library(hybrid_visual_loop
+  src/visual_loop_detector.cpp
+)
+target_link_libraries(hybrid_visual_loop ${OpenCV_LIBRARIES} gtsam)
+
+add_executable(pdf_hybrid_localization_node
+  src/hybrid_localization_core.cpp
+  src/lidar_odometry.cpp
+  src/hybrid_localization_node.cpp
+)
+target_link_libraries(pdf_hybrid_localization_node
+  hybrid_sparse_visual_map
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
 
-add_executable(semantic_keyframe_pose_graph_node src/semantic_keyframe_pose_graph_node.cpp)
-target_link_libraries(semantic_keyframe_pose_graph_node
-  ${catkin_LIBRARIES}
+add_executable(semantic_gtsam_pose_graph_node
+  src/semantic_gtsam_pose_graph_node.cpp
 )
-
-add_executable(segformer_mask_projector_node src/segformer_mask_projector_node.cpp)
-target_link_libraries(segformer_mask_projector_node
+target_link_libraries(semantic_gtsam_pose_graph_node
+  hybrid_semantic_pose_graph
+  hybrid_visual_rotation
+  hybrid_visual_loop
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
+  gtsam
 )
 
-add_executable(rangenet_geometry_adapter_node src/rangenet_geometry_adapter_node.cpp)
-target_link_libraries(rangenet_geometry_adapter_node
-  ${catkin_LIBRARIES}
+add_executable(hybrid_localization_core_smoke_test
+  src/hybrid_localization_core.cpp
+  src/lidar_odometry.cpp
+  src/hybrid_localization_core_smoke_test.cpp
 )
-
-add_executable(livox_custom_to_pointcloud2_node src/livox_custom_to_pointcloud2_node.cpp)
-target_link_libraries(livox_custom_to_pointcloud2_node
-  ${catkin_LIBRARIES}
-)
-
-if(HAVE_REAL_RANGENETPP)
-  set(TENSORRT_RUNTIME_LIBS
-    ${TENSORRT_LIB_DIR}/libnvinfer.so
-    ${TENSORRT_LIB_DIR}/libnvonnxparser.so
-  )
-  if(EXISTS "${TENSORRT_LIB_DIR}/libnvparsers.so")
-    list(APPEND TENSORRT_RUNTIME_LIBS ${TENSORRT_LIB_DIR}/libnvparsers.so)
-  endif()
-  add_executable(rangenetpp_ros_node src/rangenetpp_ros_node.cpp)
-  target_link_libraries(rangenetpp_ros_node
-    ${catkin_LIBRARIES}
-    rangenet_lib
-    rangenet_external
-    yaml-cpp
-    -Wl,--no-as-needed
-    ${TENSORRT_LIB_DIR}/libnvinfer_plugin.so
-    -Wl,--as-needed
-    ${TENSORRT_RUNTIME_LIBS}
-  )
-  set_target_properties(rangenetpp_ros_node PROPERTIES
-    BUILD_RPATH "${RANGENETPP_LIB_DIR};${TENSORRT_LIB_DIR}"
-    INSTALL_RPATH "${RANGENETPP_LIB_DIR};${TENSORRT_LIB_DIR}"
-  )
+if(CATKIN_ENABLE_TESTING)
+  add_test(NAME hybrid_localization_core_smoke_test
+           COMMAND hybrid_localization_core_smoke_test)
 endif()
 
-add_executable(trajectory_groundtruth_evaluator_node src/trajectory_groundtruth_evaluator_node.cpp)
-target_link_libraries(trajectory_groundtruth_evaluator_node
+add_executable(visual_loop_detector_smoke_test
+  src/visual_loop_detector_smoke_test.cpp
+)
+target_link_libraries(visual_loop_detector_smoke_test
+  hybrid_visual_loop
+  ${OpenCV_LIBRARIES}
+  gtsam
+)
+if(CATKIN_ENABLE_TESTING)
+  add_test(NAME visual_loop_detector_smoke_test
+           COMMAND visual_loop_detector_smoke_test)
+endif()
+
+add_executable(semantic_pose_graph_smoke_test
+  src/semantic_pose_graph_smoke_test.cpp
+)
+target_link_libraries(semantic_pose_graph_smoke_test
+  hybrid_semantic_pose_graph
+  gtsam
+)
+if(CATKIN_ENABLE_TESTING)
+  add_test(NAME semantic_pose_graph_smoke_test
+           COMMAND semantic_pose_graph_smoke_test)
+endif()
+
+add_executable(visual_rotation_tracker_smoke_test
+  src/visual_rotation_tracker_smoke_test.cpp
+)
+target_link_libraries(visual_rotation_tracker_smoke_test
+  hybrid_visual_rotation
+  ${OpenCV_LIBRARIES}
+  gtsam
+)
+if(CATKIN_ENABLE_TESTING)
+  add_test(NAME visual_rotation_tracker_smoke_test
+           COMMAND visual_rotation_tracker_smoke_test)
+endif()
+
+add_executable(sparse_visual_map_smoke_test
+  src/sparse_visual_map_smoke_test.cpp
+)
+target_link_libraries(sparse_visual_map_smoke_test
+  hybrid_sparse_visual_map
+  ${OpenCV_LIBRARIES}
+)
+if(CATKIN_ENABLE_TESTING)
+  add_test(NAME sparse_visual_map_smoke_test
+           COMMAND sparse_visual_map_smoke_test)
+endif()
+
+add_executable(livox_custom_to_pointcloud2_node
+  src/livox_custom_to_pointcloud2_node.cpp
+)
+target_link_libraries(livox_custom_to_pointcloud2_node ${catkin_LIBRARIES})
+
+add_executable(fast_livo2_global_hybrid_localization_evaluator_node
+  src/hybrid_localization_evaluator_node.cpp
+)
+set_target_properties(fast_livo2_global_hybrid_localization_evaluator_node PROPERTIES
+  OUTPUT_NAME hybrid_localization_evaluator_node
+)
+target_link_libraries(fast_livo2_global_hybrid_localization_evaluator_node
   ${catkin_LIBRARIES}
 )
 
 catkin_install_python(PROGRAMS
-  scripts/satellite_tile_downloader.py
-  scripts/efficient_loftr_bridge.py
-  scripts/cloud_topic_probe.py
-  scripts/map_match_evaluator.py
-  scripts/eloftr_queue_exporter.py
-  scripts/eloftr_queue_result_publisher.py
-  scripts/eloftr_file_service.py
-  scripts/semantic_file_service.py
-  scripts/sam3_semantic_match_service.py
-  scripts/geo_prior_constraint_match_service.py
-  scripts/local_geometric_semantic_mapper.py
   scripts/camera_lidar_queue_exporter.py
   scripts/projected_semantic_bev_mapper.py
-  scripts/sam3_image_mask_service.py
-  scripts/rangenetpp_inference_bridge.py
-  scripts/trajectory_ned_recorder.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-install(TARGETS
-  global_localizer_node
-  cloud_topic_probe_node
-  semantic_voxel_mapper_node
-  semantic_keyframe_pose_graph_node
-  segformer_mask_projector_node
-  rangenet_geometry_adapter_node
-  livox_custom_to_pointcloud2_node
-  trajectory_groundtruth_evaluator_node
+install(TARGETS hybrid_semantic_pose_graph hybrid_visual_rotation
+                hybrid_sparse_visual_map hybrid_visual_loop
+                pdf_hybrid_localization_node semantic_gtsam_pose_graph_node
+                fast_livo2_global_hybrid_localization_evaluator_node
+                livox_custom_to_pointcloud2_node
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
-if(HAVE_REAL_RANGENETPP)
-  install(TARGETS rangenetpp_ros_node RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
-endif()
-install(DIRECTORY launch config docs DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
+install(DIRECTORY include/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
+)
+install(DIRECTORY launch config docs rviz
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)

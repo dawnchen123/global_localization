@@ -1,25 +1,28 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>fast_livo2_global_localization</name>
-  <version>0.2.0</version>
-  <description>Wide-area hybrid localization extension for FAST-LIVO2 with high-resolution satellite tiles, ground-removed BEV generation, map alignment and EKF fusion.</description>
+  <version>1.0.0</version>
+  <description>C++ multi-factor hybrid localization with optional asynchronous SAM3 semantic mapping.</description>
   <maintainer email="user@example.com">researcher</maintainer>
   <license>MIT</license>
+
   <buildtool_depend>catkin</buildtool_depend>
   <depend>roscpp</depend>
-  <depend>rospy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>livox_ros_driver</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
-  <depend>cv_bridge</depend>
-  <depend>image_transport</depend>
-  <depend>pcl_ros</depend>
-  <depend>pcl_conversions</depend>
-  <depend>livox_ros_driver</depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
   <export/>
 </package>

@@ -5,9 +5,11 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -186,6 +188,15 @@ struct SE2MatchSample
   double weight = 1.0;
 };
 
+enum class ConstraintDebugState : uint8_t
+{
+  CANDIDATE = 0,
+  INLIER = 1,
+  OUTLIER = 2,
+  APPLIED = 3,
+  COUNT = 4
+};
+
 struct ConstraintDebugPair
 {
   Eigen::Vector3d source = Eigen::Vector3d::Zero();
@@ -193,6 +204,7 @@ struct ConstraintDebugPair
   uint32_t label = LABEL_UNKNOWN;
   double residual = 0.0;
   double weight = 1.0;
+  ConstraintDebugState state = ConstraintDebugState::CANDIDATE;
 };
 
 struct LocalSemanticFrame
@@ -516,6 +528,11 @@ class SemanticVoxelMapper
     pnh_.param<double>("max_xy_correction_step", max_xy_correction_step_, 0.03);
     pnh_.param<double>("max_abs_xy_correction", max_abs_xy_correction_, 5.0);
     pnh_.param<double>("max_xy_match_residual", max_xy_match_residual_, 3.0);
+    pnh_.param<int>("xy_ransac_iterations", xy_ransac_iterations_, 250);
+    pnh_.param<double>("xy_ransac_inlier_threshold", xy_ransac_inlier_threshold_, 0.45);
+    pnh_.param<double>("xy_ransac_min_pair_separation_m", xy_ransac_min_pair_separation_m_, 2.0);
+    pnh_.param<int>("xy_huber_iterations", xy_huber_iterations_, 5);
+    pnh_.param<double>("xy_huber_delta", xy_huber_delta_, 0.25);
     pnh_.param<bool>("enable_semantic_yaw_correction", enable_semantic_yaw_correction_, true);
     pnh_.param<int>("min_se2_constraint_matches", min_se2_constraint_matches_, 30);
     pnh_.param<double>("min_se2_spread_m", min_se2_spread_m_, 8.0);
@@ -1183,7 +1200,7 @@ class SemanticVoxelMapper
   void publishConstraintDebug(const ros::Time& stamp,
                               const std::string& ns,
                               const std::vector<ConstraintDebugPair>& pairs,
-                              bool accepted,
+                              bool constraint_valid,
                               const std::string& reason,
                               ros::Publisher& marker_pub,
                               ros::Publisher& points_pub) const
@@ -1204,54 +1221,82 @@ class SemanticVoxelMapper
     clear.action = visualization_msgs::Marker::DELETEALL;
     markers.markers.push_back(clear);
 
-    visualization_msgs::Marker lines;
-    lines.header.stamp = stamp;
-    lines.header.frame_id = map_frame_;
-    lines.ns = ns + "_links";
-    lines.id = 1;
-    lines.type = visualization_msgs::Marker::LINE_LIST;
-    lines.action = visualization_msgs::Marker::ADD;
-    lines.pose.orientation.w = 1.0;
-    lines.scale.x = accepted ? 0.05 : 0.035;
-    lines.color = accepted ? markerColor(0.0, 1.0, 0.15, 0.95) : markerColor(1.0, 0.1, 0.0, 0.85);
+    constexpr std::size_t state_count = static_cast<std::size_t>(ConstraintDebugState::COUNT);
+    const std::array<std::string, state_count> state_names =
+        {{"candidate", "inlier", "outlier", "applied"}};
+    const std::array<std_msgs::ColorRGBA, state_count> state_colors =
+        {{markerColor(1.0, 0.62, 0.0, 0.85),
+          markerColor(0.0, 0.78, 1.0, 0.95),
+          markerColor(0.48, 0.48, 0.48, 0.65),
+          markerColor(0.0, 1.0, 0.15, 0.98)}};
+    const std::array<double, state_count> line_widths = {{0.03, 0.045, 0.025, 0.07}};
 
-    visualization_msgs::Marker src_points;
-    src_points.header = lines.header;
-    src_points.ns = ns + "_source";
-    src_points.id = 2;
-    src_points.type = visualization_msgs::Marker::SPHERE_LIST;
-    src_points.action = visualization_msgs::Marker::ADD;
-    src_points.pose.orientation.w = 1.0;
-    src_points.scale.x = src_points.scale.y = src_points.scale.z = 0.25;
-    src_points.color = markerColor(0.1, 0.45, 1.0, 0.95);
+    std::array<visualization_msgs::Marker, state_count> lines;
+    std::array<visualization_msgs::Marker, state_count> src_points;
+    std::array<visualization_msgs::Marker, state_count> target_points;
+    std::array<std::size_t, state_count> state_totals = {{0, 0, 0, 0}};
+    std::array<std::size_t, state_count> state_shown = {{0, 0, 0, 0}};
+    for (std::size_t state = 0; state < state_count; ++state)
+    {
+      lines[state].header.stamp = stamp;
+      lines[state].header.frame_id = map_frame_;
+      lines[state].ns = ns + "_" + state_names[state] + "_links";
+      lines[state].id = static_cast<int>(10 + state * 3);
+      lines[state].type = visualization_msgs::Marker::LINE_LIST;
+      lines[state].action = visualization_msgs::Marker::ADD;
+      lines[state].pose.orientation.w = 1.0;
+      lines[state].scale.x = line_widths[state];
+      lines[state].color = state_colors[state];
 
-    visualization_msgs::Marker target_points;
-    target_points.header = lines.header;
-    target_points.ns = ns + "_target";
-    target_points.id = 3;
-    target_points.type = visualization_msgs::Marker::SPHERE_LIST;
-    target_points.action = visualization_msgs::Marker::ADD;
-    target_points.pose.orientation.w = 1.0;
-    target_points.scale.x = target_points.scale.y = target_points.scale.z = 0.32;
-    target_points.color = markerColor(1.0, 0.85, 0.0, 0.95);
+      src_points[state].header = lines[state].header;
+      src_points[state].ns = ns + "_" + state_names[state] + "_source";
+      src_points[state].id = static_cast<int>(11 + state * 3);
+      src_points[state].type = visualization_msgs::Marker::SPHERE_LIST;
+      src_points[state].action = visualization_msgs::Marker::ADD;
+      src_points[state].pose.orientation.w = 1.0;
+      const double source_size = state == static_cast<std::size_t>(ConstraintDebugState::APPLIED) ? 0.28 : 0.20;
+      src_points[state].scale.x = src_points[state].scale.y = src_points[state].scale.z = source_size;
+      src_points[state].color = state_colors[state];
+
+      target_points[state].header = lines[state].header;
+      target_points[state].ns = ns + "_" + state_names[state] + "_target";
+      target_points[state].id = static_cast<int>(12 + state * 3);
+      target_points[state].type = visualization_msgs::Marker::SPHERE_LIST;
+      target_points[state].action = visualization_msgs::Marker::ADD;
+      target_points[state].pose.orientation.w = 1.0;
+      const double target_size = state == static_cast<std::size_t>(ConstraintDebugState::APPLIED) ? 0.34 : 0.25;
+      target_points[state].scale.x = target_points[state].scale.y = target_points[state].scale.z = target_size;
+      target_points[state].color = state_colors[state];
+    }
+
+    for (const auto& pair : pairs)
+    {
+      const std::size_t state = static_cast<std::size_t>(pair.state);
+      if (state < state_count)
+      {
+        ++state_totals[state];
+      }
+    }
 
     std::vector<OutputPoint> debug_points;
     const std::size_t limit = static_cast<std::size_t>(std::max(1, constraint_debug_max_pairs_));
     const std::size_t stride = pairs.size() > limit ? std::max<std::size_t>(1, pairs.size() / limit) : 1;
-    double abs_res_sum = 0.0;
-    double abs_res_max = 0.0;
+    std::array<double, state_count> state_abs_res_sum = {{0.0, 0.0, 0.0, 0.0}};
+    std::array<double, state_count> state_abs_res_max = {{0.0, 0.0, 0.0, 0.0}};
     std::size_t used = 0;
     for (std::size_t i = 0; i < pairs.size() && used < limit; i += stride)
     {
       const ConstraintDebugPair& pair = pairs[i];
-      if (!std::isfinite(pair.source.x()) || !std::isfinite(pair.target.x()))
+      const std::size_t state = static_cast<std::size_t>(pair.state);
+      if (state >= state_count || !pair.source.allFinite() || !pair.target.allFinite())
       {
         continue;
       }
-      lines.points.push_back(markerPoint(pair.source));
-      lines.points.push_back(markerPoint(pair.target));
-      src_points.points.push_back(markerPoint(pair.source));
-      target_points.points.push_back(markerPoint(pair.target));
+      lines[state].points.push_back(markerPoint(pair.source));
+      lines[state].points.push_back(markerPoint(pair.target));
+      src_points[state].points.push_back(markerPoint(pair.source));
+      target_points[state].points.push_back(markerPoint(pair.target));
+      ++state_shown[state];
 
       OutputPoint src;
       src.x = static_cast<float>(pair.source.x());
@@ -1272,15 +1317,16 @@ class SemanticVoxelMapper
       debug_points.push_back(tgt);
 
       const double ar = std::fabs(pair.residual);
-      abs_res_sum += ar;
-      abs_res_max = std::max(abs_res_max, ar);
+      state_abs_res_sum[state] += ar;
+      state_abs_res_max[state] = std::max(state_abs_res_max[state], ar);
       ++used;
     }
 
     visualization_msgs::Marker text;
-    text.header = lines.header;
+    text.header.stamp = stamp;
+    text.header.frame_id = map_frame_;
     text.ns = ns + "_status";
-    text.id = 4;
+    text.id = 100;
     text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
     text.action = visualization_msgs::Marker::ADD;
     text.pose.orientation.w = 1.0;
@@ -1297,22 +1343,48 @@ class SemanticVoxelMapper
     }
     text.pose.position = markerPoint(label_pos);
     text.scale.z = 0.8;
-    text.color = markerColor(1.0, 1.0, 1.0, 0.95);
+    const bool has_applied = state_totals[static_cast<std::size_t>(ConstraintDebugState::APPLIED)] > 0;
+    text.color = has_applied ? markerColor(0.0, 1.0, 0.15, 0.98) :
+                 constraint_valid ? markerColor(0.0, 0.78, 1.0, 0.98) :
+                                    markerColor(1.0, 0.35, 0.20, 0.98);
     std::ostringstream label;
-    label << ns << " " << (accepted ? "ACCEPT" : "REJECT")
+    label << ns << " " << (has_applied ? "APPLIED" : (constraint_valid ? "VALIDATED" : "REJECT"))
           << " reason=" << reason
           << " pairs=" << pairs.size()
-          << " shown=" << used;
-    if (used > 0)
+          << " shown=" << used
+          << " candidate=" << state_totals[static_cast<std::size_t>(ConstraintDebugState::CANDIDATE)]
+          << " inlier=" << state_totals[static_cast<std::size_t>(ConstraintDebugState::INLIER)]
+          << " outlier=" << state_totals[static_cast<std::size_t>(ConstraintDebugState::OUTLIER)]
+          << " applied=" << state_totals[static_cast<std::size_t>(ConstraintDebugState::APPLIED)]
+          << " shown[c/i/o/a]="
+          << state_shown[static_cast<std::size_t>(ConstraintDebugState::CANDIDATE)] << "/"
+          << state_shown[static_cast<std::size_t>(ConstraintDebugState::INLIER)] << "/"
+          << state_shown[static_cast<std::size_t>(ConstraintDebugState::OUTLIER)] << "/"
+          << state_shown[static_cast<std::size_t>(ConstraintDebugState::APPLIED)];
+    const std::size_t inlier_state = static_cast<std::size_t>(ConstraintDebugState::INLIER);
+    const std::size_t applied_state = static_cast<std::size_t>(ConstraintDebugState::APPLIED);
+    const std::size_t outlier_state = static_cast<std::size_t>(ConstraintDebugState::OUTLIER);
+    const std::size_t effective_shown = state_shown[inlier_state] + state_shown[applied_state];
+    if (effective_shown > 0)
     {
-      label << " mean_abs_res=" << (abs_res_sum / static_cast<double>(used))
-            << " max_abs_res=" << abs_res_max;
+      label << " effective_mean_abs_res="
+            << ((state_abs_res_sum[inlier_state] + state_abs_res_sum[applied_state]) /
+                static_cast<double>(effective_shown))
+            << " effective_max_abs_res="
+            << std::max(state_abs_res_max[inlier_state], state_abs_res_max[applied_state]);
+    }
+    if (state_shown[outlier_state] > 0)
+    {
+      label << " outlier_max_abs_res=" << state_abs_res_max[outlier_state];
     }
     text.text = label.str();
 
-    markers.markers.push_back(lines);
-    markers.markers.push_back(src_points);
-    markers.markers.push_back(target_points);
+    for (std::size_t state = 0; state < state_count; ++state)
+    {
+      markers.markers.push_back(lines[state]);
+      markers.markers.push_back(src_points[state]);
+      markers.markers.push_back(target_points[state]);
+    }
     markers.markers.push_back(text);
     marker_pub.publish(markers);
     publishPointCloud(debug_points, ns + "_debug_points", points_pub, stamp);
@@ -1448,7 +1520,8 @@ class SemanticVoxelMapper
                             const Eigen::Vector3d& mean,
                             uint32_t label,
                             int search_radius_cells,
-                            double* best_distance = nullptr) const
+                            double* best_distance = nullptr,
+                            VoxelKey* best_key = nullptr) const
   {
     const int radius = std::max(0, search_radius_cells);
     const SemanticAnchor* best = nullptr;
@@ -1470,6 +1543,10 @@ class SemanticVoxelMapper
         {
           best_dist = dist;
           best = &it->second;
+          if (best_key)
+          {
+            *best_key = candidate;
+          }
         }
       }
     }
@@ -1483,9 +1560,11 @@ class SemanticVoxelMapper
   const SemanticAnchor* findNearestObjectAnchor(const VoxelKey& key,
                                                 const Eigen::Vector3d& mean,
                                                 uint32_t label,
-                                                double* best_distance = nullptr) const
+                                                double* best_distance = nullptr,
+                                                VoxelKey* best_key = nullptr) const
   {
-    return findNearestObjectAnchorIn(object_anchors_, key, mean, label, xy_anchor_search_radius_cells_, best_distance);
+    return findNearestObjectAnchorIn(object_anchors_, key, mean, label,
+                                     xy_anchor_search_radius_cells_, best_distance, best_key);
   }
 
   const SemanticAnchor* findZObjectAnchor(const VoxelKey& key,
@@ -1663,6 +1742,190 @@ class SemanticVoxelMapper
     return accum;
   }
 
+  static void replaceConstraintDebugState(std::vector<ConstraintDebugPair>& pairs,
+                                          ConstraintDebugState from,
+                                          ConstraintDebugState to)
+  {
+    for (auto& pair : pairs)
+    {
+      if (pair.state == from)
+      {
+        pair.state = to;
+      }
+    }
+  }
+
+  bool runSE2Ransac(const std::vector<SE2MatchSample>& samples,
+                    std::vector<bool>& inliers) const
+  {
+    inliers.assign(samples.size(), false);
+    if (samples.size() < 2)
+    {
+      return false;
+    }
+
+    const int iterations = std::max(1, xy_ransac_iterations_);
+    const double threshold = std::max(
+        0.02, std::min(std::max(0.05, max_xy_match_residual_), xy_ransac_inlier_threshold_));
+    const double min_separation = std::max(0.10, xy_ransac_min_pair_separation_m_);
+    std::mt19937 generator(static_cast<uint32_t>(0x6d2b79f5U ^ samples.size()));
+    std::uniform_int_distribution<std::size_t> distribution(0, samples.size() - 1);
+
+    double best_score = -1.0;
+    double best_error = std::numeric_limits<double>::infinity();
+    std::size_t best_count = 0;
+    std::vector<bool> trial_inliers(samples.size(), false);
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+      std::size_t first = distribution(generator);
+      std::size_t second = distribution(generator);
+      if (first == second)
+      {
+        second = (second + 1) % samples.size();
+      }
+
+      const Eigen::Vector2d source_delta = samples[second].source - samples[first].source;
+      const Eigen::Vector2d target_delta = samples[second].target - samples[first].target;
+      if (source_delta.norm() < min_separation || target_delta.norm() < min_separation * 0.5)
+      {
+        continue;
+      }
+
+      const double yaw = std::atan2(source_delta.x() * target_delta.y() - source_delta.y() * target_delta.x(),
+                                    source_delta.dot(target_delta));
+      const double c = std::cos(yaw);
+      const double s = std::sin(yaw);
+      Eigen::Matrix2d rotation;
+      rotation << c, -s, s, c;
+      const Eigen::Vector2d translation = samples[first].target - rotation * samples[first].source;
+
+      double score = 0.0;
+      double error = 0.0;
+      std::size_t count = 0;
+      std::fill(trial_inliers.begin(), trial_inliers.end(), false);
+      for (std::size_t i = 0; i < samples.size(); ++i)
+      {
+        const double residual = (rotation * samples[i].source + translation - samples[i].target).norm();
+        if (residual > threshold)
+        {
+          continue;
+        }
+        const double weight = std::max(0.05, samples[i].weight);
+        trial_inliers[i] = true;
+        score += weight;
+        error += weight * residual * residual;
+        ++count;
+      }
+
+      if (score > best_score + 1e-9 ||
+          (std::fabs(score - best_score) <= 1e-9 && error < best_error))
+      {
+        best_score = score;
+        best_error = error;
+        best_count = count;
+        inliers = trial_inliers;
+      }
+    }
+    return best_count >= 2;
+  }
+
+  bool solveHuberSE2(const std::vector<SE2MatchSample>& samples,
+                     const std::vector<bool>& active,
+                     Eigen::Vector3d& delta,
+                     Eigen::Vector2d& center,
+                     double& spread,
+                     double& residual_rms) const
+  {
+    if (samples.size() != active.size())
+    {
+      return false;
+    }
+
+    double base_weight_sum = 0.0;
+    center.setZero();
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+      if (!active[i])
+      {
+        continue;
+      }
+      const double weight = std::max(0.05, samples[i].weight);
+      center += samples[i].source * weight;
+      base_weight_sum += weight;
+    }
+    if (base_weight_sum <= 1e-6)
+    {
+      return false;
+    }
+    center /= base_weight_sum;
+
+    double spread_sum = 0.0;
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+      if (!active[i])
+      {
+        continue;
+      }
+      const double weight = std::max(0.05, samples[i].weight);
+      spread_sum += weight * (samples[i].source - center).squaredNorm();
+    }
+    spread = std::sqrt(spread_sum / base_weight_sum);
+
+    delta.setZero();
+    const int iterations = std::max(1, xy_huber_iterations_);
+    const double huber_delta = std::max(0.02, xy_huber_delta_);
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+      Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
+      Eigen::Vector3d g = Eigen::Vector3d::Zero();
+      for (std::size_t i = 0; i < samples.size(); ++i)
+      {
+        if (!active[i])
+        {
+          continue;
+        }
+        const Eigen::Vector2d d = samples[i].source - center;
+        const Eigen::Vector2d rhs = samples[i].target - samples[i].source;
+        Eigen::Matrix<double, 2, 3> A;
+        A << 1.0, 0.0, -d.y(),
+             0.0, 1.0,  d.x();
+        const double error_norm = (A * delta - rhs).norm();
+        const double robust_weight = iteration == 0 || error_norm <= huber_delta ?
+                                     1.0 : huber_delta / std::max(1e-9, error_norm);
+        const double weight = std::max(0.05, samples[i].weight) * robust_weight;
+        H += weight * (A.transpose() * A);
+        g += weight * (A.transpose() * rhs);
+      }
+      if (std::fabs(H.determinant()) < 1e-9)
+      {
+        return false;
+      }
+      const Eigen::Vector3d solution = H.ldlt().solve(g);
+      if (!solution.allFinite())
+      {
+        return false;
+      }
+      delta = solution;
+    }
+
+    double error_sum = 0.0;
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+      if (!active[i])
+      {
+        continue;
+      }
+      const Eigen::Vector2d d = samples[i].source - center;
+      const Eigen::Vector2d prediction(delta.x() - delta.z() * d.y(),
+                                       delta.y() + delta.z() * d.x());
+      const Eigen::Vector2d rhs = samples[i].target - samples[i].source;
+      const double weight = std::max(0.05, samples[i].weight);
+      error_sum += weight * (prediction - rhs).squaredNorm();
+    }
+    residual_rms = std::sqrt(error_sum / base_weight_sum);
+    return std::isfinite(residual_rms);
+  }
+
   void updateGroundAnchors(const std::vector<FrameSemanticPoint>& points,
                            const ros::Time& stamp,
                            const GroundFrameFilter& ground_filter)
@@ -1744,10 +2007,20 @@ class SemanticVoxelMapper
   void updateSemanticXYCorrection(const std::vector<FrameSemanticPoint>& points, const ros::Time& stamp)
   {
     const double interval = std::max(0.0, pose_constraint_interval_sec_);
-    if (interval > 0.0 && !last_pose_constraint_time_.isZero() &&
-        (stamp - last_pose_constraint_time_).toSec() < interval)
+    if (interval > 0.0 && !last_pose_constraint_time_.isZero())
     {
-      return;
+      const double dt = (stamp - last_pose_constraint_time_).toSec();
+      if (dt >= 0.0 && dt < interval)
+      {
+        return;
+      }
+      if (dt < 0.0)
+      {
+        ROS_WARN_THROTTLE(2.0,
+                          "semantic XY constraint time moved backwards by %.3fs; "
+                          "resetting interval gate so debug markers keep publishing",
+                          -dt);
+      }
     }
     last_pose_constraint_time_ = stamp;
 
@@ -1768,16 +2041,22 @@ class SemanticVoxelMapper
       return;
     }
 
-    std::vector<double> residual_x;
-    std::vector<double> residual_y;
     std::vector<SE2MatchSample> samples;
+    std::vector<std::size_t> sample_debug_indices;
     std::vector<ConstraintDebugPair> debug_pairs;
-    residual_x.reserve(static_cast<std::size_t>(std::max(1, max_xy_constraint_samples_)));
-    residual_y.reserve(static_cast<std::size_t>(std::max(1, max_xy_constraint_samples_)));
     samples.reserve(static_cast<std::size_t>(std::max(1, max_xy_constraint_samples_)));
+    sample_debug_indices.reserve(static_cast<std::size_t>(std::max(1, max_xy_constraint_samples_)));
     debug_pairs.reserve(static_cast<std::size_t>(std::max(1, max_xy_constraint_samples_)));
 
     const auto object_accum_current = buildObjectAccum(points, true);
+    struct CurrentObjectNode
+    {
+      VoxelKey key;
+      Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+      uint32_t count = 0;
+    };
+    std::vector<CurrentObjectNode> current_nodes;
+    current_nodes.reserve(object_accum_current.size());
     for (const auto& kv : object_accum_current)
     {
       const uint32_t label = static_cast<uint32_t>(std::max(0, kv.first.z));
@@ -1790,125 +2069,204 @@ class SemanticVoxelMapper
       {
         continue;
       }
-      const Eigen::Vector3d mean = a.sum / a.weight_sum;
+      CurrentObjectNode node;
+      node.key = kv.first;
+      node.mean = a.sum / a.weight_sum;
+      node.count = a.count;
+      current_nodes.push_back(node);
+    }
+    std::sort(current_nodes.begin(), current_nodes.end(), [](const CurrentObjectNode& lhs,
+                                                             const CurrentObjectNode& rhs) {
+      if (lhs.key.z != rhs.key.z)
+      {
+        return lhs.key.z < rhs.key.z;
+      }
+      if (lhs.key.x != rhs.key.x)
+      {
+        return lhs.key.x < rhs.key.x;
+      }
+      return lhs.key.y < rhs.key.y;
+    });
+
+    std::unordered_set<VoxelKey, VoxelKeyHash> used_target_keys;
+    const std::size_t association_limit =
+        static_cast<std::size_t>(std::max(1, max_xy_constraint_samples_));
+    for (const auto& node : current_nodes)
+    {
+      if (debug_pairs.size() >= association_limit)
+      {
+        break;
+      }
+      const uint32_t label = static_cast<uint32_t>(std::max(0, node.key.z));
       double anchor_distance = 0.0;
-      const SemanticAnchor* anchor = findNearestObjectAnchor(kv.first, mean, label, &anchor_distance);
+      VoxelKey target_key;
+      const SemanticAnchor* anchor = findNearestObjectAnchor(node.key, node.mean, label,
+                                                             &anchor_distance, &target_key);
       if (!anchor || anchor_distance > std::max(0.05, max_xy_match_residual_))
       {
         continue;
       }
-      const Eigen::Vector2d residual(mean.x() - anchor->mean.x(), mean.y() - anchor->mean.y());
-      const double sample_weight = std::min(1.0, static_cast<double>(a.count) / 30.0);
-      addXYResidualSample(residual_x, residual_y, residual, sample_weight);
-      if (samples.size() < static_cast<std::size_t>(std::max(1, max_xy_constraint_samples_)))
+
+      const Eigen::Vector2d residual = node.mean.head<2>() - anchor->mean.head<2>();
+      const double sample_weight = std::min(1.0, static_cast<double>(node.count) / 30.0);
+      ConstraintDebugPair dbg;
+      dbg.source = node.mean;
+      dbg.target = anchor->mean;
+      dbg.label = label;
+      dbg.residual = residual.norm();
+      dbg.weight = std::max(0.05, sample_weight);
+      dbg.state = ConstraintDebugState::CANDIDATE;
+      const std::size_t debug_index = debug_pairs.size();
+      debug_pairs.push_back(dbg);
+
+      const int radius = std::max(0, xy_anchor_search_radius_cells_);
+      bool has_reverse = false;
+      VoxelKey reverse_key;
+      double reverse_distance = std::numeric_limits<double>::infinity();
+      for (int dx = -radius; dx <= radius; ++dx)
       {
-        SE2MatchSample sample;
-        sample.source = mean.head<2>();
-        sample.target = anchor->mean.head<2>();
-        sample.weight = std::max(0.05, sample_weight);
-        samples.push_back(sample);
-        ConstraintDebugPair dbg;
-        dbg.source = mean;
-        dbg.target = anchor->mean;
-        dbg.label = label;
-        dbg.residual = residual.norm();
-        dbg.weight = sample.weight;
-        debug_pairs.push_back(dbg);
+        for (int dy = -radius; dy <= radius; ++dy)
+        {
+          const VoxelKey source_key{target_key.x + dx, target_key.y + dy, static_cast<int>(label)};
+          const auto source_it = object_accum_current.find(source_key);
+          if (source_it == object_accum_current.end() ||
+              source_it->second.count < 8 || source_it->second.weight_sum <= 1e-6)
+          {
+            continue;
+          }
+          const Eigen::Vector3d source_mean = source_it->second.sum / source_it->second.weight_sum;
+          const double distance = (source_mean.head<2>() - anchor->mean.head<2>()).norm();
+          if (distance < reverse_distance)
+          {
+            reverse_distance = distance;
+            reverse_key = source_key;
+            has_reverse = true;
+          }
+        }
       }
+
+      const bool reciprocal = has_reverse && reverse_key == node.key &&
+                              reverse_distance <= std::max(0.05, max_xy_match_residual_);
+      const bool target_unique = reciprocal && used_target_keys.insert(target_key).second;
+      if (!reciprocal || !target_unique)
+      {
+        debug_pairs[debug_index].state = ConstraintDebugState::OUTLIER;
+        continue;
+      }
+
+      SE2MatchSample sample;
+      sample.source = node.mean.head<2>();
+      sample.target = anchor->mean.head<2>();
+      sample.weight = std::max(0.05, sample_weight);
+      samples.push_back(sample);
+      sample_debug_indices.push_back(debug_index);
     }
 
-    last_xy_matches_ = static_cast<int>(std::min(residual_x.size(), residual_y.size()));
-    if (last_xy_matches_ < std::max(1, min_xy_constraint_matches_))
+    const int min_se2 = std::max(2, std::max(min_xy_constraint_matches_, min_se2_constraint_matches_));
+    if (static_cast<int>(samples.size()) < min_se2)
     {
       pose_constraint_stale_frames_ += 1;
       pose_xy_variance_ = std::min(max_pose_xy_variance_, pose_xy_variance_ * 1.05 + 0.02);
       pose_yaw_variance_ = std::min(max_pose_yaw_variance_, pose_yaw_variance_ * 1.05 + 1e-5);
-      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "too_few_xy_matches",
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "too_few_mutual_unique_matches",
                              xy_constraint_debug_pub_, xy_constraint_points_pub_);
       return;
     }
 
-    const double rx = robustMedian(residual_x);
-    const double ry = robustMedian(residual_y);
-    last_xy_residual_ = Eigen::Vector2d(rx, ry);
-
-    const int min_se2 = std::max(std::max(1, min_xy_constraint_matches_), min_se2_constraint_matches_);
-    if (static_cast<int>(samples.size()) < min_se2)
+    std::vector<bool> ransac_inliers;
+    if (!runSE2Ransac(samples, ransac_inliers))
     {
       pose_constraint_stale_frames_ += 1;
-      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "too_few_se2_samples",
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "ransac_no_valid_model",
                              xy_constraint_debug_pub_, xy_constraint_points_pub_);
       return;
     }
 
-    double wsum = 0.0;
+    int ransac_count = 0;
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+      debug_pairs[sample_debug_indices[i]].state =
+          ransac_inliers[i] ? ConstraintDebugState::INLIER : ConstraintDebugState::OUTLIER;
+      ransac_count += ransac_inliers[i] ? 1 : 0;
+    }
+    if (ransac_count < min_se2)
+    {
+      pose_constraint_stale_frames_ += 1;
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "too_few_ransac_inliers",
+                             xy_constraint_debug_pub_, xy_constraint_points_pub_);
+      return;
+    }
+
+    Eigen::Vector3d delta = Eigen::Vector3d::Zero();
     Eigen::Vector2d center = Eigen::Vector2d::Zero();
-    for (const auto& sample : samples)
-    {
-      const double w = std::max(0.05, sample.weight);
-      center += sample.source * w;
-      wsum += w;
-    }
-    if (wsum <= 1e-6)
+    if (!solveHuberSE2(samples, ransac_inliers, delta, center,
+                       last_se2_spread_, last_se2_residual_rms_))
     {
       pose_constraint_stale_frames_ += 1;
-      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "zero_weight",
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "huber_singular_se2",
                              xy_constraint_debug_pub_, xy_constraint_points_pub_);
       return;
     }
-    center /= wsum;
 
-    Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
-    Eigen::Vector3d g = Eigen::Vector3d::Zero();
-    double spread_sum = 0.0;
-    for (const auto& sample : samples)
+    const double final_gate = std::max(
+        0.02, std::min(std::max(0.05, max_xy_match_residual_), xy_ransac_inlier_threshold_));
+    std::vector<bool> final_inliers = ransac_inliers;
+    int final_count = 0;
+    for (std::size_t i = 0; i < samples.size(); ++i)
     {
-      const double w = std::max(0.05, sample.weight);
-      const Eigen::Vector2d d = sample.source - center;
-      const Eigen::Vector2d rhs = sample.target - sample.source;
-      Eigen::Matrix<double, 2, 3> A;
-      A << 1.0, 0.0, -d.y(),
-           0.0, 1.0,  d.x();
-      H += w * (A.transpose() * A);
-      g += w * (A.transpose() * rhs);
-      spread_sum += w * d.squaredNorm();
+      if (final_inliers[i])
+      {
+        const Eigen::Vector2d d = samples[i].source - center;
+        const Eigen::Vector2d prediction(delta.x() - delta.z() * d.y(),
+                                         delta.y() + delta.z() * d.x());
+        const Eigen::Vector2d rhs = samples[i].target - samples[i].source;
+        final_inliers[i] = (prediction - rhs).norm() <= final_gate;
+      }
+      debug_pairs[sample_debug_indices[i]].state =
+          final_inliers[i] ? ConstraintDebugState::INLIER : ConstraintDebugState::OUTLIER;
+      final_count += final_inliers[i] ? 1 : 0;
     }
-    last_se2_spread_ = std::sqrt(spread_sum / wsum);
+    last_xy_matches_ = final_count;
+    if (final_count < min_se2)
+    {
+      pose_constraint_stale_frames_ += 1;
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "too_few_post_huber_inliers",
+                             xy_constraint_debug_pub_, xy_constraint_points_pub_);
+      return;
+    }
+
+    if (!solveHuberSE2(samples, final_inliers, delta, center,
+                       last_se2_spread_, last_se2_residual_rms_))
+    {
+      pose_constraint_stale_frames_ += 1;
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "final_huber_singular_se2",
+                             xy_constraint_debug_pub_, xy_constraint_points_pub_);
+      return;
+    }
+
+    std::vector<double> residual_x;
+    std::vector<double> residual_y;
+    residual_x.reserve(static_cast<std::size_t>(final_count));
+    residual_y.reserve(static_cast<std::size_t>(final_count));
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+      if (!final_inliers[i])
+      {
+        continue;
+      }
+      const Eigen::Vector2d residual = samples[i].source - samples[i].target;
+      residual_x.push_back(residual.x());
+      residual_y.push_back(residual.y());
+    }
+    last_xy_residual_ = Eigen::Vector2d(robustMedian(residual_x), robustMedian(residual_y));
+
     if (last_se2_spread_ < std::max(0.5, min_se2_spread_m_))
     {
       pose_constraint_stale_frames_ += 1;
-      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "low_spread",
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "low_inlier_spread",
                              xy_constraint_debug_pub_, xy_constraint_points_pub_);
       return;
     }
-    if (std::fabs(H.determinant()) < 1e-9)
-    {
-      pose_constraint_stale_frames_ += 1;
-      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "singular_se2",
-                             xy_constraint_debug_pub_, xy_constraint_points_pub_);
-      return;
-    }
-
-    const Eigen::Vector3d delta = H.ldlt().solve(g);
-    if (!std::isfinite(delta.x()) || !std::isfinite(delta.y()) || !std::isfinite(delta.z()))
-    {
-      pose_constraint_stale_frames_ += 1;
-      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, false, "nonfinite_solution",
-                             xy_constraint_debug_pub_, xy_constraint_points_pub_);
-      return;
-    }
-
-    double err_sum = 0.0;
-    for (const auto& sample : samples)
-    {
-      const double w = std::max(0.05, sample.weight);
-      const Eigen::Vector2d d = sample.source - center;
-      const Eigen::Vector2d pred(delta.x() - delta.z() * d.y(),
-                                 delta.y() + delta.z() * d.x());
-      const Eigen::Vector2d rhs = sample.target - sample.source;
-      err_sum += w * (pred - rhs).squaredNorm();
-    }
-    last_se2_residual_rms_ = std::sqrt(err_sum / std::max(1e-6, wsum));
     if (last_se2_residual_rms_ > std::max(0.05, max_se2_residual_rms_))
     {
       pose_constraint_stale_frames_ += 1;
@@ -1922,7 +2280,7 @@ class SemanticVoxelMapper
     if (!enable_semantic_xy_correction_)
     {
       pose_constraint_stale_frames_ += 1;
-      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, true, "debug_only_xy_correction_disabled",
+      publishConstraintDebug(stamp, "xy_constraint", debug_pairs, true, "validated_xy_correction_disabled",
                              xy_constraint_debug_pub_, xy_constraint_points_pub_);
       return;
     }
@@ -1969,10 +2327,12 @@ class SemanticVoxelMapper
     pose_constraint_stale_frames_ = 0;
     pose_xy_variance_ = std::max(min_pose_xy_variance_,
                                  (last_se2_residual_rms_ * last_se2_residual_rms_) /
-                                     std::max(1.0, static_cast<double>(samples.size())));
+                                     std::max(1.0, static_cast<double>(final_count)));
     pose_yaw_variance_ = std::max(min_pose_yaw_variance_,
                                   std::fabs(delta.z()) * std::fabs(delta.z()) /
-                                      std::max(1.0, static_cast<double>(samples.size())));
+                                      std::max(1.0, static_cast<double>(final_count)));
+    replaceConstraintDebugState(debug_pairs, ConstraintDebugState::INLIER,
+                                ConstraintDebugState::APPLIED);
     publishConstraintDebug(stamp, "xy_constraint", debug_pairs, true, "accepted",
                            xy_constraint_debug_pub_, xy_constraint_points_pub_);
   }
@@ -2180,6 +2540,8 @@ class SemanticVoxelMapper
           dbg.label = fp.label;
           dbg.residual = residual;
           dbg.weight = sample_weight;
+          dbg.state = max_z_residual_abs_ > 0.0 && std::fabs(residual) > max_z_residual_abs_ ?
+                      ConstraintDebugState::OUTLIER : ConstraintDebugState::CANDIDATE;
           debug_pairs.push_back(dbg);
         }
         addZResidualSample(residuals, z_fit_samples, p, residual, sample_weight, true);
@@ -2212,6 +2574,8 @@ class SemanticVoxelMapper
             dbg.label = label;
             dbg.residual = residual;
             dbg.weight = object_anchor_weight_;
+            dbg.state = max_z_residual_abs_ > 0.0 && std::fabs(residual) > max_z_residual_abs_ ?
+                        ConstraintDebugState::OUTLIER : ConstraintDebugState::CANDIDATE;
             debug_pairs.push_back(dbg);
           }
           addZResidualSample(residuals, z_fit_samples, mean, residual, object_anchor_weight_, false);
@@ -2241,6 +2605,9 @@ class SemanticVoxelMapper
           publishSemanticConstraintStatus(stamp);
           return;
         }
+
+        replaceConstraintDebugState(debug_pairs, ConstraintDebugState::CANDIDATE,
+                                    ConstraintDebugState::INLIER);
 
         const double jump_gate = std::max(0.0, max_z_residual_jump_);
         if (!has_z_candidate_residual_ ||
@@ -2283,6 +2650,8 @@ class SemanticVoxelMapper
         pose_z_variance_ = std::max(min_pose_z_variance_,
                                     (residual * residual) / std::max(1.0, static_cast<double>(last_z_matches_)));
         updateSemanticZSlopeCorrection(z_fit_samples, residual);
+        replaceConstraintDebugState(debug_pairs, ConstraintDebugState::INLIER,
+                                    ConstraintDebugState::APPLIED);
         publishConstraintDebug(stamp, "z_constraint", debug_pairs, true, "accepted",
                                z_constraint_debug_pub_, z_constraint_points_pub_);
       }
@@ -3418,6 +3787,9 @@ class SemanticVoxelMapper
   double max_xy_correction_step_ = 0.03;
   double max_abs_xy_correction_ = 5.0;
   double max_xy_match_residual_ = 3.0;
+  double xy_ransac_inlier_threshold_ = 0.45;
+  double xy_ransac_min_pair_separation_m_ = 2.0;
+  double xy_huber_delta_ = 0.25;
   double yaw_correction_alpha_ = 0.05;
   double max_yaw_correction_step_deg_ = 0.15;
   double max_abs_yaw_correction_deg_ = 8.0;
@@ -3496,6 +3868,8 @@ class SemanticVoxelMapper
   int min_xy_constraint_matches_ = 12;
   int max_xy_constraint_samples_ = 500;
   int xy_anchor_search_radius_cells_ = 1;
+  int xy_ransac_iterations_ = 250;
+  int xy_huber_iterations_ = 5;
   int min_se2_constraint_matches_ = 30;
   int max_pose_constraint_stale_frames_ = 30;
   int max_z_constraint_stale_frames_ = 20;

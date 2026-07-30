@@ -1,0 +1,12 @@
+<launch>
+  <arg name="ground_truth_topic" default="/ground_truth/odom" />
+  <arg name="save_path" default="" />
+  <node pkg="fast_livo2_global_localization"
+        type="hybrid_localization_evaluator_node"
+        name="hybrid_localization_evaluator"
+        output="screen">
+    <rosparam command="load" file="$(find fast_livo2_global_localization)/config/hybrid_localization_evaluator.yaml" />
+    <param name="ground_truth_topic" value="$(arg ground_truth_topic)" />
+    <param name="save_path" value="$(arg save_path)" />
+  </node>
+</launch>

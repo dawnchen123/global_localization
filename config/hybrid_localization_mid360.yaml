@@ -1,0 +1,85 @@
+# i2Nav Livox Mid360 raw sensor interface.
+lidar_cloud_topic: /livox/mid360/points_xyzirt
+imu_topic: /adi/adis16465/imu
+wheel_topic: /insprobe/ranger/odometer
+wheel_message_type: insprobe_ranger
+subscribe_wheel: false
+lidar_frame: livox_mid360
+
+# Livox CustomMsg offset_time is in nanoseconds from scan start.
+lidar_deskew_enabled: true
+lidar_point_time_mode: relative
+lidar_point_time_scale: 0.000000001
+lidar_stamp_is_end: false
+lidar_imu_wait_sec: 0.115
+max_lidar_points: 16000
+
+lidar_odometry:
+  scan_voxel_size: 0.30
+  map_voxel_size: 0.45
+  map_insert_voxel_size: 0.18
+  max_correspondence_distance: 1.30
+  max_plane_distance: 0.38
+  plane_max_eigen_ratio: 0.22
+  huber_delta: 0.15
+  max_rmse: 0.32
+  min_inlier_ratio: 0.14
+  max_translation_per_scan: 1.5
+  max_rotation_per_scan_deg: 12.0
+  max_translation_speed: 4.0
+  max_rotation_speed_deg: 45.0
+  map_insertion_max_plane_distance: 0.24
+  max_iterations: 4
+  min_scan_points: 250
+  min_correspondences: 120
+  max_scan_points: 4000
+  max_map_points: 80000
+  local_map_radius: 65.0
+  normal_neighbor_voxels: 2
+  min_normal_neighbors: 6
+  max_plane_neighbors: 20
+  min_voxel_plane_points: 7
+  max_voxel_points: 120
+  max_plane_variance: 0.035
+  plane_uncertainty_scale: 0.8
+  plane_fit_residual_gate: 0.14
+  use_point_knn_plane: false
+  use_compatible_voxel_plane: false
+  point_knn_fallback: true
+  point_knn_fallback_max_queries: 1000
+  strong_support_min_correspondences: 350
+  strong_support_min_azimuth_sectors: 4
+  strong_support_max_rmse: 0.16
+  recovery_after_rejections: 3
+  recovery_max_lidar_correction_translation: 0.65
+  recovery_max_lidar_correction_rotation_deg: 5.0
+  max_voxel_samples: 12
+  wheel_speed_scale: 0.9865
+  wheel_forward_noise: 0.15
+  wheel_lateral_noise: 0.12
+  wheel_vertical_noise: 1.00
+  wheel_huber_delta: 1.5
+  lidar_loss_hold_after_rejections: 3
+  lidar_loss_freeze_after_rejections: 12
+  lidar_loss_max_vertical_offset: 0.35
+  lidar_loss_max_horizontal_speed: 3.0
+  lidar_loss_max_horizontal_step: 0.75
+  lidar_loss_velocity_decay: 0.98
+  imu_init_duration: 1.5
+  imu_init_samples: 250
+  imu_max_gap: 0.02
+  gyro_noise: 0.010
+  acceleration_noise: 0.08
+  gyro_bias_random_walk: 0.00005
+  acceleration_bias_random_walk: 0.0005
+
+# The supplied calibration is LiDAR -> IMU(FRD). The leading diag(1,-1,-1)
+# converts the dataset IMU frame into ROS base_link (FLU).
+body_from_lidar: [0.99997669, 0.00548118, -0.00407184, 0.0,
+                 -0.00549873, 0.99997558, -0.00431282, 0.0,
+                  0.00404810, 0.00433511, 0.99998241, 0.159,
+                  0.0, 0.0, 0.0, 1.0]
+body_from_imu: [1.0, 0.0, 0.0, 0.0,
+                0.0, -1.0, 0.0, 0.0,
+                0.0, 0.0, -1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]

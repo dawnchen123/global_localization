@@ -1,0 +1,152 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Background Color: 24; 26; 29
+    Fixed Frame: map
+    Frame Rate: 30
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Plane: XY
+      Cell Size: 1
+      Plane Cell Count: 100
+      Color: 90; 90; 90
+      Alpha: 0.45
+    - Class: rviz/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Show Axes: true
+      Show Names: false
+      Show Arrows: true
+    - Class: rviz/PointCloud2
+      Name: Registered Corrected Scan
+      Enabled: true
+      Topic: /hybrid/cloud_registered_corrected
+      Queue Size: 2
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: AxisColor
+      Position Transformer: XYZ
+      Axis: Z
+      Autocompute Value Bounds: true
+      Use Fixed Frame: true
+    - Class: rviz/PointCloud2
+      Name: Optimized Semantic Graph Map
+      Enabled: true
+      Topic: /hybrid/semantic_graph/map
+      Queue Size: 2
+      Style: Points
+      Size (Pixels): 3
+      Alpha: 1
+      Color Transformer: RGB8
+      Position Transformer: XYZ
+      Use Fixed Frame: true
+    - Class: rviz/PointCloud2
+      Name: SAM3 Fused Semantic Map
+      Enabled: true
+      Topic: /sam3/semantic_cloud_map
+      Queue Size: 2
+      Style: Points
+      Size (Pixels): 2
+      Alpha: 0.75
+      Color Transformer: RGB8
+      Position Transformer: XYZ
+      Use Fixed Frame: true
+    - Class: rviz/PointCloud2
+      Name: Current Semantic Observation
+      Enabled: false
+      Topic: /hybrid/semantic_observation
+      Queue Size: 2
+      Style: Points
+      Size (Pixels): 3
+      Alpha: 1
+      Color Transformer: RGB8
+      Position Transformer: XYZ
+      Use Fixed Frame: true
+    - Class: rviz/Odometry
+      Name: Hybrid Odometry
+      Enabled: true
+      Topic: /hybrid/odometry
+      Queue Size: 10
+      Keep: 1
+      Shape:
+        Value: Axes
+        Axes Length: 0.7
+        Axes Radius: 0.08
+    - Class: rviz/Path
+      Name: Hybrid Path
+      Enabled: true
+      Topic: /hybrid/path
+      Queue Size: 2
+      Line Style: Lines
+      Line Width: 0.04
+      Color: 0; 220; 255
+    - Class: rviz/Map
+      Name: Local BEV
+      Enabled: true
+      Topic: /hybrid/local_bev
+      Alpha: 0.35
+      Color Scheme: map
+    - Class: rviz/Map
+      Name: Prior Map
+      Enabled: false
+      Topic: /hybrid/prior_map
+      Alpha: 0.35
+      Color Scheme: map
+    - Class: rviz/MarkerArray
+      Name: Map Match Debug
+      Enabled: true
+      Marker Topic: /hybrid/map_match_debug
+      Queue Size: 10
+    - Class: rviz/MarkerArray
+      Name: XY Constraint Debug
+      Enabled: true
+      Marker Topic: /semantic_slam/xy_constraint_debug
+      Queue Size: 10
+    - Class: rviz/MarkerArray
+      Name: Z Constraint Debug
+      Enabled: true
+      Marker Topic: /semantic_slam/z_constraint_debug
+      Queue Size: 10
+    - Class: rviz/MarkerArray
+      Name: Semantic XY Observation Debug
+      Enabled: true
+      Marker Topic: /semantic_slam/semantic_xy_observation_debug
+      Queue Size: 10
+    - Class: rviz/MarkerArray
+      Name: Semantic Z Observation Debug
+      Enabled: true
+      Marker Topic: /semantic_slam/semantic_z_observation_debug
+      Queue Size: 10
+    - Class: rviz/MarkerArray
+      Name: Semantic Objects
+      Enabled: true
+      Marker Topic: /hybrid/objects/markers
+      Queue Size: 10
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 25
+      Target Frame: base_link
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 0.75
+      Yaw: 0.75
+Window Geometry:
+  Height: 900
+  Width: 1440

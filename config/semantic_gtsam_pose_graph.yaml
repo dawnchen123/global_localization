@@ -1,0 +1,294 @@
+# Internal backend for the standalone ESKF LiDAR/IMU frontend.
+frontend_odom_topic: /hybrid/frontend/odometry
+registered_cloud_topic: /hybrid/cloud_registered
+semantic_cloud_topic: /hybrid/semantic_observation
+wheel_topic: /insprobe/ranger/odometer
+camera_topic: /avt_camera/left/image/compressed
+output_odom_topic: /hybrid/odometry
+output_path_topic: /hybrid/path
+corrected_cloud_topic: /hybrid/cloud_registered_corrected
+stats_topic: /hybrid/semantic_graph/stats
+xy_debug_topic: /semantic_slam/xy_constraint_debug
+z_debug_topic: /semantic_slam/z_constraint_debug
+semantic_xy_debug_topic: /semantic_slam/semantic_xy_observation_debug
+semantic_z_debug_topic: /semantic_slam/semantic_z_observation_debug
+semantic_map_topic: /hybrid/semantic_graph/map
+visual_projection_debug_topic: /hybrid/visual/debug/projection
+visual_tracking_debug_topic: /hybrid/visual/debug/tracks
+visual_pnp_debug_topic: /hybrid/visual/debug/pnp_inliers
+visual_time_difference_topic: /hybrid/visual/debug/image_cloud_dt
+visual_loop_debug_topic: /hybrid/visual/debug/loop
+
+map_frame: map
+body_frame: base_link
+label_field: label
+confidence_field: confidence
+subscribe_semantic: false
+subscribe_camera: false
+visual_observation_only: true
+publish_visual_debug_images: true
+semantic_cloud_in_map_frame: true
+broadcast_tf: true
+save_on_shutdown: true
+max_pose_lookup_dt: 0.15
+odom_history_sec: 120.0
+semantic_map_publish_rate: 0.20
+semantic_map_voxel_size: 0.30
+semantic_map_max_points: 120000
+max_registered_points: 8000
+max_pending_registered_clouds: 100
+max_semantic_points: 6000
+max_debug_pairs: 500
+path_publish_rate: 0.5
+trajectory_checkpoint_keyframes: 25
+trajectory_save_path: ''
+camera_time_offset: 0.0
+visual_sync_tolerance: 0.06
+
+visual:
+  fx: 1064.8950
+  fy: 1065.2546
+  cx: 801.4049
+  cy: 624.6878
+  distortion: [-0.1516, 0.0942, 0.000169, -0.000142, -0.0229]
+  # i2Nav left camera -> IMU(FRD), converted to ROS body FLU.
+  body_from_camera: [0.00549192, -0.00206914, 0.99998278, 0.09,
+                     -0.99998051, 0.00295932, 0.00549803, 0.20,
+                     -0.00297065, -0.99999348, -0.00205284, 0.054,
+                     0.0, 0.0, 0.0, 1.0]
+  image_scale: 0.5
+  minimum_interval: 0.15
+  maximum_reference_gap: 0.60
+  maximum_features: 1400
+  minimum_tracks: 90
+  minimum_inliers: 65
+  feature_quality: 0.01
+  feature_minimum_distance: 10.0
+  forward_backward_error: 1.2
+  minimum_median_parallax: 1.2
+  ransac_probability: 0.999
+  ransac_threshold_pixels: 1.5
+  minimum_inlier_ratio: 0.50
+  grid_rows: 4
+  grid_cols: 6
+  minimum_occupied_cells: 8
+  maximum_rotation_rate_deg: 80.0
+  maximum_rotation_step_deg: 12.0
+  equalize_histogram: true
+  generate_debug_images: true
+  enable_lidar_pnp: true
+  require_lidar_pnp: true
+  pnp_association_radius_pixels: 5
+  pnp_minimum_correspondences: 45
+  pnp_minimum_inliers: 40
+  pnp_minimum_occupied_cells: 6
+  pnp_minimum_inlier_ratio: 0.25
+  pnp_ransac_reprojection_error: 2.0
+  pnp_ransac_iterations: 600
+  pnp_maximum_reprojection_rmse: 1.8
+  pnp_maximum_local_depth_difference: 1.25
+  pnp_maximum_local_depth_ratio: 0.08
+  pnp_minimum_depth: 1.0
+  pnp_maximum_depth: 80.0
+  pnp_maximum_translation_speed: 15.0
+  pnp_maximum_translation_step: 5.0
+
+# Non-adjacent metric visual loop detector. It reuses the calibrated camera
+# model above, but keeps a separate ORB database and LiDAR-depth PnP gates.
+visual_loop:
+  image_scale: 0.5
+  maximum_features: 1800
+  minimum_depth_features: 80
+  maximum_database_size: 1000
+  keyframe_distance: 0.75
+  keyframe_interval_sec: 1.0
+  minimum_index_gap: 25
+  search_radius: 25.0
+  maximum_yaw_difference_deg: 70.0
+  maximum_retrieval_candidates: 40
+  maximum_geometric_candidates: 5
+  descriptor_ratio: 0.75
+  minimum_descriptor_matches: 55
+  depth_association_radius_pixels: 5
+  minimum_depth: 1.0
+  maximum_depth: 80.0
+  pnp_iterations: 600
+  pnp_reprojection_error: 2.5
+  minimum_pnp_inliers: 40
+  minimum_pnp_inlier_ratio: 0.35
+  grid_rows: 4
+  grid_cols: 6
+  minimum_occupied_cells: 8
+  maximum_reprojection_rmse: 2.0
+  maximum_translation_disagreement: 3.0
+  maximum_rotation_disagreement_deg: 10.0
+  minimum_quality: 0.40
+
+graph:
+  enabled: true
+
+  # The frontend remains the high-rate estimator. GTSAM only receives this
+  # package's own keyframe poses and independent multi-frame cloud constraints.
+  enable_xy_loops: false
+  enable_z_loops: false
+  enable_sequential_ground_z: false
+  enable_wheel_factors: false
+  enable_visual_rotation_factors: false
+  enable_visual_translation_factors: false
+  enable_visual_loop_factors: false
+  enable_semantic_observation_factors: true
+  enable_semantic_observation_xy_factors: true
+  enable_semantic_observation_z_factors: true
+  semantic_observation_require_xy_for_z: true
+  use_semantics: true
+
+  keyframe_distance: 1.0
+  keyframe_yaw_deg: 8.0
+  keyframe_interval_sec: 1.0
+  max_keyframes: 2500
+  submap_frames: 8
+  max_points_per_frame: 7000
+  max_features_per_keyframe: 3500
+
+  # BEV cell features. Unknown raw LiDAR cells are classified by vertical span;
+  # SAM3 labels, when available, override the geometric class.
+  feature_resolution: 0.60
+  feature_min_points: 3
+  structural_min_height_span: 0.55
+  structural_min_z: -0.35
+  ground_max_height: -0.20
+  ground_max_height_span: 0.30
+  ground_min_points: 4
+  descriptor_rings: 20
+  descriptor_sectors: 60
+  descriptor_max_radius: 55.0
+  descriptor_min_similarity: 0.22
+  # Minimum normalized gap between the best and second geometric candidate.
+  descriptor_min_score_gap: 0.015
+  semantic_weight: 0.35
+
+  # Each message is one original-time SAM observation. Five consecutive
+  # observations form one non-overlapping semantic BEV submap. This prevents
+  # adjacent camera views from repeatedly imposing the same local bias.
+  # The rolling visualization map is never used as a factor input.
+  semantic_submap_observations: 5
+  semantic_observation_min_index_gap: 12
+  semantic_observation_max_index_gap: 45
+  semantic_observation_max_reference_uses: 2
+  semantic_observation_interval: 1
+  semantic_observation_min_features: 100
+  semantic_observation_min_inliers: 80
+  semantic_observation_min_z_inliers: 60
+  semantic_observation_search_radius: 30.0
+  semantic_observation_min_baseline: 8.0
+  semantic_observation_max_time_offset: 0.75
+  semantic_observation_correspondence_distance: 0.70
+  semantic_observation_ransac_inlier_distance: 0.30
+  semantic_observation_min_inlier_ratio: 0.55
+  semantic_observation_min_spread: 8.0
+  semantic_observation_min_spread_ratio: 0.25
+  semantic_observation_max_rmse: 0.18
+  semantic_observation_max_xy_correction: 0.25
+  semantic_observation_max_yaw_correction_deg: 0.60
+  semantic_observation_max_z_correction: 0.10
+  semantic_observation_sigma_xy: 0.55
+  semantic_observation_sigma_yaw_deg: 1.75
+  semantic_observation_sigma_z: 0.50
+  semantic_observation_huber_k: 1.345
+  min_semantic_observation_factors_for_xy_output: 2
+
+  # Candidate retrieval and coarse alignment around the frontend prediction.
+  loop_min_index_gap: 30
+  loop_max_candidates: 6
+  loop_search_radius: 18.0
+  loop_max_yaw_difference_deg: 35.0
+  coarse_xy_radius: 5.0
+  coarse_xy_step: 0.75
+  coarse_yaw_radius_deg: 8.0
+  coarse_yaw_step_deg: 2.0
+  coarse_max_points: 900
+  coarse_min_inliers: 70
+
+  # XY: mutual nearest-neighbor and one-to-one pairs, two-point RANSAC, then
+  # iterative Huber SE(2) refinement.
+  correspondence_distance: 0.90
+  ransac_inlier_distance: 0.35
+  ransac_iterations: 120
+  min_xy_inliers: 100
+  min_xy_inlier_ratio: 0.40
+  min_xy_spread: 8.0
+  min_xy_spread_ratio: 0.15
+  max_xy_rmse: 0.30
+  huber_delta: 0.25
+  huber_iterations: 5
+  max_xy_correction: 0.75
+  max_yaw_correction_deg: 2.0
+
+  # Z: first reject each over-limit candidate, then estimate median/MAD only
+  # from effective ground pairs. Rejected candidates are published in gray.
+  z_correspondence_distance: 0.65
+  z_candidate_residual_gate: 0.45
+  z_inlier_residual_gate: 0.16
+  min_z_inliers: 55
+  max_z_mad: 0.08
+  max_z_correction: 0.25
+
+  # A measurement must also agree with the current graph before insertion.
+  graph_consistency_max_xy: 0.40
+  graph_consistency_max_yaw_deg: 1.0
+  graph_consistency_max_z: 0.20
+  min_loops_for_xy_output: 2
+
+  # Pose3 tangent order is roll, pitch, yaw, x, y, z.
+  odom_sigma_roll_pitch: 0.010
+  odom_sigma_yaw: 0.008
+  odom_sigma_xy_base: 0.035
+  odom_sigma_xy_per_meter: 0.010
+  odom_sigma_z_base: 0.050
+  loop_sigma_xy: 0.25
+  loop_sigma_yaw_deg: 1.00
+  loop_sigma_z: 0.15
+  sequential_ground_sigma_z: 0.12
+  loop_huber_k: 1.345
+  sequential_ground_huber_k: 1.345
+
+  # Ranger MINI is integrated only between graph keyframes. The calibrated
+  # scale is obtained from the street00 wheel distance versus FAST-LIVO2 path.
+  wheel_speed_scale: 0.9865
+  wheel_max_gap: 0.08
+  wheel_sigma_base: 0.08
+  wheel_sigma_per_meter: 0.025
+  wheel_lateral_sigma: 0.15
+  wheel_huber_k: 1.345
+  wheel_min_samples: 5
+
+  # Camera factors are gated against the LIO prediction before insertion.
+  # Translation is used only when metric LiDAR-depth PnP is enabled explicitly.
+  visual_max_time_offset: 0.15
+  visual_min_quality: 0.30
+  visual_max_angular_disagreement_deg: 4.0
+  visual_sigma_roll_pitch_deg: 0.80
+  visual_sigma_yaw_deg: 0.50
+  visual_quality_sigma_scale: 1.5
+  visual_huber_k: 1.345
+  visual_max_translation_disagreement: 1.0
+  visual_sigma_xy_base: 0.10
+  visual_sigma_z_base: 0.18
+  visual_sigma_translation_per_meter: 0.03
+
+  # Full 6DoF robust factor produced only by a non-adjacent LiDAR-depth PnP
+  # loop. The short-baseline KLT/PnP observation-only switch does not affect it.
+  visual_loop_max_time_offset: 0.65
+  visual_loop_min_index_gap: 20
+  visual_loop_min_quality: 0.40
+  visual_loop_max_translation_disagreement: 3.0
+  visual_loop_max_rotation_disagreement_deg: 10.0
+  visual_loop_sigma_roll_pitch_deg: 2.0
+  visual_loop_sigma_yaw_deg: 1.0
+  visual_loop_sigma_xy: 0.25
+  visual_loop_sigma_z: 0.35
+  visual_loop_quality_sigma_scale: 1.5
+  visual_loop_huber_k: 1.345
+
+  isam_relinearize_threshold: 0.05
+  isam_relinearize_skip: 1
