@@ -74,11 +74,22 @@ measurement_scheduler:
   # scheduling rate so image work cannot starve the LiDAR/IMU frontend.
   camera_observation_interval_sec: 0.20
   reorder_window_sec: 0.02
+  # Flush a final bag/live frame after ingress has been idle. The frontend's
+  # IMU coverage gate still rejects a trailing LiDAR scan when future IMU data
+  # required for deskew is genuinely unavailable.
+  idle_flush_sec: 0.50
   # Wait for the next 50 Hz wheel sample so LiDAR updates see a deterministic
   # nearest measurement. A LiDAR-time timeout prevents wheel dropout stalls.
   wheel_wait_sec: 0.02
   wheel_timeout_sec: 0.15
+  # Zero preserves every LiDAR frame. High-rate sensor profiles can enable a
+  # latency bound so overload coalesces old scans while retaining IMU samples.
+  max_lidar_lag_sec: 0.0
   max_queue: 400
+  # These queues must cover the same wall-time backlog as the LiDAR queue.
+  # Defaults hold 200 s at the i2Nav 200 Hz IMU and 50 Hz wheel rates.
+  max_pending_imu_samples: 40000
+  max_pending_wheel_samples: 10000
 
 # Sparse LiDAR-depth visual map and direct photometric ESKF update.  The
 # camera-to-body matrix uses the ROS FLU body frame; image patches are sampled
@@ -198,9 +209,16 @@ lidar_odometry:
   convergence_rotation_deg: 0.03
   degeneracy_eigen_ratio: 0.0001
   observability_eigen_ratio: 0.0001
+  # Rotational support is evaluated after marginalizing translation. The
+  # projection remains opt-in so existing sensor profiles are unchanged.
+  rotation_observability_eigen_ratio: 0.0001
+  project_lidar_information_to_observable_rotation: false
+  weak_rotation_information_scale: 0.0
   min_observable_directions: 3
   max_mean_normalized_residual: 10.0
   map_insertion_min_observable_directions: 3
+  map_insertion_min_observable_rotation_directions: 0
+  map_insertion_min_yaw_observability: 0.0
   map_insertion_max_mean_normalized_residual: 8.0
   preserve_unobservable_covariance: true
   # Optional consistent degeneracy projection. Sensor profiles enable it only
@@ -209,6 +227,13 @@ lidar_odometry:
   # Optional mean-only protection against corrupting gyro bias with a
   # scan-unobservable rotation. It remains off until sensor-profile A/B tests.
   project_gyro_bias_update_to_observable_rotation: false
+  lidar_update_acceleration_bias: true
+  lidar_acceleration_bias_require_stable_wheel_motion: false
+  lidar_update_gravity: true
+  max_lidar_velocity_step: 1.0
+  max_lidar_gyro_bias_step: 0.02
+  max_lidar_acceleration_bias_step: 0.10
+  max_lidar_gravity_step: 0.05
   solver_damping: 0.0000001
   max_translation_per_scan: 0.80
   max_rotation_per_scan_deg: 10.0
@@ -216,8 +241,28 @@ lidar_odometry:
   # These rate gates avoid rejecting that physically valid accumulated motion.
   max_translation_speed: 4.0
   max_rotation_speed_deg: 40.0
+  # Allow a delayed scan to carry the rotation already supported by complete
+  # IMU propagation. Disabled globally; calibrated sensor profiles opt in.
+  turn_aware_motion_gate_enabled: false
+  turn_aware_rotation_margin_deg: 3.0
+  turn_aware_max_rotation_deg: 90.0
+  turn_aware_max_scan_dt: 1.5
+  turn_aware_min_yaw_rate: 0.20
+  turn_aware_lidar_correction_rotation_deg: 0.0
+  turn_aware_wheel_imu_max_yaw_rate_difference: 0.20
   max_lidar_correction_translation: 0.35
   max_lidar_correction_rotation_deg: 3.5
+  lidar_rotation_correction_nis_gate: 0.0
+  lidar_rotation_correction_std_floor_deg: 0.5
+  # Both positive values enable protection against a sequence of individually
+  # small, same-sign scan-to-IMU yaw corrections.
+  lidar_yaw_correction_window_sec: 0.0
+  max_cumulative_lidar_yaw_correction_deg: 0.0
+  # Optional selective guard: clamp only the gravity-axis LiDAR correction
+  # while preserving translation and roll/pitch. Disabled by default.
+  limit_cumulative_lidar_yaw_correction: false
+  limited_lidar_yaw_information_scale: 0.0
+  defer_map_when_lidar_yaw_limited: true
   degenerate_min_inlier_ratio: 0.28
   degenerate_max_rmse: 0.18
   # After consecutive failed registrations, keep propagation bounded until a
@@ -230,6 +275,9 @@ lidar_odometry:
   lidar_loss_velocity_decay: 0.98
   map_insertion_max_plane_distance: 0.25
   local_map_radius: 70.0
+  # Keep false for bounded local mapping. Dataset profiles may retain the
+  # complete voxel map when they need old geometry during a return traversal.
+  retain_global_map: false
   max_iterations: 5
   min_scan_points: 200
   min_correspondences: 100
@@ -242,6 +290,7 @@ lidar_odometry:
   max_voxel_points: 120
   max_voxel_samples: 12
   freeze_mature_voxels: false
+  mature_voxel_update_gain: 1.0
   map_insertion_min_translation: 0.0
   map_insertion_min_rotation_deg: 0.0
   map_insertion_max_interval: 0.0
@@ -286,6 +335,27 @@ lidar_odometry:
   wheel_vertical_noise: 0.25
   wheel_huber_delta: 1.5
   wheel_forward_innovation_gate: 0.0
+  # Optional differential-wheel yaw observation. The scale converts
+  # right-minus-left speed to body yaw rate and zero keeps generic odometry
+  # messages backward compatible.
+  wheel_yaw_rate_scale: 0.0
+  wheel_yaw_rate_relative_scale_uncertainty: 0.0
+  # Positive window: estimate gyro Z bias from a robust low-curvature median;
+  # zero retains the legacy frame-by-frame differential-wheel factor.
+  wheel_yaw_bias_window_sec: 0.0
+  wheel_yaw_bias_min_samples: 8
+  wheel_yaw_bias_max_abs_rate: 0.0
+  wheel_yaw_bias_max_mad: 0.0
+  wheel_yaw_bias_noise_floor: 0.01
+  wheel_yaw_bias_calibrate_offset: false
+  wheel_differential_forward_leakage: 0.0
+  wheel_yaw_rate_noise: 0.10
+  wheel_yaw_rate_huber_delta: 1.5
+  wheel_yaw_rate_innovation_gate: 16.0
+  wheel_yaw_rate_min_speed: 0.30
+  wheel_yaw_rate_max_abs: 2.0
+  wheel_yaw_rate_max_imu_difference: 0.0
+  wheel_differential_max_disagreement: 0.08
   wheel_buffer_duration: 5.0
 
   imu_init_duration: 1.5

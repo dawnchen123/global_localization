@@ -32,6 +32,7 @@ if(EXISTS "/usr/lib/x86_64-linux-gnu/cmake/opencv4/OpenCVConfig.cmake")
       "OpenCV version matching ROS Noetic binary ABI" FORCE)
 endif()
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc imgcodecs calib3d video features2d)
+find_package(OpenMP QUIET)
 set(GTSAM_INCLUDE_DIRS ${GTSAM_INCLUDE_DIR})
 set(GTSAM_LIBRARIES gtsam)
 
@@ -88,6 +89,9 @@ target_link_libraries(pdf_hybrid_localization_node
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(pdf_hybrid_localization_node OpenMP::OpenMP_CXX)
+endif()
 
 add_executable(semantic_gtsam_pose_graph_node
   src/semantic_gtsam_pose_graph_node.cpp
@@ -106,6 +110,9 @@ add_executable(hybrid_localization_core_smoke_test
   src/lidar_odometry.cpp
   src/hybrid_localization_core_smoke_test.cpp
 )
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(hybrid_localization_core_smoke_test OpenMP::OpenMP_CXX)
+endif()
 if(CATKIN_ENABLE_TESTING)
   add_test(NAME hybrid_localization_core_smoke_test
            COMMAND hybrid_localization_core_smoke_test)

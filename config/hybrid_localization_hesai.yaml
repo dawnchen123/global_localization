@@ -20,6 +20,11 @@ wheel_time_offset: -0.01
 camera_time_offset: 0.0
 max_lidar_points: 40000
 
+measurement_scheduler:
+  # Do not spend tens of seconds processing stale AT128 frames when camera,
+  # semantics, or bag replay temporarily exceeds real-time throughput.
+  max_lidar_lag_sec: 0.75
+
 lidar_odometry:
   scan_voxel_size: 0.32
   map_voxel_size: 0.45
@@ -31,21 +36,53 @@ lidar_odometry:
   huber_delta: 0.12
   max_rmse: 0.24
   min_inlier_ratio: 0.22
+  # Rebuild point-plane correspondences once more after the first small ESKF
+  # increment. This is the rematching confirmation used by FAST-LIVO2 to keep
+  # a transient turn association out of the local map.
+  convergence_confirmation_iterations: 2
+  require_convergence_for_acceptance: false
+  max_iteration_translation: 0.25
+  max_iteration_rotation_deg: 1.5
   max_translation_per_scan: 0.70
   max_rotation_per_scan_deg: 8.0
   max_translation_speed: 4.0
   max_rotation_speed_deg: 40.0
+  # Under load a registered scan can span several AT128 frames. Admit the
+  # rotation predicted by complete IMU propagation instead of treating a
+  # physically valid sharp turn as implausible motion.
+  turn_aware_motion_gate_enabled: true
+  turn_aware_rotation_margin_deg: 3.0
+  turn_aware_max_rotation_deg: 90.0
+  turn_aware_max_scan_dt: 1.25
+  turn_aware_min_yaw_rate: 0.20
+  # Widen only the correction relative to IMU when independent Ranger yaw
+  # agrees with the bias-corrected gyro; arbitrary scan matches stay at 2.8 deg.
+  turn_aware_lidar_correction_rotation_deg: 3.2
+  turn_aware_wheel_imu_max_yaw_rate_difference: 0.05
   max_lidar_correction_translation: 0.28
   max_lidar_correction_rotation_deg: 2.8
+  lidar_rotation_correction_nis_gate: 25.0
+  lidar_rotation_correction_std_floor_deg: 0.50
   observability_eigen_ratio: 0.0002
   min_observable_directions: 3
   max_mean_normalized_residual: 9.0
   map_insertion_min_observable_directions: 3
   map_insertion_max_mean_normalized_residual: 7.0
+  map_insertion_require_convergence: true
+  map_insertion_max_lidar_correction_translation: 0.20
+  map_insertion_max_lidar_correction_rotation_deg: 1.5
   preserve_unobservable_covariance: true
+  # Match FAST-LIVO2's iterated ESKF behavior: retain weak geometric
+  # directions at naturally low gain instead of hard-zeroing their update.
+  project_lidar_information_to_observable_subspace: false
+  # Suppress gyro-bias mean increments along scan-unobservable rotation modes.
+  # A Building02 A/B test showed that disabling this projection increased the
+  # 400 s APE from 1.423 m to 1.478 m.
+  project_gyro_bias_update_to_observable_rotation: true
   degenerate_min_inlier_ratio: 0.30
   degenerate_max_rmse: 0.16
   lidar_loss_hold_after_rejections: 3
+  lidar_loss_use_wheel_dead_reckoning: true
   lidar_loss_freeze_after_rejections: 12
   lidar_loss_max_vertical_offset: 0.35
   lidar_loss_max_horizontal_speed: 3.0
@@ -55,6 +92,9 @@ lidar_odometry:
   min_correspondences: 150
   max_scan_points: 7000
   max_map_points: 90000
+  # Parallelize only the read-only correspondence search. The implementation
+  # clamps this to two threads and keeps deterministic serial accumulation.
+  registration_threads: 2
   local_map_radius: 70.0
   max_iterations: 5
   map_insertion_max_plane_distance: 0.25
@@ -89,6 +129,30 @@ lidar_odometry:
   # vertical constraint strongly enough to stop scan-to-map height drift.
   wheel_vertical_noise: 0.18
   wheel_huber_delta: 1.5
+  # Ranger right-minus-left wheel speed. The sign and approximately 0.43 m
+  # equivalent track width were cross-checked on street00 and street02.
+  wheel_yaw_rate_scale: -2.3255814
+  wheel_differential_forward_leakage: -0.0010
+  # The wheel factor is already weak and robust; the independent 0.05 rad/s
+  # turn gate above remains deliberately stricter so disagreement can never
+  # widen the LiDAR correction bound.
+  wheel_yaw_rate_fuse_gyro_bias: true
+  # Robust full-bag wheel/IMU fits vary by roughly 15% with turn radius. Model
+  # that as scale uncertainty instead of a hard turn cutoff, preserving slow
+  # gyro-bias tracking through long curves while reducing sharp-turn weight.
+  wheel_yaw_rate_relative_scale_uncertainty: 0.15
+  # Slow the update of mature, validated planes so the map remains an
+  # independent reference without making calibration or viewpoint error
+  # permanent. Mixed/non-planar cells retain the full update gain.
+  freeze_mature_voxels: false
+  mature_voxel_update_gain: 0.10
+  wheel_yaw_rate_noise: 0.12
+  wheel_yaw_rate_huber_delta: 1.5
+  wheel_yaw_rate_innovation_gate: 16.0
+  wheel_yaw_rate_min_speed: 0.30
+  wheel_yaw_rate_max_abs: 2.0
+  wheel_yaw_rate_max_imu_difference: 0.20
+  wheel_differential_max_disagreement: 0.08
   # Ranger MINI center is [0, 0, 0.852] in ADIS FRD. ROS body is FLU.
   wheel_lever_arm: [0.0, 0.0, -0.852]
   wheel_compensate_angular_velocity: true

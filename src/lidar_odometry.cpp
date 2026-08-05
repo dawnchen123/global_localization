@@ -44,6 +44,23 @@ double clampNorm(Eigen::Vector3d &vector, double maximum)
   return norm;
 }
 
+double median(std::vector<double> values)
+{
+  if (values.empty())
+  {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const std::size_t middle = values.size() / 2U;
+  std::nth_element(values.begin(), values.begin() + middle, values.end());
+  const double upper = values[middle];
+  if ((values.size() & 1U) != 0U)
+  {
+    return upper;
+  }
+  const double lower = *std::max_element(values.begin(), values.begin() + middle);
+  return 0.5 * (lower + upper);
+}
+
 struct VisualMeasurementProjection
 {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -311,14 +328,41 @@ LidarOdometry::LidarOdometry(const LidarOdometryOptions &options) : options_(opt
   options_.strong_support_max_rmse = std::max(0.0, options_.strong_support_max_rmse);
   options_.observability_eigen_ratio = std::max(
       1e-8, std::min(0.25, options_.observability_eigen_ratio));
+  options_.rotation_observability_eigen_ratio = std::max(
+      1e-8, std::min(0.25, options_.rotation_observability_eigen_ratio));
+  options_.weak_rotation_information_scale = std::max(
+      0.0, std::min(1.0, options_.weak_rotation_information_scale));
   options_.min_observable_directions = std::max(
       1, std::min(6, options_.min_observable_directions));
   options_.max_mean_normalized_residual = std::max(
       0.0, options_.max_mean_normalized_residual);
+  options_.convergence_confirmation_iterations = std::max(
+      1, options_.convergence_confirmation_iterations);
+  options_.max_iteration_translation = std::max(
+      1e-4, options_.max_iteration_translation);
+  options_.max_iteration_rotation_deg = std::max(
+      1e-3, options_.max_iteration_rotation_deg);
+  options_.max_lidar_velocity_step = std::max(
+      0.0, options_.max_lidar_velocity_step);
+  options_.max_lidar_gyro_bias_step = std::max(
+      0.0, options_.max_lidar_gyro_bias_step);
+  options_.max_lidar_acceleration_bias_step = std::max(
+      0.0, options_.max_lidar_acceleration_bias_step);
+  options_.max_lidar_gravity_step = std::max(
+      0.0, options_.max_lidar_gravity_step);
   options_.map_insertion_min_observable_directions = std::max(
       1, std::min(6, options_.map_insertion_min_observable_directions));
+  options_.map_insertion_min_observable_rotation_directions = std::max(
+      0, std::min(3,
+                  options_.map_insertion_min_observable_rotation_directions));
+  options_.map_insertion_min_yaw_observability = std::max(
+      0.0, std::min(1.0, options_.map_insertion_min_yaw_observability));
   options_.map_insertion_max_mean_normalized_residual = std::max(
       0.0, options_.map_insertion_max_mean_normalized_residual);
+  options_.map_insertion_max_lidar_correction_translation = std::max(
+      0.0, options_.map_insertion_max_lidar_correction_translation);
+  options_.map_insertion_max_lidar_correction_rotation_deg = std::max(
+      0.0, options_.map_insertion_max_lidar_correction_rotation_deg);
   options_.recovery_after_rejections = std::max(0, options_.recovery_after_rejections);
   options_.recovery_max_lidar_correction_translation = std::max(
       0.0, options_.recovery_max_lidar_correction_translation);
@@ -358,6 +402,30 @@ LidarOdometry::LidarOdometry(const LidarOdometryOptions &options) : options_(opt
   options_.max_rotation_per_scan_deg = std::max(0.1, options_.max_rotation_per_scan_deg);
   options_.max_translation_speed = std::max(0.0, options_.max_translation_speed);
   options_.max_rotation_speed_deg = std::max(0.0, options_.max_rotation_speed_deg);
+  options_.turn_aware_rotation_margin_deg = std::max(
+      0.0, options_.turn_aware_rotation_margin_deg);
+  options_.turn_aware_max_rotation_deg = std::max(
+      options_.max_rotation_per_scan_deg,
+      options_.turn_aware_max_rotation_deg);
+  options_.turn_aware_max_scan_dt = std::max(
+      0.0, options_.turn_aware_max_scan_dt);
+  options_.turn_aware_min_yaw_rate = std::max(
+      0.0, options_.turn_aware_min_yaw_rate);
+  options_.turn_aware_lidar_correction_rotation_deg = std::max(
+      0.0, options_.turn_aware_lidar_correction_rotation_deg);
+  options_.turn_aware_wheel_imu_max_yaw_rate_difference = std::max(
+      0.0, options_.turn_aware_wheel_imu_max_yaw_rate_difference);
+  options_.lidar_rotation_correction_nis_gate = std::max(
+      0.0, options_.lidar_rotation_correction_nis_gate);
+  options_.lidar_rotation_correction_std_floor_deg = std::max(
+      1e-3, options_.lidar_rotation_correction_std_floor_deg);
+  options_.lidar_yaw_correction_window_sec = std::max(
+      0.0, options_.lidar_yaw_correction_window_sec);
+  options_.max_cumulative_lidar_yaw_correction_deg = std::max(
+      0.0, options_.max_cumulative_lidar_yaw_correction_deg);
+  options_.limited_lidar_yaw_information_scale = std::max(
+      0.0, std::min(1.0,
+                    options_.limited_lidar_yaw_information_scale));
   options_.lidar_loss_hold_after_rejections = std::max(
       0, options_.lidar_loss_hold_after_rejections);
   options_.lidar_loss_freeze_after_rejections = std::max(
@@ -370,17 +438,31 @@ LidarOdometry::LidarOdometry(const LidarOdometryOptions &options) : options_(opt
       0.0, options_.lidar_loss_max_horizontal_step);
   options_.lidar_loss_velocity_decay = std::max(
       0.0, std::min(1.0, options_.lidar_loss_velocity_decay));
+  options_.registration_threads = std::max(
+      1, std::min(2, options_.registration_threads));
   options_.max_iterations = std::max(1, options_.max_iterations);
   options_.min_scan_points = std::max(20, options_.min_scan_points);
   options_.min_correspondences = std::max(20, options_.min_correspondences);
   options_.max_scan_points = std::max(options_.min_scan_points, options_.max_scan_points);
   options_.max_map_points = std::max(options_.min_correspondences, options_.max_map_points);
+  if (options_.retain_global_map)
+  {
+    // A global profile knows its memory budget up front. Reserving the hash
+    // table avoids multi-million-entry rehash pauses that can otherwise make
+    // the scheduler discard a different LiDAR frame on each replay.
+    map_voxels_.reserve(static_cast<std::size_t>(options_.max_map_points));
+  }
   if (options_.max_adaptive_subvoxels <= 0)
   {
     options_.max_adaptive_subvoxels = 2 * options_.max_map_points;
   }
   options_.max_adaptive_subvoxels = std::max(
       options_.min_correspondences, options_.max_adaptive_subvoxels);
+  if (options_.retain_global_map && options_.use_adaptive_subvoxel_plane)
+  {
+    adaptive_subvoxels_.reserve(
+        static_cast<std::size_t>(options_.max_adaptive_subvoxels));
+  }
   options_.normal_neighbor_voxels = std::max(1, options_.normal_neighbor_voxels);
   options_.min_normal_neighbors = std::max(4, options_.min_normal_neighbors);
   options_.max_plane_neighbors = std::max(options_.min_normal_neighbors,
@@ -389,6 +471,8 @@ LidarOdometry::LidarOdometry(const LidarOdometryOptions &options) : options_(opt
   options_.max_voxel_points = std::max(options_.min_voxel_plane_points,
                                         options_.max_voxel_points);
   options_.max_voxel_samples = std::max(4, options_.max_voxel_samples);
+  options_.mature_voxel_update_gain = std::max(
+      0.0, std::min(1.0, options_.mature_voxel_update_gain));
   options_.map_insertion_min_translation = std::max(
       0.0, options_.map_insertion_min_translation);
   options_.map_insertion_min_rotation_deg = std::max(
@@ -418,6 +502,33 @@ LidarOdometry::LidarOdometry(const LidarOdometryOptions &options) : options_(opt
   options_.wheel_huber_delta = std::max(0.1, options_.wheel_huber_delta);
   options_.wheel_forward_innovation_gate = std::max(
       0.0, options_.wheel_forward_innovation_gate);
+  options_.wheel_yaw_rate_relative_scale_uncertainty = std::max(
+      0.0, std::min(1.0,
+                    options_.wheel_yaw_rate_relative_scale_uncertainty));
+  options_.wheel_yaw_bias_window_sec = std::max(
+      0.0, options_.wheel_yaw_bias_window_sec);
+  options_.wheel_yaw_bias_min_samples = std::max(
+      3, options_.wheel_yaw_bias_min_samples);
+  options_.wheel_yaw_bias_max_abs_rate = std::max(
+      0.0, options_.wheel_yaw_bias_max_abs_rate);
+  options_.wheel_yaw_bias_max_mad = std::max(
+      0.0, options_.wheel_yaw_bias_max_mad);
+  options_.wheel_yaw_bias_noise_floor = std::max(
+      1e-4, options_.wheel_yaw_bias_noise_floor);
+  options_.wheel_yaw_rate_noise = std::max(
+      0.01, options_.wheel_yaw_rate_noise);
+  options_.wheel_yaw_rate_huber_delta = std::max(
+      0.1, options_.wheel_yaw_rate_huber_delta);
+  options_.wheel_yaw_rate_innovation_gate = std::max(
+      0.0, options_.wheel_yaw_rate_innovation_gate);
+  options_.wheel_yaw_rate_min_speed = std::max(
+      0.0, options_.wheel_yaw_rate_min_speed);
+  options_.wheel_yaw_rate_max_abs = std::max(
+      0.01, options_.wheel_yaw_rate_max_abs);
+  options_.wheel_yaw_rate_max_imu_difference = std::max(
+      0.0, options_.wheel_yaw_rate_max_imu_difference);
+  options_.wheel_differential_max_disagreement = std::max(
+      0.0, options_.wheel_differential_max_disagreement);
   options_.wheel_buffer_duration = std::max(options_.wheel_max_age + 0.1,
                                              options_.wheel_buffer_duration);
   options_.visual_max_iterations = std::max(1, options_.visual_max_iterations);
@@ -469,6 +580,10 @@ void LidarOdometry::reset()
   imu_buffer_.clear();
   propagation_history_.clear();
   wheel_buffer_.clear();
+  wheel_yaw_bias_history_.clear();
+  wheel_yaw_bias_offset_initialized_ = false;
+  wheel_yaw_bias_offset_ = 0.0;
+  lidar_yaw_correction_history_.clear();
   map_voxels_.clear();
   adaptive_subvoxels_.clear();
 }
@@ -505,6 +620,15 @@ void LidarOdometry::addWheelSample(const WheelSample &sample)
   }
   WheelSample scaled = sample;
   scaled.forward_speed *= options_.wheel_speed_scale;
+  if (std::isfinite(scaled.differential_speed))
+  {
+    scaled.differential_speed *= options_.wheel_speed_scale;
+  }
+  if (std::isfinite(scaled.differential_disagreement))
+  {
+    scaled.differential_disagreement *=
+        std::abs(options_.wheel_speed_scale);
+  }
   if (std::abs(scaled.forward_speed) > options_.wheel_max_speed ||
       (!wheel_buffer_.empty() && scaled.stamp <= wheel_buffer_.back().stamp))
   {
@@ -518,9 +642,11 @@ void LidarOdometry::addWheelSample(const WheelSample &sample)
   }
 }
 
-bool LidarOdometry::wheelMeasurement(double stamp, double *forward_speed) const
+bool LidarOdometry::wheelMeasurement(
+    double stamp, WheelSample *measurement) const
 {
-  if (!options_.wheel_enabled || wheel_buffer_.empty() || forward_speed == nullptr)
+  if (!options_.wheel_enabled || wheel_buffer_.empty() ||
+      measurement == nullptr)
   {
     return false;
   }
@@ -543,7 +669,7 @@ bool LidarOdometry::wheelMeasurement(double stamp, double *forward_speed) const
   {
     return false;
   }
-  *forward_speed = best->forward_speed;
+  *measurement = *best;
   return true;
 }
 
@@ -1717,12 +1843,18 @@ bool LidarOdometry::findSmoothVoxelPlane(const Eigen::Vector3d &world_point,
 
 void LidarOdometry::updateVoxel(MapVoxel &voxel, const Eigen::Vector3d &point)
 {
-  if (options_.freeze_mature_voxels &&
+  // Match FAST-LIVO2's octree behavior: only a validated planar cell becomes
+  // immutable.  Freezing a full but non-planar cell prevents later views from
+  // separating an edge/mixed surface and permanently removes useful map
+  // support.
+  if (options_.freeze_mature_voxels && voxel.plane_valid &&
       voxel.count >= options_.max_voxel_points)
   {
     voxel.last_seen_scan = accepted_scan_count_;
     return;
   }
+  const bool mature_valid_plane = voxel.plane_valid &&
+      voxel.count >= options_.max_voxel_points;
   voxel.plane_valid = false;
   if (voxel.samples.size() < static_cast<std::size_t>(options_.max_voxel_samples))
   {
@@ -1745,7 +1877,9 @@ void LidarOdometry::updateVoxel(MapVoxel &voxel, const Eigen::Vector3d &point)
     const double effective_count = static_cast<double>(voxel.count);
     Eigen::Matrix3d covariance = voxel.scatter / std::max(1.0, effective_count - 1.0);
     const Eigen::Vector3d delta = point - voxel.mean;
-    const double alpha = 1.0 / effective_count;
+    const double gain = mature_valid_plane
+        ? options_.mature_voxel_update_gain : 1.0;
+    const double alpha = gain / effective_count;
     voxel.mean += alpha * delta;
     const Eigen::Vector3d centered = point - voxel.mean;
     covariance = (1.0 - alpha) * covariance + alpha * centered * centered.transpose();
@@ -1876,7 +2010,9 @@ void LidarOdometry::insertMapPoints(const PointVector &body_points, const State 
       updateVoxelPlane(iterator->second);
     }
   }
-  if (accepted_scan_count_ % 10 == 0 ||
+  const bool periodic_local_prune =
+      !options_.retain_global_map && accepted_scan_count_ % 10 == 0;
+  if (periodic_local_prune ||
       map_voxels_.size() >
           static_cast<std::size_t>(1.10 * options_.max_map_points) ||
       adaptive_subvoxels_.size() >
@@ -1898,16 +2034,19 @@ void LidarOdometry::pruneMap()
   const auto prune_voxels =
       [&](MapVoxelMap *voxels, int maximum_count)
   {
-    for (auto iterator = voxels->begin(); iterator != voxels->end();)
+    if (!options_.retain_global_map)
     {
-      if ((iterator->second.mean - state_.position).squaredNorm() >
-          radius_squared)
+      for (auto iterator = voxels->begin(); iterator != voxels->end();)
       {
-        iterator = voxels->erase(iterator);
-      }
-      else
-      {
-        ++iterator;
+        if ((iterator->second.mean - state_.position).squaredNorm() >
+            radius_squared)
+        {
+          iterator = voxels->erase(iterator);
+        }
+        else
+        {
+          ++iterator;
+        }
       }
     }
     if (voxels->size() <= static_cast<std::size_t>(maximum_count)) return;
@@ -1996,12 +2135,20 @@ bool LidarOdometry::applyLidarLossProtection(const State &state_before_scan,
     return false;
   }
 
-  if (options_.lidar_loss_freeze_after_rejections > 0 &&
+  WheelSample wheel_measurement;
+  const bool use_wheel_dead_reckoning =
+      options_.lidar_loss_use_wheel_dead_reckoning &&
+      wheelMeasurement(scan_end_stamp, &wheel_measurement) &&
+      std::isfinite(wheel_measurement.forward_speed);
+
+  if (!use_wheel_dead_reckoning &&
+      options_.lidar_loss_freeze_after_rejections > 0 &&
       consecutive_rejections_ >= options_.lidar_loss_freeze_after_rejections)
   {
-    // Continued propagation is no longer an estimate once the local map has
-    // provided no support for this long. Freeze the full pose so downstream
-    // semantic mapping cannot accumulate data at a fabricated location.
+    // Without an independent speed observation, a long inertial-only outage
+    // is not trustworthy. Keep the legacy freeze for that case. With wheel
+    // coverage, freezing a moving platform makes scan-to-map reacquisition
+    // impossible, so the bounded dead-reckoning path below remains active.
     state_.rotation = last_accepted_state_.rotation;
     state_.position = last_accepted_state_.position;
     state_.velocity.setZero();
@@ -2026,6 +2173,25 @@ bool LidarOdometry::applyLidarLossProtection(const State &state_before_scan,
     reference_state = last_accepted_state_;
   }
   Eigen::Vector2d horizontal_velocity = reference_state.velocity.head<2>();
+  Eigen::Vector2d current_horizontal_velocity = state_.velocity.head<2>();
+  if (use_wheel_dead_reckoning)
+  {
+    // Integrate the wheel speed at the midpoint attitude. This preserves the
+    // IMU turn while removing the accelerometer double-integration that caused
+    // the prediction to leave the local map after several rejected scans.
+    Eigen::Quaterniond reference_orientation(reference_state.rotation);
+    Eigen::Quaterniond current_orientation(state_.rotation);
+    reference_orientation.normalize();
+    current_orientation.normalize();
+    const Eigen::Matrix3d midpoint_rotation =
+        reference_orientation.slerp(0.5, current_orientation).toRotationMatrix();
+    horizontal_velocity =
+        (midpoint_rotation *
+         Eigen::Vector3d(wheel_measurement.forward_speed, 0.0, 0.0)).head<2>();
+    current_horizontal_velocity =
+        (state_.rotation *
+         Eigen::Vector3d(wheel_measurement.forward_speed, 0.0, 0.0)).head<2>();
+  }
   if (!horizontal_velocity.allFinite())
   {
     horizontal_velocity.setZero();
@@ -2044,7 +2210,9 @@ bool LidarOdometry::applyLidarLossProtection(const State &state_before_scan,
     horizontal_step *= options_.lidar_loss_max_horizontal_step / step_norm;
   }
   state_.position.head<2>() = reference_state.position.head<2>() + horizontal_step;
-  state_.velocity.head<2>() = horizontal_velocity * options_.lidar_loss_velocity_decay;
+  state_.velocity.head<2>() = use_wheel_dead_reckoning
+      ? current_horizontal_velocity
+      : horizontal_velocity * options_.lidar_loss_velocity_decay;
 
   const double vertical_offset = state_.position.z() - last_accepted_state_.position.z();
   const double vertical_limit = options_.lidar_loss_max_vertical_offset;
@@ -2314,6 +2482,13 @@ VisualUpdateResult LidarOdometry::processVisual(
   result.mean_ncc = final_linearization.mean_ncc;
   const VisualMeasurementProjection final_projected_measurement =
       projectVisualMeasurement(final_linearization, visual_options);
+  if (final_projected_measurement.valid)
+  {
+    final_information = prior_information;
+    final_information.block<6, 6>(0, 0).noalias() +=
+        final_projected_measurement.hessian;
+    final_information.diagonal().array() += options_.visual_solver_damping;
+  }
   result.observable_directions = final_projected_measurement.observable_directions;
   result.z_observable = final_projected_measurement.z_observable;
   result.z_projection = final_projected_measurement.z_projection;
@@ -2344,8 +2519,10 @@ VisualUpdateResult LidarOdometry::processVisual(
   const bool z_measurement_enabled = final_projected_measurement.z_fused &&
       (!automatic_z_requested ||
        (automatic_z_decided && automatic_z_enabled));
+  const bool convergence_valid =
+      !options_.visual_require_convergence || result.converged;
   if (measurement_valid && motion_valid && observability_valid &&
-      two_mode_quality_valid && result.iterations > 0)
+      two_mode_quality_valid && convergence_valid && result.iterations > 0)
   {
     state_ = estimate;
     const Eigen::LDLT<Matrix18d> information_solver(final_information);
@@ -2379,6 +2556,10 @@ VisualUpdateResult LidarOdometry::processVisual(
     else if (!measurement_valid)
     {
       result.reason = "visual_quality_gate";
+    }
+    else if (!convergence_valid)
+    {
+      result.reason = "visual_not_converged";
     }
     else
     {
@@ -2493,6 +2674,7 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     result.converged = true;
     result.map_updated = true;
     result.map_keyframe_selected = true;
+    result.map_update_reason = "initialized";
     result.rmse = 0.0;
     result.inlier_ratio = 1.0;
     result.correspondences = static_cast<int>(scan.size());
@@ -2539,21 +2721,214 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
       std::numeric_limits<double>::infinity();
   int final_correspondences = 0;
   int final_observable_directions = 0;
+  int final_observable_rotation_directions = 0;
   double final_measurement_condition =
       std::numeric_limits<double>::infinity();
+  double final_rotation_measurement_condition =
+      std::numeric_limits<double>::infinity();
+  double final_yaw_observability = 0.0;
   int final_correspondence_sectors = 0;
   int final_point_knn_fallback_queries = 0;
   int final_point_knn_fallback_matches = 0;
   int final_innovation_rejections = 0;
   double final_robust_weight_sum = 0.0;
   bool final_wheel_forward_rejected = false;
-  double measured_forward_speed = 0.0;
+  bool final_wheel_yaw_rate_rejected = false;
+  double final_wheel_yaw_rate_effective_noise =
+      options_.wheel_yaw_rate_noise;
+  bool final_used_wheel_yaw_rate = false;
+  double final_wheel_yaw_rate_residual = 0.0;
+  WheelSample wheel_measurement;
   const bool have_wheel_measurement = wheelMeasurement(scan_end_stamp,
-                                                        &measured_forward_speed);
+                                                        &wheel_measurement);
+  const double measured_forward_speed = have_wheel_measurement
+      ? wheel_measurement.forward_speed : 0.0;
   result.used_wheel = have_wheel_measurement;
   result.wheel_speed = measured_forward_speed;
+  Eigen::Vector3d measured_angular_velocity = Eigen::Vector3d::Zero();
+  const bool have_angular_velocity = angularVelocityMeasurement(
+      scan_end_stamp, &measured_angular_velocity);
+  const bool wheel_yaw_rate_requested = have_wheel_measurement &&
+      std::abs(options_.wheel_yaw_rate_scale) > kSmall &&
+      std::isfinite(wheel_measurement.differential_speed);
+  const double corrected_differential_speed = wheel_yaw_rate_requested
+      ? wheel_measurement.differential_speed -
+          options_.wheel_differential_forward_leakage *
+              measured_forward_speed
+      : 0.0;
+  const double measured_wheel_yaw_rate = wheel_yaw_rate_requested
+      ? options_.wheel_yaw_rate_scale * corrected_differential_speed
+      : 0.0;
+  const bool differential_consistent = wheel_yaw_rate_requested &&
+      (options_.wheel_differential_max_disagreement <= 0.0 ||
+       (std::isfinite(wheel_measurement.differential_disagreement) &&
+        wheel_measurement.differential_disagreement <=
+            options_.wheel_differential_max_disagreement));
+  const double wheel_yaw_rate_prefit_residual =
+      wheel_yaw_rate_requested && have_angular_velocity
+      ? measured_angular_velocity.z() - propagated_state.gyro_bias.z() -
+          measured_wheel_yaw_rate
+      : 0.0;
+  const bool wheel_imu_yaw_rate_consistent =
+      wheel_yaw_rate_requested && have_angular_velocity &&
+      (options_.wheel_yaw_rate_max_imu_difference <= 0.0 ||
+       std::abs(wheel_yaw_rate_prefit_residual) <=
+           options_.wheel_yaw_rate_max_imu_difference);
+  const bool wheel_yaw_rate_input_valid = wheel_yaw_rate_requested &&
+      have_angular_velocity && differential_consistent &&
+      wheel_imu_yaw_rate_consistent &&
+      std::abs(measured_forward_speed) >=
+          options_.wheel_yaw_rate_min_speed &&
+      std::isfinite(measured_wheel_yaw_rate) &&
+      std::abs(measured_wheel_yaw_rate) <=
+          options_.wheel_yaw_rate_max_abs;
+  const bool robust_wheel_yaw_bias_enabled =
+      options_.wheel_yaw_bias_window_sec > 0.0;
+  const bool low_curvature_bias_sample = wheel_yaw_rate_input_valid &&
+      (options_.wheel_yaw_bias_max_abs_rate <= 0.0 ||
+       std::abs(measured_wheel_yaw_rate) <=
+           options_.wheel_yaw_bias_max_abs_rate);
+  if (robust_wheel_yaw_bias_enabled)
+  {
+    const double oldest_bias_stamp =
+        scan_end_stamp - options_.wheel_yaw_bias_window_sec;
+    while (!wheel_yaw_bias_history_.empty() &&
+           wheel_yaw_bias_history_.front().stamp < oldest_bias_stamp)
+    {
+      wheel_yaw_bias_history_.pop_front();
+    }
+    if (low_curvature_bias_sample &&
+        (wheel_yaw_bias_history_.empty() ||
+         scan_end_stamp > wheel_yaw_bias_history_.back().stamp + kSmall))
+    {
+      wheel_yaw_bias_history_.push_back(WheelYawBiasSample{
+          scan_end_stamp,
+          measured_angular_velocity.z() - measured_wheel_yaw_rate});
+    }
+  }
+  double robust_wheel_yaw_bias = 0.0;
+  double robust_wheel_yaw_bias_raw = 0.0;
+  double robust_wheel_yaw_bias_mad =
+      std::numeric_limits<double>::infinity();
+  double robust_wheel_yaw_bias_noise = options_.wheel_yaw_rate_noise;
+  bool robust_wheel_yaw_bias_valid = false;
+  if (robust_wheel_yaw_bias_enabled &&
+      wheel_yaw_bias_history_.size() >=
+          static_cast<std::size_t>(options_.wheel_yaw_bias_min_samples))
+  {
+    std::vector<double> bias_samples;
+    bias_samples.reserve(wheel_yaw_bias_history_.size());
+    for (const WheelYawBiasSample &sample : wheel_yaw_bias_history_)
+    {
+      bias_samples.push_back(sample.bias);
+    }
+    robust_wheel_yaw_bias_raw = median(bias_samples);
+    std::vector<double> absolute_deviations;
+    absolute_deviations.reserve(bias_samples.size());
+    for (const double bias : bias_samples)
+    {
+      absolute_deviations.push_back(
+          std::abs(bias - robust_wheel_yaw_bias_raw));
+    }
+    robust_wheel_yaw_bias_mad = median(absolute_deviations);
+    const double independent_sample_noise = std::sqrt(
+        options_.wheel_yaw_rate_noise * options_.wheel_yaw_rate_noise +
+        options_.gyro_noise * options_.gyro_noise) /
+        std::sqrt(static_cast<double>(bias_samples.size()));
+    robust_wheel_yaw_bias_noise = std::max(
+        options_.wheel_yaw_bias_noise_floor,
+        std::max(independent_sample_noise,
+                 1.4826 * robust_wheel_yaw_bias_mad));
+    robust_wheel_yaw_bias_valid =
+        std::isfinite(robust_wheel_yaw_bias_raw) &&
+        std::isfinite(robust_wheel_yaw_bias_mad) &&
+        (options_.wheel_yaw_bias_max_mad <= 0.0 ||
+         robust_wheel_yaw_bias_mad <= options_.wheel_yaw_bias_max_mad);
+    if (robust_wheel_yaw_bias_valid && low_curvature_bias_sample &&
+        options_.wheel_yaw_bias_calibrate_offset &&
+        !wheel_yaw_bias_offset_initialized_)
+    {
+      wheel_yaw_bias_offset_ =
+          robust_wheel_yaw_bias_raw - propagated_state.gyro_bias.z();
+      wheel_yaw_bias_offset_initialized_ =
+          std::isfinite(wheel_yaw_bias_offset_);
+      if (!wheel_yaw_bias_offset_initialized_)
+      {
+        wheel_yaw_bias_offset_ = 0.0;
+      }
+    }
+    robust_wheel_yaw_bias = robust_wheel_yaw_bias_raw -
+        (wheel_yaw_bias_offset_initialized_ ? wheel_yaw_bias_offset_ : 0.0);
+  }
+  result.wheel_yaw_rate = measured_wheel_yaw_rate;
+  result.imu_yaw_rate = have_angular_velocity
+      ? measured_angular_velocity.z() - propagated_state.gyro_bias.z()
+      : 0.0;
+  result.wheel_yaw_bias_window_samples =
+      static_cast<int>(wheel_yaw_bias_history_.size());
+  result.wheel_yaw_bias_observation = robust_wheel_yaw_bias;
+  result.wheel_yaw_bias_raw_observation = robust_wheel_yaw_bias_raw;
+  result.wheel_yaw_bias_offset = wheel_yaw_bias_offset_;
+  result.wheel_yaw_bias_offset_calibrated =
+      wheel_yaw_bias_offset_initialized_;
+  result.wheel_yaw_bias_mad = robust_wheel_yaw_bias_mad;
+  const bool stable_wheel_motion_for_acceleration_bias =
+      robust_wheel_yaw_bias_enabled && low_curvature_bias_sample &&
+      robust_wheel_yaw_bias_valid;
+  const bool acceleration_bias_update_allowed =
+      options_.lidar_update_acceleration_bias &&
+      (!options_.lidar_acceleration_bias_require_stable_wheel_motion ||
+       stable_wheel_motion_for_acceleration_bias);
+  result.acceleration_bias_update_allowed =
+      acceleration_bias_update_allowed;
+  final_wheel_yaw_rate_residual = wheel_yaw_rate_prefit_residual;
+  const bool wheel_yaw_rate_should_be_tested =
+      wheel_yaw_rate_requested &&
+      std::abs(measured_forward_speed) >=
+          options_.wheel_yaw_rate_min_speed;
+  final_wheel_yaw_rate_rejected =
+      wheel_yaw_rate_should_be_tested && !wheel_yaw_rate_input_valid;
+  Eigen::Vector3d world_up = Eigen::Vector3d::UnitZ();
+  if (propagated_state.gravity.norm() > kSmall)
+  {
+    world_up = -propagated_state.gravity.normalized();
+  }
+  const Eigen::Vector3d up_in_propagated_body =
+      propagated_state.rotation.transpose() * world_up;
+  if (options_.lidar_yaw_correction_window_sec > 0.0)
+  {
+    const double oldest_stamp =
+        scan_end_stamp - options_.lidar_yaw_correction_window_sec;
+    while (!lidar_yaw_correction_history_.empty() &&
+           lidar_yaw_correction_history_.front().stamp < oldest_stamp)
+    {
+      lidar_yaw_correction_history_.pop_front();
+    }
+  }
+  double historical_lidar_yaw_correction = 0.0;
+  for (const YawCorrectionSample &sample : lidar_yaw_correction_history_)
+  {
+    historical_lidar_yaw_correction += sample.correction;
+  }
+  const bool cumulative_yaw_limit_enabled = result.used_imu &&
+      options_.limit_cumulative_lidar_yaw_correction &&
+      options_.lidar_yaw_correction_window_sec > 0.0 &&
+      options_.max_cumulative_lidar_yaw_correction_deg > 0.0;
+  const double cumulative_yaw_limit =
+      options_.max_cumulative_lidar_yaw_correction_deg * kPi / 180.0;
+  bool lidar_yaw_correction_limited = false;
+  bool lidar_yaw_information_guard_active = false;
+  result.lidar_yaw_correction_limit_deg =
+      options_.max_cumulative_lidar_yaw_correction_deg;
+  int convergence_confirmations = 0;
+  int applied_update_iterations = 0;
+  bool final_linearization_valid = false;
 
-  for (int iteration = 0; iteration < options_.max_iterations; ++iteration)
+  // Reserve one final relinearization after the configured number of update
+  // steps.  The old path applied its last increment and then validated stale
+  // residuals from the previous pose, which was particularly unsafe during a
+  // turn when nearest planes can change between iterations.
+  for (int iteration = 0; iteration <= options_.max_iterations; ++iteration)
   {
     Matrix18d lidar_measurement_hessian = Matrix18d::Zero();
     Vector18d lidar_measurement_gradient = Vector18d::Zero();
@@ -2569,37 +2944,111 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     bool wheel_forward_rejected = false;
     constexpr int kAzimuthSectorCount = 12;
     std::array<bool, kAzimuthSectorCount> correspondence_sectors{};
-    for (const Eigen::Vector3d &body_point : scan)
+
+    struct PointLinearization
     {
-      const Eigen::Vector3d world_point =
-          estimate.rotation * body_point + estimate.position;
+      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+      Eigen::Vector3d world_point = Eigen::Vector3d::Zero();
       PlaneMatch match;
-      bool found_match = findLocalPlane(world_point, match);
-      if (!found_match && !options_.use_point_knn_plane && options_.point_knn_fallback &&
-          (options_.point_knn_fallback_max_queries == 0 ||
-           point_knn_fallback_queries < options_.point_knn_fallback_max_queries))
-      {
-        ++point_knn_fallback_queries;
-        found_match = findPointKnnPlane(world_point, match);
-        if (found_match)
-        {
-          ++point_knn_fallback_matches;
-        }
-      }
-      if (!found_match)
-      {
-        continue;
-      }
-      const double residual = match.normal.dot(world_point - match.center);
-      if (std::abs(residual) > options_.max_plane_distance)
-      {
-        continue;
-      }
       Eigen::Matrix<double, 1, 18> jacobian =
           Eigen::Matrix<double, 1, 18>::Zero();
-      jacobian.block<1, 3>(0, 0) =
-          -match.normal.transpose() * estimate.rotation * skew(body_point);
-      jacobian.block<1, 3>(0, 3) = match.normal.transpose();
+      double residual = 0.0;
+      double measurement_variance = 0.0;
+      double robust_weight = 0.0;
+      bool matched = false;
+      bool fallback_matched = false;
+      bool accepted = false;
+      bool innovation_rejected = false;
+      int azimuth_sector = -1;
+    };
+    using PointLinearizationVector = std::vector<
+        PointLinearization, Eigen::aligned_allocator<PointLinearization>>;
+    PointLinearizationVector point_linearizations(scan.size());
+    const int scan_point_count = static_cast<int>(scan.size());
+
+    // FAST-LIVO2 distributes the read-only point-to-plane search over a small
+    // worker set. Map mutation remains outside this region, so concurrent
+    // unordered_map lookups never overlap an insert, erase, or plane refit.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(options_.registration_threads) \
+    if(options_.registration_threads > 1)
+#endif
+    for (int point_index = 0; point_index < scan_point_count; ++point_index)
+    {
+      PointLinearization &point =
+          point_linearizations[static_cast<std::size_t>(point_index)];
+      const Eigen::Vector3d &body_point =
+          scan[static_cast<std::size_t>(point_index)];
+      point.world_point =
+          estimate.rotation * body_point + estimate.position;
+      point.matched = findLocalPlane(point.world_point, point.match);
+    }
+
+    // Select KNN fallback work in scan order before dispatching it. This keeps
+    // the configured budget and resulting associations deterministic even
+    // when worker completion order changes.
+    std::vector<int> fallback_indices;
+    if (!options_.use_point_knn_plane && options_.point_knn_fallback)
+    {
+      const int fallback_budget = options_.point_knn_fallback_max_queries;
+      fallback_indices.reserve(fallback_budget > 0
+          ? static_cast<std::size_t>(std::min(fallback_budget, scan_point_count))
+          : scan.size());
+      for (int point_index = 0; point_index < scan_point_count; ++point_index)
+      {
+        if (point_linearizations[static_cast<std::size_t>(point_index)].matched)
+        {
+          continue;
+        }
+        if (fallback_budget > 0 &&
+            static_cast<int>(fallback_indices.size()) >= fallback_budget)
+        {
+          break;
+        }
+        fallback_indices.push_back(point_index);
+      }
+    }
+    point_knn_fallback_queries = static_cast<int>(fallback_indices.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(options_.registration_threads) \
+    if(options_.registration_threads > 1)
+#endif
+    for (int fallback_index = 0;
+         fallback_index < static_cast<int>(fallback_indices.size());
+         ++fallback_index)
+    {
+      PointLinearization &point = point_linearizations[static_cast<std::size_t>(
+          fallback_indices[static_cast<std::size_t>(fallback_index)])];
+      point.matched = findPointKnnPlane(point.world_point, point.match);
+      point.fallback_matched = point.matched;
+    }
+
+    // Measurement preparation is independent per point. The final normal
+    // equation is accumulated serially below in scan order to avoid floating
+    // point reduction jitter in convergence and map-write decisions.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(options_.registration_threads) \
+    if(options_.registration_threads > 1)
+#endif
+    for (int point_index = 0; point_index < scan_point_count; ++point_index)
+    {
+      PointLinearization &point =
+          point_linearizations[static_cast<std::size_t>(point_index)];
+      if (!point.matched)
+      {
+        continue;
+      }
+      const Eigen::Vector3d &body_point =
+          scan[static_cast<std::size_t>(point_index)];
+      point.residual = point.match.normal.dot(
+          point.world_point - point.match.center);
+      if (std::abs(point.residual) > options_.max_plane_distance)
+      {
+        continue;
+      }
+      point.jacobian.block<1, 3>(0, 0) =
+          -point.match.normal.transpose() * estimate.rotation * skew(body_point);
+      point.jacobian.block<1, 3>(0, 3) = point.match.normal.transpose();
       const Eigen::Vector3d lidar_ray =
           body_point - options_.lidar_origin_in_body;
       const double range = lidar_ray.norm();
@@ -2610,7 +3059,7 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
       {
         const Eigen::Vector3d beam_direction = lidar_ray / range;
         const Eigen::Vector3d normal_in_body =
-            estimate.rotation.transpose() * match.normal;
+            estimate.rotation.transpose() * point.match.normal;
         const double radial_projection =
             normal_in_body.dot(beam_direction);
         const double radial_variance =
@@ -2621,48 +3070,69 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
             (radial_variance - tangential_variance) *
                 radial_projection * radial_projection;
       }
-      const double measurement_variance = std::max(1e-8,
+      point.measurement_variance = std::max(1e-8,
           options_.lidar_measurement_noise *
               options_.lidar_measurement_noise +
-          std::max(0.0, point_variance) + match.variance);
+          std::max(0.0, point_variance) + point.match.variance);
       if (options_.lidar_innovation_gate > 0.0)
       {
         const double predicted_variance = std::max(0.0,
-            (jacobian * propagated_covariance *
-             jacobian.transpose())(0, 0));
+            (point.jacobian * propagated_covariance *
+             point.jacobian.transpose())(0, 0));
         const double innovation_variance =
-            measurement_variance + predicted_variance;
+            point.measurement_variance + predicted_variance;
         const double normalized_innovation =
-            residual * residual / std::max(1e-8, innovation_variance);
+            point.residual * point.residual /
+                std::max(1e-8, innovation_variance);
         if (!std::isfinite(normalized_innovation) ||
             normalized_innovation > options_.lidar_innovation_gate)
         {
-          ++innovation_rejections;
+          point.innovation_rejected = true;
           continue;
         }
       }
-      const double robust_weight =
+      point.robust_weight =
           options_.lidar_normalized_huber_delta > 0.0
-          ? huberWeight(residual / std::sqrt(measurement_variance),
+          ? huberWeight(point.residual /
+                            std::sqrt(point.measurement_variance),
                         options_.lidar_normalized_huber_delta)
-          : huberWeight(residual, options_.huber_delta);
-      const double robust_information =
-          robust_weight / measurement_variance;
-      lidar_measurement_hessian.noalias() +=
-          robust_information * jacobian.transpose() * jacobian;
-      lidar_measurement_gradient.noalias() +=
-          robust_information * jacobian.transpose() * residual;
-      squared_error += residual * residual;
-      normalized_squared_error += residual * residual /
-          measurement_variance;
-      robust_weight_sum += robust_weight;
-      ++correspondences;
+          : huberWeight(point.residual, options_.huber_delta);
+      point.accepted = true;
       const double azimuth = std::atan2(body_point.y(), body_point.x());
       const double normalized_azimuth = std::max(0.0, std::min(
           1.0 - 1e-12, (azimuth + kPi) / (2.0 * kPi)));
-      const int sector = std::min(kAzimuthSectorCount - 1,
-          static_cast<int>(std::floor(normalized_azimuth * kAzimuthSectorCount)));
-      correspondence_sectors[static_cast<std::size_t>(sector)] = true;
+      point.azimuth_sector = std::min(kAzimuthSectorCount - 1,
+          static_cast<int>(std::floor(
+              normalized_azimuth * kAzimuthSectorCount)));
+    }
+
+    for (const PointLinearization &point : point_linearizations)
+    {
+      if (point.fallback_matched)
+      {
+        ++point_knn_fallback_matches;
+      }
+      if (point.innovation_rejected)
+      {
+        ++innovation_rejections;
+      }
+      if (!point.accepted)
+      {
+        continue;
+      }
+      const double robust_information =
+          point.robust_weight / point.measurement_variance;
+      lidar_measurement_hessian.noalias() +=
+          robust_information * point.jacobian.transpose() * point.jacobian;
+      lidar_measurement_gradient.noalias() +=
+          robust_information * point.jacobian.transpose() * point.residual;
+      squared_error += point.residual * point.residual;
+      normalized_squared_error += point.residual * point.residual /
+          point.measurement_variance;
+      robust_weight_sum += point.robust_weight;
+      ++correspondences;
+      correspondence_sectors[static_cast<std::size_t>(
+          point.azimuth_sector)] = true;
     }
 
     if (have_wheel_measurement)
@@ -2726,6 +3196,68 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
             information * row.transpose() * residual(axis);
       }
       result.wheel_velocity_residual = residual.norm();
+
+      if (wheel_yaw_rate_input_valid)
+      {
+        const bool robust_bias_factor_available =
+            robust_wheel_yaw_bias_enabled && low_curvature_bias_sample &&
+            robust_wheel_yaw_bias_valid;
+        const bool direct_bias_factor_available =
+            !robust_wheel_yaw_bias_enabled;
+        if (robust_bias_factor_available || direct_bias_factor_available)
+        {
+          Eigen::Matrix<double, 1, 18> yaw_jacobian =
+              Eigen::Matrix<double, 1, 18>::Zero();
+          // h(x) = gyro_z - wheel_yaw_rate - gyro_bias_z. In robust-window
+          // mode the first two terms are replaced by their low-curvature
+          // median, while the state Jacobian remains unchanged.
+          yaw_jacobian(0, 11) = -1.0;
+          const double yaw_residual = robust_bias_factor_available
+              ? robust_wheel_yaw_bias - estimate.gyro_bias.z()
+              : measured_angular_velocity.z() - estimate.gyro_bias.z() -
+                  measured_wheel_yaw_rate;
+          const double wheel_scale_standard_deviation =
+              options_.wheel_yaw_rate_relative_scale_uncertainty *
+              std::abs(measured_wheel_yaw_rate);
+          const double yaw_noise = robust_bias_factor_available
+              ? robust_wheel_yaw_bias_noise
+              : std::sqrt(options_.wheel_yaw_rate_noise *
+                              options_.wheel_yaw_rate_noise +
+                          options_.gyro_noise * options_.gyro_noise);
+          const double yaw_variance = yaw_noise * yaw_noise +
+              wheel_scale_standard_deviation *
+                  wheel_scale_standard_deviation;
+          final_wheel_yaw_rate_effective_noise = std::sqrt(yaw_variance);
+          bool reject_yaw_rate = false;
+          if (options_.wheel_yaw_rate_innovation_gate > 0.0)
+          {
+            const double predicted_variance = std::max(
+                0.0, (yaw_jacobian * propagated_covariance *
+                      yaw_jacobian.transpose())(0, 0));
+            const double normalized_innovation =
+                yaw_residual * yaw_residual /
+                std::max(1e-8, yaw_variance + predicted_variance);
+            reject_yaw_rate = !std::isfinite(normalized_innovation) ||
+                normalized_innovation >
+                    options_.wheel_yaw_rate_innovation_gate;
+          }
+          if (!reject_yaw_rate && options_.wheel_yaw_rate_fuse_gyro_bias)
+          {
+            const double normalized_yaw_residual =
+                yaw_residual / std::sqrt(yaw_variance);
+            const double yaw_information =
+                huberWeight(normalized_yaw_residual,
+                            options_.wheel_yaw_rate_huber_delta) /
+                yaw_variance;
+            wheel_measurement_hessian.noalias() +=
+                yaw_information * yaw_jacobian.transpose() * yaw_jacobian;
+            wheel_measurement_gradient.noalias() +=
+                yaw_information * yaw_jacobian.transpose() * yaw_residual;
+            final_used_wheel_yaw_rate = true;
+          }
+          final_wheel_yaw_rate_rejected = reject_yaw_rate;
+        }
+      }
     }
 
     final_correspondences = correspondences;
@@ -2777,21 +3309,129 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     {
       break;
     }
+
+    // Translation can make the full 6-DoF Hessian look healthy while a
+    // rotational mode remains weak. Marginalize translation and inspect the
+    // conditional rotation information before allowing LiDAR to correct the
+    // IMU attitude or write the scan into the persistent map.
+    const Eigen::Matrix3d translation_hessian =
+        0.5 * (pose_hessian.block<3, 3>(3, 3) +
+               pose_hessian.block<3, 3>(3, 3).transpose());
+    Eigen::Matrix3d translation_hessian_inverse = Eigen::Matrix3d::Zero();
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>
+        translation_solver(translation_hessian);
+    if (translation_solver.info() == Eigen::Success)
+    {
+      const Eigen::Vector3d translation_eigenvalues =
+          translation_solver.eigenvalues().cwiseMax(0.0);
+      const double translation_largest = std::max(
+          kSmall, translation_eigenvalues.maxCoeff());
+      const double inverse_threshold = std::max(
+          kSmall, 1e-8 * translation_largest);
+      for (int index = 0; index < 3; ++index)
+      {
+        if (translation_eigenvalues(index) <= inverse_threshold) continue;
+        const Eigen::Vector3d direction =
+            translation_solver.eigenvectors().col(index);
+        translation_hessian_inverse.noalias() +=
+            direction * direction.transpose() /
+            translation_eigenvalues(index);
+      }
+    }
+    Eigen::Matrix3d rotation_hessian =
+        pose_hessian.block<3, 3>(0, 0) -
+        pose_hessian.block<3, 3>(0, 3) *
+            translation_hessian_inverse *
+            pose_hessian.block<3, 3>(3, 0);
+    rotation_hessian = 0.5 *
+        (rotation_hessian + rotation_hessian.transpose());
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>
+        rotation_solver(rotation_hessian);
+    if (rotation_solver.info() != Eigen::Success)
+    {
+      break;
+    }
+    const Eigen::Vector3d rotation_eigenvalues =
+        rotation_solver.eigenvalues().cwiseMax(0.0);
+    const double largest_rotation_eigenvalue = std::max(
+        kSmall, rotation_eigenvalues.maxCoeff());
+    const double rotation_observable_threshold =
+        largest_rotation_eigenvalue *
+        options_.rotation_observability_eigen_ratio;
+    Eigen::Matrix3d rotation_observability_projection =
+        Eigen::Matrix3d::Zero();
+    int observable_rotation_directions = 0;
+    double smallest_observable_rotation_eigenvalue =
+        std::numeric_limits<double>::infinity();
+    for (int index = 0; index < 3; ++index)
+    {
+      if (rotation_eigenvalues(index) < rotation_observable_threshold)
+      {
+        continue;
+      }
+      const Eigen::Vector3d direction =
+          rotation_solver.eigenvectors().col(index);
+      rotation_observability_projection.noalias() +=
+          direction * direction.transpose();
+      ++observable_rotation_directions;
+      smallest_observable_rotation_eigenvalue = std::min(
+          smallest_observable_rotation_eigenvalue,
+          rotation_eigenvalues(index));
+    }
+    const double yaw_observability = std::max(
+        0.0, std::min(1.0, rotation_observability_projection(2, 2)));
+    Eigen::Matrix3d rotation_information_filter = Eigen::Matrix3d::Identity();
+    if (options_.project_lidar_information_to_observable_rotation)
+    {
+      const double weak_scale = options_.weak_rotation_information_scale;
+      rotation_information_filter =
+          weak_scale * Eigen::Matrix3d::Identity() +
+          (1.0 - weak_scale) * rotation_observability_projection;
+    }
+    Eigen::Matrix<double, 6, 6> rotation_pose_filter =
+        Eigen::Matrix<double, 6, 6>::Identity();
+    rotation_pose_filter.block<3, 3>(0, 0) = rotation_information_filter;
+    Eigen::Matrix<double, 6, 6> filtered_pose_hessian =
+        rotation_pose_filter * pose_hessian * rotation_pose_filter;
+    filtered_pose_hessian = 0.5 *
+        (filtered_pose_hessian + filtered_pose_hessian.transpose());
+    Eigen::Matrix<double, 6, 1> filtered_pose_gradient =
+        rotation_pose_filter * lidar_measurement_gradient.head<6>();
+    if (lidar_yaw_information_guard_active)
+    {
+      const Eigen::Vector3d up_in_estimate_body =
+          estimate.rotation.transpose() * world_up;
+      const Eigen::Matrix3d yaw_information_filter =
+          Eigen::Matrix3d::Identity() -
+          (1.0 - options_.limited_lidar_yaw_information_scale) *
+              up_in_estimate_body * up_in_estimate_body.transpose();
+      Eigen::Matrix<double, 6, 6> yaw_pose_filter =
+          Eigen::Matrix<double, 6, 6>::Identity();
+      yaw_pose_filter.block<3, 3>(0, 0) = yaw_information_filter;
+      filtered_pose_hessian = yaw_pose_filter * filtered_pose_hessian *
+          yaw_pose_filter;
+      filtered_pose_hessian = 0.5 *
+          (filtered_pose_hessian + filtered_pose_hessian.transpose());
+      filtered_pose_gradient = yaw_pose_filter * filtered_pose_gradient;
+    }
+
     Matrix18d measurement_hessian = wheel_measurement_hessian;
     Vector18d measurement_gradient = wheel_measurement_gradient;
     if (options_.project_lidar_information_to_observable_subspace)
     {
       measurement_hessian.block<6, 6>(0, 0).noalias() +=
-          observability_projection * pose_hessian *
+          observability_projection * filtered_pose_hessian *
           observability_projection;
       measurement_gradient.head<6>().noalias() +=
           observability_projection *
-          lidar_measurement_gradient.head<6>();
+          filtered_pose_gradient;
     }
     else
     {
-      measurement_hessian += lidar_measurement_hessian;
-      measurement_gradient += lidar_measurement_gradient;
+      measurement_hessian.block<6, 6>(0, 0).noalias() +=
+          filtered_pose_hessian;
+      measurement_gradient.head<6>().noalias() +=
+          filtered_pose_gradient;
     }
     const Vector18d displacement = stateDifference(estimate, propagated_state);
     Matrix18d information = prior_information + measurement_hessian;
@@ -2807,22 +3447,30 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     {
       break;
     }
-    if (!options_.project_lidar_information_to_observable_subspace)
-    {
-      // Legacy degeneracy handling projects only the final pose step. The
-      // consistent path above instead projects information before it can
-      // condition any correlated ESKF state.
-      step.head<6>() = observability_projection * step.head<6>();
-    }
+    // In the normal full-information path, retain the complete iterated ESKF
+    // correction as FAST-LIVO2 does. The prior information already limits weak
+    // scan directions; hard-zeroing them here caused systematic under-travel
+    // through long turns and corridors. The optional projected-information
+    // branch above remains available for controlled degeneracy experiments.
     if (options_.project_gyro_bias_update_to_observable_rotation)
     {
-      // Rotation error and gyro bias both use body-frame coordinates. The
-      // rotation block of the 6-DoF pose projection therefore suppresses the
-      // bias component associated with a scan-unobservable pose mode while
-      // leaving fully observable scans unchanged.
+      // Rotation error and gyro bias both use body-frame coordinates. Reuse
+      // the marginalized rotational filter so strong translation support
+      // cannot manufacture a gyro-bias correction in a weak yaw mode.
       step.segment<3>(9) =
-          observability_projection.block<3, 3>(0, 0) *
+          rotation_information_filter *
           step.segment<3>(9);
+    }
+    if (lidar_yaw_information_guard_active)
+    {
+      const Eigen::Vector3d up_in_estimate_body =
+          estimate.rotation.transpose() * world_up;
+      const Eigen::Matrix3d yaw_information_filter =
+          Eigen::Matrix3d::Identity() -
+          (1.0 - options_.limited_lidar_yaw_information_scale) *
+              up_in_estimate_body * up_in_estimate_body.transpose();
+      step.segment<3>(9) =
+          yaw_information_filter * step.segment<3>(9);
     }
     const auto clamp_segment = [&step](int start, double maximum)
     {
@@ -2832,30 +3480,115 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
         step.segment<3>(start) *= maximum / norm;
       }
     };
-    clamp_segment(0, 3.0 * kPi / 180.0);
-    clamp_segment(3, 0.40);
-    clamp_segment(6, 1.0);
-    clamp_segment(9, 0.02);
-    clamp_segment(12, 0.10);
-    clamp_segment(15, 0.05);
-    applyError(estimate, step);
+    clamp_segment(0, options_.max_iteration_rotation_deg * kPi / 180.0);
+    clamp_segment(3, options_.max_iteration_translation);
+    // Hidden-state limits are scan limits, not iteration limits. Applying the
+    // full allowance in every IEKF iteration let a five-iteration scan change
+    // gyro bias and velocity by five times the configured bound.
+    const Vector18d accumulated_update =
+        stateDifference(estimate, propagated_state);
+    if (cumulative_yaw_limit_enabled)
+    {
+      const Eigen::Matrix3d proposed_rotation =
+          estimate.rotation * expSO3(step.segment<3>(0));
+      Eigen::Vector3d proposed_correction = logSO3(
+          propagated_state.rotation.transpose() * proposed_rotation);
+      const double proposed_yaw_correction =
+          proposed_correction.dot(up_in_propagated_body);
+      const double minimum_yaw_correction =
+          -cumulative_yaw_limit - historical_lidar_yaw_correction;
+      const double maximum_yaw_correction =
+          cumulative_yaw_limit - historical_lidar_yaw_correction;
+      const double limited_yaw_correction = std::max(
+          minimum_yaw_correction,
+          std::min(maximum_yaw_correction, proposed_yaw_correction));
+      if (std::abs(limited_yaw_correction - proposed_yaw_correction) >
+          1e-10)
+      {
+        proposed_correction +=
+            (limited_yaw_correction - proposed_yaw_correction) *
+            up_in_propagated_body;
+        const Eigen::Matrix3d limited_rotation =
+            propagated_state.rotation * expSO3(proposed_correction);
+        step.segment<3>(0) = logSO3(
+            estimate.rotation.transpose() * limited_rotation);
+        lidar_yaw_correction_limited = true;
+        lidar_yaw_information_guard_active = true;
+      }
+    }
+    const auto clamp_total_segment =
+        [&step, &accumulated_update](int start, double maximum)
+    {
+      Eigen::Vector3d total = accumulated_update.segment<3>(start) +
+          step.segment<3>(start);
+      const double norm = total.norm();
+      if (norm > maximum && norm > kSmall)
+      {
+        total *= maximum / norm;
+        step.segment<3>(start) =
+            total - accumulated_update.segment<3>(start);
+      }
+    };
+    clamp_total_segment(6, options_.max_lidar_velocity_step);
+    clamp_total_segment(9, options_.max_lidar_gyro_bias_step);
+    if (acceleration_bias_update_allowed)
+    {
+      clamp_total_segment(12, options_.max_lidar_acceleration_bias_step);
+    }
+    else
+    {
+      step.segment<3>(12).setZero();
+    }
+    if (options_.lidar_update_gravity)
+    {
+      clamp_total_segment(15, options_.max_lidar_gravity_step);
+    }
+    else
+    {
+      step.segment<3>(15).setZero();
+    }
     final_information = information;
     final_measurement_hessian = pose_hessian;
     final_observability_projection = observability_projection;
     final_squared_error = squared_error;
     final_normalized_squared_error = normalized_squared_error;
     final_observable_directions = observable_directions;
+    final_observable_rotation_directions =
+        observable_rotation_directions;
     final_measurement_condition = largest_eigenvalue /
         std::max(kSmall, smallest_observable_eigenvalue);
+    final_rotation_measurement_condition =
+        largest_rotation_eigenvalue /
+        std::max(kSmall, smallest_observable_rotation_eigenvalue);
+    final_yaw_observability = yaw_observability;
     result.iterations = iteration + 1;
-    if (step.segment<3>(3).norm() < options_.convergence_translation &&
-        step.segment<3>(0).norm() * 180.0 / kPi < options_.convergence_rotation_deg)
+    const bool small_increment =
+        step.segment<3>(3).norm() < options_.convergence_translation &&
+        step.segment<3>(0).norm() * 180.0 / kPi <
+            options_.convergence_rotation_deg;
+    convergence_confirmations = small_increment
+        ? convergence_confirmations + 1 : 0;
+    result.convergence_confirmations = convergence_confirmations;
+    if (convergence_confirmations >=
+        options_.convergence_confirmation_iterations)
     {
       result.converged = true;
+      final_linearization_valid = true;
       break;
     }
+    if (applied_update_iterations >= options_.max_iterations)
+    {
+      // Keep the estimate at this already-evaluated state.  A non-converged
+      // scan can still be accepted by a permissive profile, but it cannot use
+      // residuals from an unapplied linearization step.
+      final_linearization_valid = true;
+      break;
+    }
+    applyError(estimate, step);
+    ++applied_update_iterations;
   }
 
+  result.final_linearization_valid = final_linearization_valid;
   result.correspondences = final_correspondences;
   result.correspondence_azimuth_sectors = final_correspondence_sectors;
   result.point_knn_fallback_queries = final_point_knn_fallback_queries;
@@ -2866,6 +3599,11 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
           static_cast<double>(final_correspondences)
       : 0.0;
   result.wheel_forward_rejected = final_wheel_forward_rejected;
+  result.used_wheel_yaw_rate = final_used_wheel_yaw_rate;
+  result.wheel_yaw_rate_rejected = final_wheel_yaw_rate_rejected;
+  result.wheel_yaw_rate_effective_noise =
+      final_wheel_yaw_rate_effective_noise;
+  result.wheel_yaw_rate_residual = final_wheel_yaw_rate_residual;
   result.inlier_ratio = static_cast<double>(final_correspondences) /
       static_cast<double>(std::max<std::size_t>(1U, scan.size()));
   result.rmse = final_correspondences > 0 && std::isfinite(final_squared_error)
@@ -2877,7 +3615,12 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
           static_cast<double>(final_correspondences)
       : std::numeric_limits<double>::infinity();
   result.observable_directions = final_observable_directions;
+  result.observable_rotation_directions =
+      final_observable_rotation_directions;
   result.measurement_condition = final_measurement_condition;
+  result.rotation_measurement_condition =
+      final_rotation_measurement_condition;
+  result.yaw_observability = final_yaw_observability;
   if (final_correspondences >= options_.min_correspondences)
   {
     const Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eigen_solver(
@@ -2894,13 +3637,83 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
   const Eigen::Isometry3d estimated_pose = statePose(estimate);
   const Eigen::Isometry3d propagated_pose = statePose(propagated_state);
   const Eigen::Isometry3d relative_motion = pose_before_scan.inverse() * estimated_pose;
+  const Eigen::Isometry3d propagated_relative_motion =
+      pose_before_scan.inverse() * propagated_pose;
   const Eigen::Isometry3d lidar_correction = propagated_pose.inverse() * estimated_pose;
+  const Eigen::Vector3d lidar_correction_vector =
+      logSO3(lidar_correction.rotation());
+  const double lidar_yaw_correction =
+      lidar_correction_vector.dot(up_in_propagated_body);
+  result.lidar_yaw_correction_deg =
+      lidar_yaw_correction * 180.0 / kPi;
+  const double cumulative_lidar_yaw_correction =
+      historical_lidar_yaw_correction + lidar_yaw_correction;
+  result.cumulative_lidar_yaw_correction_deg =
+      cumulative_lidar_yaw_correction * 180.0 / kPi;
+  result.lidar_yaw_correction_limited =
+      lidar_yaw_correction_limited;
+  result.lidar_yaw_information_scale =
+      lidar_yaw_information_guard_active
+      ? options_.limited_lidar_yaw_information_scale : 1.0;
+  const bool cumulative_yaw_correction_valid =
+      !result.used_imu || options_.lidar_yaw_correction_window_sec <= 0.0 ||
+      options_.max_cumulative_lidar_yaw_correction_deg <= 0.0 ||
+      std::abs(result.cumulative_lidar_yaw_correction_deg) <=
+          options_.max_cumulative_lidar_yaw_correction_deg + 1e-6;
+  bool rotation_correction_nis_valid = true;
+  if (result.used_imu && options_.lidar_rotation_correction_nis_gate > 0.0)
+  {
+    const Eigen::Vector3d rotation_correction =
+        logSO3(lidar_correction.rotation());
+    const double angular_floor =
+        options_.lidar_rotation_correction_std_floor_deg * kPi / 180.0;
+    Eigen::Matrix3d rotation_covariance = 0.5 *
+        (propagated_covariance.block<3, 3>(0, 0) +
+         propagated_covariance.block<3, 3>(0, 0).transpose());
+    rotation_covariance.diagonal().array() += angular_floor * angular_floor;
+    const Eigen::LDLT<Eigen::Matrix3d> rotation_covariance_solver(
+        rotation_covariance);
+    if (rotation_covariance_solver.info() == Eigen::Success)
+    {
+      const Eigen::Vector3d whitened_correction =
+          rotation_covariance_solver.solve(rotation_correction);
+      result.lidar_rotation_correction_nis =
+          rotation_correction.dot(whitened_correction);
+      rotation_correction_nis_valid =
+          std::isfinite(result.lidar_rotation_correction_nis) &&
+          result.lidar_rotation_correction_nis <=
+              options_.lidar_rotation_correction_nis_gate;
+    }
+    else
+    {
+      rotation_correction_nis_valid = false;
+    }
+  }
   const double scan_dt = previous_scan_stamp_ > 0.0
       ? std::max(0.0, scan_end_stamp - previous_scan_stamp_) : 0.0;
   const double translation_motion_gate = std::max(
       options_.max_translation_per_scan, options_.max_translation_speed * scan_dt);
-  const double rotation_motion_gate = std::max(
+  const double expected_rotation_deg =
+      rotationDegrees(propagated_relative_motion.rotation());
+  double rotation_motion_gate = std::max(
       options_.max_rotation_per_scan_deg, options_.max_rotation_speed_deg * scan_dt);
+  const bool turn_aware_interval_valid =
+      options_.turn_aware_motion_gate_enabled && result.used_imu &&
+      scan_dt > 0.0 && options_.turn_aware_max_scan_dt > 0.0 &&
+      scan_dt <= options_.turn_aware_max_scan_dt;
+  if (turn_aware_interval_valid)
+  {
+    const double propagated_gate = std::min(
+        options_.turn_aware_max_rotation_deg,
+        expected_rotation_deg + options_.turn_aware_rotation_margin_deg);
+    rotation_motion_gate = std::max(rotation_motion_gate, propagated_gate);
+  }
+  result.expected_rotation_deg = expected_rotation_deg;
+  result.rotation_motion_gate_deg = rotation_motion_gate;
+  result.turn_aware_gate_active = turn_aware_interval_valid &&
+      rotation_motion_gate >
+          std::max(options_.max_rotation_per_scan_deg,
+                   options_.max_rotation_speed_deg * scan_dt) + 1e-6;
   const bool ratio_support = final_correspondences >= options_.min_correspondences &&
       result.inlier_ratio >= options_.min_inlier_ratio;
   const bool strong_support = options_.strong_support_min_correspondences > 0 &&
@@ -2917,14 +3730,37 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
       ? std::max(options_.max_lidar_correction_translation,
                  options_.recovery_max_lidar_correction_translation)
       : options_.max_lidar_correction_translation;
-  const double lidar_correction_rotation_gate = recovery_mode && strong_support &&
+  double lidar_correction_rotation_gate = recovery_mode && strong_support &&
       options_.recovery_max_lidar_correction_rotation_deg > 0.0
       ? std::max(options_.max_lidar_correction_rotation_deg,
                  options_.recovery_max_lidar_correction_rotation_deg)
       : options_.max_lidar_correction_rotation_deg;
+  const bool trusted_wheel_turn = turn_aware_interval_valid &&
+      wheel_yaw_rate_input_valid && !result.wheel_yaw_rate_rejected &&
+      std::abs(result.wheel_yaw_rate) >=
+          options_.turn_aware_min_yaw_rate &&
+      std::abs(result.imu_yaw_rate - result.wheel_yaw_rate) <=
+          options_.turn_aware_wheel_imu_max_yaw_rate_difference;
+  if (trusted_wheel_turn &&
+      options_.turn_aware_lidar_correction_rotation_deg > 0.0)
+  {
+    lidar_correction_rotation_gate = std::max(
+        lidar_correction_rotation_gate,
+        options_.turn_aware_lidar_correction_rotation_deg);
+  }
+  result.lidar_correction_rotation_gate_deg =
+      lidar_correction_rotation_gate;
   if (final_correspondences < options_.min_correspondences)
   {
     result.reject_reason = "too_few_plane_correspondences";
+  }
+  else if (!result.final_linearization_valid)
+  {
+    result.reject_reason = "invalid_final_linearization";
+  }
+  else if (options_.require_convergence_for_acceptance && !result.converged)
+  {
+    result.reject_reason = "registration_not_converged";
   }
   else if (!ratio_support && !strong_support)
   {
@@ -2951,6 +3787,14 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
   {
     result.reject_reason = "implausible_scan_motion";
   }
+  else if (!rotation_correction_nis_valid)
+  {
+    result.reject_reason = "rotation_correction_innovation";
+  }
+  else if (!cumulative_yaw_correction_valid)
+  {
+    result.reject_reason = "persistent_lidar_yaw_correction";
+  }
   else if (lidar_correction.translation().norm() > lidar_correction_translation_gate ||
            rotationDegrees(lidar_correction.rotation()) >
                lidar_correction_rotation_gate)
@@ -2971,6 +3815,11 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
 
   if (result.accepted)
   {
+    if (options_.lidar_yaw_correction_window_sec > 0.0)
+    {
+      lidar_yaw_correction_history_.push_back(
+          YawCorrectionSample{scan_end_stamp, lidar_yaw_correction});
+    }
     const double dt = previous_scan_stamp_ > 0.0
         ? scan_end_stamp - previous_scan_stamp_ : 0.0;
     state_ = estimate;
@@ -3019,11 +3868,31 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     last_accepted_state_ = state_;
     const bool observable_for_map = result.observable_directions >=
         options_.map_insertion_min_observable_directions;
+    const bool rotation_observable_for_map =
+        options_.map_insertion_min_observable_rotation_directions <= 0 ||
+        result.observable_rotation_directions >=
+            options_.map_insertion_min_observable_rotation_directions;
+    const bool yaw_observable_for_map =
+        options_.map_insertion_min_yaw_observability <= 0.0 ||
+        result.yaw_observability >=
+            options_.map_insertion_min_yaw_observability;
     const bool innovation_for_map =
         options_.map_insertion_max_mean_normalized_residual <= 0.0 ||
         (std::isfinite(result.mean_normalized_residual) &&
          result.mean_normalized_residual <=
              options_.map_insertion_max_mean_normalized_residual);
+    const bool convergence_for_map =
+        !options_.map_insertion_require_convergence || result.converged;
+    const bool yaw_guard_for_map =
+        !options_.defer_map_when_lidar_yaw_limited ||
+        !result.lidar_yaw_correction_limited;
+    const bool correction_for_map =
+        (options_.map_insertion_max_lidar_correction_translation <= 0.0 ||
+         lidar_correction.translation().norm() <=
+             options_.map_insertion_max_lidar_correction_translation) &&
+        (options_.map_insertion_max_lidar_correction_rotation_deg <= 0.0 ||
+         rotationDegrees(lidar_correction.rotation()) <=
+             options_.map_insertion_max_lidar_correction_rotation_deg);
     bool recovery_trusted_for_map = true;
     if (recovery_map_guard_active_)
     {
@@ -3046,18 +3915,57 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     const bool map_keyframe_selected =
         shouldInsertMap(state_, scan_end_stamp);
     result.map_keyframe_selected = map_keyframe_selected;
-    if (observable_for_map && innovation_for_map &&
-        recovery_trusted_for_map && map_keyframe_selected)
+    if (observable_for_map && rotation_observable_for_map &&
+        yaw_observable_for_map && innovation_for_map && convergence_for_map &&
+        yaw_guard_for_map && correction_for_map && recovery_trusted_for_map &&
+        map_keyframe_selected)
     {
       insertMapPoints(scan, state_, true);
       have_last_map_insert_pose_ = true;
       last_map_insert_pose_ = statePose(state_);
       last_map_insert_stamp_ = scan_end_stamp;
       result.map_updated = true;
+      result.map_update_reason = "updated";
     }
     else
     {
       result.map_update_deferred = true;
+      if (!observable_for_map)
+      {
+        result.map_update_reason = "insufficient_observability";
+      }
+      else if (!rotation_observable_for_map)
+      {
+        result.map_update_reason = "insufficient_rotation_observability";
+      }
+      else if (!yaw_observable_for_map)
+      {
+        result.map_update_reason = "insufficient_yaw_observability";
+      }
+      else if (!innovation_for_map)
+      {
+        result.map_update_reason = "high_normalized_residual";
+      }
+      else if (!convergence_for_map)
+      {
+        result.map_update_reason = "registration_not_converged";
+      }
+      else if (!yaw_guard_for_map)
+      {
+        result.map_update_reason = "limited_lidar_yaw_correction";
+      }
+      else if (!correction_for_map)
+      {
+        result.map_update_reason = "large_lidar_correction";
+      }
+      else if (!recovery_trusted_for_map)
+      {
+        result.map_update_reason = "recovery_confirmation";
+      }
+      else
+      {
+        result.map_update_reason = "not_keyframe";
+      }
     }
   }
   else
@@ -3065,9 +3973,12 @@ LidarOdometryResult LidarOdometry::processScan(const TimedPointVector &points,
     state_ = propagated_state;
     state_.covariance = propagated_covariance;
     result.loss_limited = applyLidarLossProtection(state_before_scan, scan_end_stamp);
+    result.map_update_reason = "registration_rejected";
   }
 
   pose_cache_ = statePose(state_);
+  result.acceleration_bias_correction =
+      state_.acceleration_bias - propagated_state.acceleration_bias;
   result.relative_pose = pose_before_scan.inverse() * pose_cache_;
   previous_scan_pose_ = last_scan_pose_;
   last_scan_pose_ = pose_cache_;

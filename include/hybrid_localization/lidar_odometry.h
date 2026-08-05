@@ -43,6 +43,12 @@ struct WheelSample
 {
   double stamp = 0.0;
   double forward_speed = 0.0;
+  // Ranger MINI exposes four wheel speeds. The front/rear averaged
+  // right-minus-left speed is retained as an optional independent yaw-rate
+  // observation; generic wheel messages leave these values non-finite.
+  double differential_speed = std::numeric_limits<double>::quiet_NaN();
+  double differential_disagreement =
+      std::numeric_limits<double>::infinity();
 };
 
 struct LidarOdometryOptions
@@ -75,27 +81,67 @@ struct LidarOdometryOptions
   double min_inlier_ratio = 0.15;
   double convergence_translation = 0.0015;
   double convergence_rotation_deg = 0.03;
+  // FAST-LIVO2-style iterated updates rematch after the first small increment
+  // instead of accepting correspondences from a single linearization.  Two
+  // consecutive confirmations make the state used for validation and map
+  // insertion coincide with the state at which residuals were evaluated.
+  int convergence_confirmation_iterations = 2;
+  bool require_convergence_for_acceptance = false;
+  double max_iteration_translation = 0.40;
+  double max_iteration_rotation_deg = 3.0;
   double degeneracy_eigen_ratio = 1e-4;
   // The scan-to-map Hessian is rank deficient in corridors, planar roads, and
-  // sparse views. Project each iterative pose correction onto its observable
-  // eigenspace instead of turning an ill-conditioned least-squares step into
-  // a spurious yaw, height, or lateral correction.
+  // sparse views. This ratio identifies weak directions for diagnostics,
+  // covariance preservation, map-write gating, and optional hard projection.
   double observability_eigen_ratio = 1e-4;
   int min_observable_directions = 3;
+  // Marginalize translation from the pose Hessian before judging rotational
+  // support. This avoids treating a well-observed position direction as
+  // evidence that yaw/roll/pitch are also constrained. When enabled, weak
+  // rotational LiDAR modes retain only weak_rotation_information_scale of
+  // their information and therefore fall back smoothly to IMU propagation.
+  double rotation_observability_eigen_ratio = 1e-4;
+  bool project_lidar_information_to_observable_rotation = false;
+  double weak_rotation_information_scale = 0.0;
   // Mean point-to-plane normalized squared residual. A non-positive value
   // disables the corresponding gate.
   double max_mean_normalized_residual = 10.0;
   int map_insertion_min_observable_directions = 3;
+  // Independent rotational map-write gates. Zero disables each gate and
+  // preserves the historical six-dimensional observability policy.
+  int map_insertion_min_observable_rotation_directions = 0;
+  double map_insertion_min_yaw_observability = 0.0;
   double map_insertion_max_mean_normalized_residual = 8.0;
+  bool map_insertion_require_convergence = false;
+  // Independent map-write gates.  Zero disables the corresponding gate.
+  // They allow a bounded state correction to remain usable without baking a
+  // marginal turn registration into the persistent local map.
+  double map_insertion_max_lidar_correction_translation = 0.0;
+  double map_insertion_max_lidar_correction_rotation_deg = 0.0;
   bool preserve_unobservable_covariance = true;
-  // Project LiDAR information and residual gradients before the full-state
-  // ESKF solve. This keeps scan-unobservable pose modes from conditioning
-  // velocity, biases, or gravity through an inconsistent unprojected Hessian.
+  // Optional hard projection of LiDAR information and residual gradients
+  // before the full-state ESKF solve. The normal FAST-LIVO2-style path leaves
+  // this false: the full Hessian and ESKF prior naturally give weak directions
+  // small gain, while covariance and map-write guards still use observability.
   bool project_lidar_information_to_observable_subspace = false;
   // The iterated full-state solve can otherwise absorb a scan-unobservable
   // yaw/roll/pitch correction into gyro bias through prior cross-covariance.
   // Reuse the pose observability projection for the gyro-bias mean increment.
   bool project_gyro_bias_update_to_observable_rotation = false;
+  // Bound hidden-state corrections induced by one iterated LiDAR/wheel scan.
+  // The defaults preserve the previous hard-coded limits. A ground-vehicle
+  // profile with a stationary initialization may keep gravity fixed in its
+  // initial world frame while still estimating the accelerometer bias.
+  bool lidar_update_acceleration_bias = true;
+  // Acceleration bias is only indirectly observable through state
+  // cross-covariance. Ground vehicles may require a robust low-curvature
+  // wheel/gyro window before allowing a scan to modify this hidden state.
+  bool lidar_acceleration_bias_require_stable_wheel_motion = false;
+  bool lidar_update_gravity = true;
+  double max_lidar_velocity_step = 1.0;
+  double max_lidar_gyro_bias_step = 0.02;
+  double max_lidar_acceleration_bias_step = 0.10;
+  double max_lidar_gravity_step = 0.05;
   double solver_damping = 1e-7;
   double max_translation_per_scan = 2.0;
   double max_rotation_per_scan_deg = 20.0;
@@ -104,19 +150,61 @@ struct LidarOdometryOptions
   // motion solely because several scan periods elapsed before registration.
   double max_translation_speed = 4.0;
   double max_rotation_speed_deg = 40.0;
+  // A fixed per-scan rotation gate rejects legitimate sharp turns when CPU
+  // load stretches the interval between processed scans. When enabled and IMU
+  // propagation covered the interval, admit the propagated rotation plus a
+  // bounded margin. The independent LiDAR-correction gate remains active.
+  bool turn_aware_motion_gate_enabled = false;
+  double turn_aware_rotation_margin_deg = 3.0;
+  double turn_aware_max_rotation_deg = 90.0;
+  double turn_aware_max_scan_dt = 1.5;
+  // A modest correction-gate expansion is allowed only when synchronized
+  // wheel differential and IMU yaw rates agree.
+  double turn_aware_min_yaw_rate = 0.20;
+  double turn_aware_lidar_correction_rotation_deg = 0.0;
+  double turn_aware_wheel_imu_max_yaw_rate_difference = 0.20;
   // Registration must remain close to the IMU-propagated state.  This is a
   // separate gate from physical inter-scan motion and prevents one bad plane
   // alignment from poisoning both the ESKF state and the local map.
   double max_lidar_correction_translation = 0.40;
   double max_lidar_correction_rotation_deg = 4.0;
+  // Mahalanobis gate for the aggregate scan rotation correction relative to
+  // the IMU prediction. The angular floor prevents an overconfident filter
+  // from rejecting every small calibration/noise correction. Zero NIS gate
+  // disables this check.
+  double lidar_rotation_correction_nis_gate = 0.0;
+  double lidar_rotation_correction_std_floor_deg = 0.5;
+  // A sequence of individually small but same-sign scan corrections can evade
+  // the per-frame NIS gate and slowly rotate both the state and its map. Keep
+  // a time-windowed sum about the gravity axis; zero disables this guard.
+  double lidar_yaw_correction_window_sec = 0.0;
+  double max_cumulative_lidar_yaw_correction_deg = 0.0;
+  // Instead of rejecting the complete scan after the cumulative yaw limit is
+  // crossed, clamp only the gravity-axis component of the iterated LiDAR
+  // correction. Translation and roll/pitch remain available to the ESKF.
+  // The legacy whole-scan rejection remains the default when this is false.
+  bool limit_cumulative_lidar_yaw_correction = false;
+  // Information retained along the limited yaw axis. Zero falls back to the
+  // propagated IMU yaw covariance; a small positive value keeps a weak LiDAR
+  // contribution without allowing repeated map corrections to dominate.
+  double limited_lidar_yaw_information_scale = 0.0;
+  // A limited pose is useful for state correction, but its yaw disagreement
+  // must not be written back into the persistent map.
+  bool defer_map_when_lidar_yaw_limited = true;
   // After a run of rejected LiDAR updates, bound the otherwise unobservable
   // IMU-only motion. This prevents an extended registration outage from
   // turning into an unbounded vertical or horizontal trajectory excursion.
   // Set lidar_loss_hold_after_rejections to zero to disable this protection.
   int lidar_loss_hold_after_rejections = 3;
-  // Once loss persists beyond this many rejected scans, freeze the pose at
-  // the last trusted LiDAR update rather than publishing a plausible-looking
-  // but unconstrained trajectory. Set to zero to keep bounded propagation.
+  // During a LiDAR outage, use a synchronized wheel speed with the propagated
+  // IMU attitude to keep the prediction inside the local-map capture range.
+  // This mirrors FAST-LIVO2's continuous propagation through weak scans while
+  // map insertion remains disabled. If no wheel sample is available, the
+  // bounded inertial-velocity fallback below is used.
+  bool lidar_loss_use_wheel_dead_reckoning = true;
+  // Once loss persists beyond this many rejected scans, freeze the pose only
+  // when wheel dead reckoning is unavailable. Set to zero to always keep the
+  // bounded propagation alive so registration can reacquire a moving sensor.
   int lidar_loss_freeze_after_rejections = 12;
   double lidar_loss_max_vertical_offset = 0.35;
   double lidar_loss_max_horizontal_speed = 3.0;
@@ -128,6 +216,10 @@ struct LidarOdometryOptions
   double degenerate_max_rmse = 0.18;
   double map_insertion_max_plane_distance = 0.25;
   double local_map_radius = 70.0;
+  // Preserve voxels outside the current local radius so a later revisit can
+  // register against the original geometry. The radius still bounds points
+  // admitted from each scan, and max_map_points remains a hard memory limit.
+  bool retain_global_map = false;
   double max_plane_variance = 0.035;
   double plane_uncertainty_scale = 1.0;
   // Reject or down-weight a query that extrapolates too far beyond the
@@ -184,6 +276,11 @@ struct LidarOdometryOptions
   // A positive value requires this many consecutive strong-support scans after
   // any rejected frame before map insertion resumes. Zero keeps legacy behavior.
   int recovery_map_insert_min_consecutive_strong_support = 0;
+  // Point-to-plane association is read-only with respect to the local map and
+  // can be distributed like FAST-LIVO2's BuildResidualListOMP. Keep the
+  // production limit deliberately small so semantics and ROS callbacks retain
+  // CPU headroom during long bag replays.
+  int registration_threads = 1;
   int max_iterations = 5;
   int min_scan_points = 200;
   int min_correspondences = 100;
@@ -198,6 +295,11 @@ struct LidarOdometryOptions
   // A mature voxel can otherwise absorb the estimator's own slowly drifting
   // poses forever. Freezing it makes the local map an independent reference.
   bool freeze_mature_voxels = false;
+  // Relative EMA gain after a valid planar voxel reaches max_voxel_points.
+  // One preserves the historical update rate and zero holds its plane
+  // statistics fixed. Non-planar voxels always keep the full gain so mixed
+  // cells can recover when later views provide cleaner support.
+  double mature_voxel_update_gain = 1.0;
   // Insert accepted scans only after sufficient motion, while the maximum
   // interval still refreshes a stationary or slowly moving local map.
   double map_insertion_min_translation = 0.0;
@@ -247,6 +349,38 @@ struct LidarOdometryOptions
   // Maximum scalar NIS for the measured forward wheel velocity. Lateral and
   // vertical non-holonomic constraints remain available when it is rejected.
   double wheel_forward_innovation_gate = 0.0;
+  // Convert corrected right-minus-left wheel speed to body yaw rate. A zero
+  // scale disables this observation. The forward leakage term compensates a
+  // small left/right wheel-scale mismatch before the yaw conversion.
+  double wheel_yaw_rate_scale = 0.0;
+  // Keep wheel-yaw consistency available for turn gating without necessarily
+  // writing wheel-radius/track-width error into the IMU gyro bias state.
+  bool wheel_yaw_rate_fuse_gyro_bias = true;
+  // Relative uncertainty of the differential-wheel yaw scale. Its variance
+  // contribution grows with squared turn rate, retaining gyro-bias
+  // observability while smoothly reducing wheel authority in sharp turns.
+  double wheel_yaw_rate_relative_scale_uncertainty = 0.0;
+  // A positive window replaces the per-frame wheel/gyro bias factor with a
+  // robust estimate formed only from low-curvature samples. This anchors gyro
+  // bias on straight motion without writing turn-radius-dependent wheel-scale
+  // error into the inertial state. Zero preserves the legacy direct factor.
+  double wheel_yaw_bias_window_sec = 0.0;
+  int wheel_yaw_bias_min_samples = 8;
+  double wheel_yaw_bias_max_abs_rate = 0.0;
+  double wheel_yaw_bias_max_mad = 0.0;
+  double wheel_yaw_bias_noise_floor = 0.01;
+  // Remove a fixed wheel-yaw offset using the initialized IMU gyro bias when
+  // the first valid low-curvature window becomes available. This is useful
+  // when unequal wheel radii create an apparent constant yaw rate.
+  bool wheel_yaw_bias_calibrate_offset = false;
+  double wheel_differential_forward_leakage = 0.0;
+  double wheel_yaw_rate_noise = 0.10;
+  double wheel_yaw_rate_huber_delta = 1.5;
+  double wheel_yaw_rate_innovation_gate = 16.0;
+  double wheel_yaw_rate_min_speed = 0.30;
+  double wheel_yaw_rate_max_abs = 2.0;
+  double wheel_yaw_rate_max_imu_difference = 0.0;
+  double wheel_differential_max_disagreement = 0.08;
   double wheel_buffer_duration = 5.0;
   // Position of the odometer reference point relative to the IMU/body origin,
   // expressed in the ROS body frame. The velocity measurement is compensated
@@ -270,6 +404,7 @@ struct LidarOdometryOptions
   double visual_max_rotation_step_deg = 4.0;
   double visual_convergence_translation = 0.0005;
   double visual_convergence_rotation_deg = 0.01;
+  bool visual_require_convergence = false;
   double visual_solver_damping = 1e-6;
   // A pose measurement updates every ESKF state correlated with pose through
   // the prior covariance. Disabling this preserves the legacy pose-only mean
@@ -327,6 +462,7 @@ struct LidarOdometryResult
   bool map_updated = false;
   bool map_update_deferred = false;
   bool map_keyframe_selected = false;
+  bool final_linearization_valid = false;
   bool loss_limited = false;
   bool loss_frozen = false;
   bool strong_support = false;
@@ -339,17 +475,47 @@ struct LidarOdometryResult
   double wheel_speed = 0.0;
   double wheel_velocity_residual = 0.0;
   bool wheel_forward_rejected = false;
+  bool used_wheel_yaw_rate = false;
+  bool wheel_yaw_rate_rejected = false;
+  double wheel_yaw_rate_effective_noise = 0.0;
+  double wheel_yaw_rate = 0.0;
+  double imu_yaw_rate = 0.0;
+  double wheel_yaw_rate_residual = 0.0;
+  int wheel_yaw_bias_window_samples = 0;
+  double wheel_yaw_bias_observation = 0.0;
+  double wheel_yaw_bias_raw_observation = 0.0;
+  double wheel_yaw_bias_offset = 0.0;
+  bool wheel_yaw_bias_offset_calibrated = false;
+  double wheel_yaw_bias_mad = std::numeric_limits<double>::infinity();
+  bool acceleration_bias_update_allowed = false;
+  Eigen::Vector3d acceleration_bias_correction = Eigen::Vector3d::Zero();
+  bool turn_aware_gate_active = false;
+  double expected_rotation_deg = 0.0;
+  double rotation_motion_gate_deg = 0.0;
+  double lidar_correction_rotation_gate_deg = 0.0;
+  double lidar_rotation_correction_nis =
+      std::numeric_limits<double>::infinity();
+  double lidar_yaw_correction_deg = 0.0;
+  double cumulative_lidar_yaw_correction_deg = 0.0;
+  bool lidar_yaw_correction_limited = false;
+  double lidar_yaw_correction_limit_deg = 0.0;
+  double lidar_yaw_information_scale = 1.0;
   double mean_normalized_residual = std::numeric_limits<double>::infinity();
   double mean_robust_weight = 0.0;
   double measurement_condition = std::numeric_limits<double>::infinity();
+  double rotation_measurement_condition =
+      std::numeric_limits<double>::infinity();
+  double yaw_observability = 0.0;
   int correspondences = 0;
   int innovation_rejections = 0;
   int observable_directions = 0;
+  int observable_rotation_directions = 0;
   int scan_points = 0;
   int correspondence_azimuth_sectors = 0;
   int point_knn_fallback_queries = 0;
   int point_knn_fallback_matches = 0;
   int iterations = 0;
+  int convergence_confirmations = 0;
   int imu_samples = 0;
   int consecutive_rejections = 0;
   Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
@@ -362,6 +528,7 @@ struct LidarOdometryResult
       Eigen::Matrix<double, 6, 6>::Identity();
   PointVector deskewed_points;
   std::string reject_reason;
+  std::string map_update_reason;
 };
 
 struct VisualPoseLinearization
@@ -504,6 +671,18 @@ private:
     double nearest_squared_distance = std::numeric_limits<double>::infinity();
   };
 
+  struct YawCorrectionSample
+  {
+    double stamp = 0.0;
+    double correction = 0.0;
+  };
+
+  struct WheelYawBiasSample
+  {
+    double stamp = 0.0;
+    double bias = 0.0;
+  };
+
   static Eigen::Matrix3d skew(const Eigen::Vector3d &vector);
   static Eigen::Matrix3d expSO3(const Eigen::Vector3d &rotation_vector);
   static Eigen::Vector3d logSO3(const Eigen::Matrix3d &rotation);
@@ -551,7 +730,7 @@ private:
   void updateVoxel(MapVoxel &voxel, const Eigen::Vector3d &point);
   void updateVoxelPlane(MapVoxel &voxel);
   bool shouldInsertMap(const State &state, double stamp) const;
-  bool wheelMeasurement(double stamp, double *forward_speed) const;
+  bool wheelMeasurement(double stamp, WheelSample *measurement) const;
   bool angularVelocityMeasurement(double stamp,
                                   Eigen::Vector3d *angular_velocity) const;
   void pruneMap();
@@ -590,6 +769,10 @@ private:
   std::deque<ImuSample, Eigen::aligned_allocator<ImuSample>> imu_buffer_;
   std::deque<ImuPose, Eigen::aligned_allocator<ImuPose>> propagation_history_;
   std::deque<WheelSample> wheel_buffer_;
+  std::deque<WheelYawBiasSample> wheel_yaw_bias_history_;
+  bool wheel_yaw_bias_offset_initialized_ = false;
+  double wheel_yaw_bias_offset_ = 0.0;
+  std::deque<YawCorrectionSample> lidar_yaw_correction_history_;
   using MapVoxelPair = std::pair<const VoxelKey, MapVoxel>;
   using MapVoxelMap =
       std::unordered_map<VoxelKey, MapVoxel, VoxelKeyHash,

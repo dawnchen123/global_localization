@@ -1,0 +1,122 @@
+# Building02 graph overlay, loaded after semantic_gtsam_pose_graph.yaml and
+# hybrid_localization_visual_fusion.yaml.
+#
+# The previous building02 graph trajectory matched the frontend to numerical
+# precision, so this profile explicitly enables independently gated factors.
+# Repeated indoor geometry is not allowed to create an unverified raw XY loop.
+
+odom_history_sec: 2400.0
+
+continuous_correction_enabled: true
+continuous_correction_max_xy_rate: 0.35
+continuous_correction_max_z_rate: 0.10
+continuous_correction_max_rotation_rate_deg: 1.0
+continuous_correction_reset_gap_sec: 5.0
+
+visual_loop:
+  maximum_database_size: 2200
+  retrieval_interval_sec: 3.0
+  minimum_time_separation_sec: 90.0
+  search_radius: 40.0
+  maximum_yaw_difference_deg: 180.0
+  maximum_retrieval_candidates: 60
+  maximum_geometric_candidates: 8
+  enable_global_retrieval_fallback: true
+  maximum_global_retrieval_candidates: 20
+  global_retrieval_feature_count: 450
+  global_retrieval_min_votes: 10
+  global_retrieval_min_table_count: 2
+  minimum_global_geometric_candidates: 2
+  maximum_verified_candidates: 3
+  candidate_reference_min_separation_sec: 25.0
+  pending_max_size: 32
+  pending_max_retries_per_tick: 3
+
+graph:
+  enable_xy_loops: false
+  enable_z_loops: false
+  enable_visual_rotation_factors: false
+  enable_visual_translation_factors: false
+  enable_visual_loop_factors: true
+  enable_wheel_factors: true
+  enable_sequential_ground_z: true
+  enable_semantic_observation_factors: true
+  enable_semantic_observation_xy_factors: true
+  enable_semantic_observation_z_factors: true
+
+  # Weaken the correlated frontend chain enough for independently verified
+  # revisits to distribute a correction over the trajectory.
+  odom_sigma_yaw: 0.018
+  odom_sigma_xy_base: 0.08
+  odom_sigma_xy_per_meter: 0.025
+  odom_sigma_z_base: 0.10
+
+  # Visual retrieval only proposes a revisit.  PnP-seeded LiDAR mutual-NN,
+  # RANSAC/Huber and two nearby verified proposals remain mandatory.
+  visual_loop_lidar_use_pnp_seed: true
+  visual_loop_min_support: 2
+  visual_loop_support_reference_neighborhood: 20
+  visual_loop_support_current_max_gap: 16
+  visual_loop_support_max_correction_xy: 0.60
+  visual_loop_support_max_correction_yaw_deg: 1.0
+  visual_loop_support_max_correction_z: 0.20
+  visual_loop_minimum_interval_sec: 75.0
+  visual_loop_reference_neighborhood: 20
+  visual_loop_max_factors: 8
+  visual_loop_use_dcs: true
+  visual_loop_dcs_k: 9.0
+  visual_loop_graph_consistency_max_xy: 4.0
+  visual_loop_graph_consistency_max_yaw_deg: 6.0
+  visual_loop_graph_consistency_max_z: 1.5
+  visual_loop_sigma_xy: 0.40
+  visual_loop_sigma_yaw_deg: 1.50
+  visual_loop_sigma_z: 0.45
+  visual_loop_ground_z_sigma: 0.25
+  visual_loop_ground_z_max_step: 0.20
+  visual_loop_ground_z_clipped_sigma: 0.50
+
+  wheel_speed_scale: 0.9850
+  wheel_sigma_base: 0.15
+  wheel_sigma_per_meter: 0.04
+  wheel_lateral_sigma: 0.25
+  wheel_min_raw_translation: 0.25
+  wheel_max_arc_disagreement: 0.45
+  wheel_max_relative_arc_disagreement: 0.45
+  wheel_use_dcs: true
+  wheel_dcs_k: 1.0
+
+  sequential_ground_sigma_z: 0.14
+  sequential_ground_interval: 1
+  sequential_ground_min_spread: 5.0
+  sequential_ground_min_spread_ratio: 0.10
+  sequential_ground_min_inlier_ratio: 0.45
+  sequential_ground_min_support: 2
+  sequential_ground_support_max_gap: 2
+  sequential_ground_support_max_z_disagreement: 0.12
+  sequential_ground_max_step: 0.08
+  sequential_ground_use_dcs: true
+  sequential_ground_dcs_k: 1.0
+
+  # SAM3 submaps are permitted to provide several spatially separated, robust
+  # observations.  Corrections remain bounded because indoor classes and
+  # structures repeat frequently.
+  semantic_observation_min_index_gap: 30
+  semantic_observation_min_time_separation_sec: 90.0
+  semantic_observation_minimum_interval_sec: 90.0
+  semantic_observation_max_factors: 6
+  semantic_observation_min_features: 100
+  semantic_observation_min_inliers: 60
+  semantic_observation_min_z_inliers: 60
+  semantic_observation_search_radius: 25.0
+  semantic_observation_min_inlier_ratio: 0.55
+  semantic_observation_min_spread: 8.0
+  semantic_observation_min_spread_ratio: 0.25
+  semantic_observation_max_rmse: 0.18
+  semantic_observation_max_xy_correction: 2.0
+  semantic_observation_max_yaw_correction_deg: 2.5
+  semantic_observation_max_z_correction: 0.35
+  semantic_observation_sigma_xy: 0.70
+  semantic_observation_sigma_yaw_deg: 2.0
+  semantic_observation_sigma_z: 0.40
+  semantic_observation_huber_k: 1.345
+  min_semantic_observation_factors_for_xy_output: 2

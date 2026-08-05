@@ -168,6 +168,9 @@ int main()
   }
   const LidarOdometryResult second_scan = lidar_odometry.processScan(second_body_points, 1.1);
   assert(second_scan.accepted);
+  assert(second_scan.converged);
+  assert(second_scan.convergence_confirmations >= 2);
+  assert(second_scan.final_linearization_valid);
   assert(second_scan.observable_directions >= 3);
   assert(std::isfinite(second_scan.mean_normalized_residual));
   assert(std::isfinite(second_scan.measurement_condition));
@@ -175,6 +178,44 @@ int main()
       logSE3(expected_pose.inverse() * second_scan.pose);
   assert(registration_error.head<3>().norm() < 0.03);
   assert(registration_error.tail<3>().norm() < 0.10);
+
+  // Parallel association must be numerically identical to the serial path.
+  // The fallback budget is selected before dispatch and the normal equation
+  // is reduced in scan order, so thread scheduling cannot change acceptance,
+  // convergence, or the pose written into the local map.
+  LidarOdometryOptions serial_registration_options = odometry_options;
+  serial_registration_options.registration_threads = 1;
+  serial_registration_options.point_knn_fallback = true;
+  serial_registration_options.point_knn_fallback_max_queries = 200;
+  LidarOdometryOptions parallel_registration_options =
+      serial_registration_options;
+  parallel_registration_options.registration_threads = 2;
+  LidarOdometry serial_registration_odometry(serial_registration_options);
+  LidarOdometry parallel_registration_odometry(parallel_registration_options);
+  const LidarOdometryResult serial_registration_initial =
+      serial_registration_odometry.processScan(world_points, 1.4);
+  const LidarOdometryResult parallel_registration_initial =
+      parallel_registration_odometry.processScan(world_points, 1.4);
+  assert(serial_registration_initial.accepted);
+  assert(parallel_registration_initial.accepted);
+  const LidarOdometryResult serial_registration_result =
+      serial_registration_odometry.processScan(second_body_points, 1.5);
+  const LidarOdometryResult parallel_registration_result =
+      parallel_registration_odometry.processScan(second_body_points, 1.5);
+  assert(serial_registration_result.accepted ==
+         parallel_registration_result.accepted);
+  assert(serial_registration_result.converged ==
+         parallel_registration_result.converged);
+  assert(serial_registration_result.correspondences ==
+         parallel_registration_result.correspondences);
+  assert(serial_registration_result.point_knn_fallback_queries ==
+         parallel_registration_result.point_knn_fallback_queries);
+  assert(serial_registration_result.point_knn_fallback_matches ==
+         parallel_registration_result.point_knn_fallback_matches);
+  assert((serial_registration_result.pose.matrix() -
+          parallel_registration_result.pose.matrix()).norm() < 1e-12);
+  assert((serial_registration_result.covariance -
+          parallel_registration_result.covariance).norm() < 1e-12);
 
   // A single horizontal plane only observes roll, pitch, and height. The
   // scan update must expose that degeneracy rather than reporting a fully
@@ -242,6 +283,20 @@ int main()
   assert(robust_scan.mean_robust_weight <= 1.0);
   assert(robust_scan.covariance.allFinite());
 
+  // A reduced mature-plane gain must remain numerically stable after the
+  // voxel reaches its bounded sufficient-statistics capacity.
+  LidarOdometryOptions slow_map_options = odometry_options;
+  slow_map_options.max_voxel_points = 8;
+  slow_map_options.freeze_mature_voxels = false;
+  slow_map_options.mature_voxel_update_gain = 0.10;
+  LidarOdometry slow_map_odometry(slow_map_options);
+  assert(slow_map_odometry.processScan(world_points, 1.9).accepted);
+  assert(slow_map_odometry.processScan(world_points, 2.0).accepted);
+  const LidarOdometryResult slow_map_scan =
+      slow_map_odometry.processScan(world_points, 2.1);
+  assert(slow_map_scan.accepted);
+  assert(slow_map_scan.covariance.allFinite());
+
   // Motion-based map insertion must skip highly correlated stationary scans
   // but refresh after the configured maximum interval.
   LidarOdometryOptions keyframe_options = odometry_options;
@@ -264,6 +319,43 @@ int main()
   assert(keyframe_refresh.accepted);
   assert(keyframe_refresh.map_keyframe_selected);
   assert(keyframe_refresh.map_updated);
+
+  // A scan that exhausts its update budget is evaluated once more at the
+  // actual final pose. It may remain usable as a state update in a permissive
+  // profile, but must not modify the persistent map until rematching confirms
+  // convergence. A strict profile rejects the same marginal registration.
+  LidarOdometryOptions unconfirmed_options = odometry_options;
+  unconfirmed_options.max_iterations = 1;
+  unconfirmed_options.convergence_confirmation_iterations = 2;
+  unconfirmed_options.map_insertion_require_convergence = true;
+  unconfirmed_options.require_convergence_for_acceptance = false;
+  LidarOdometry unconfirmed_odometry(unconfirmed_options);
+  assert(unconfirmed_odometry.processScan(world_points, 6.5).accepted);
+  Eigen::Isometry3d unconfirmed_pose = planarTransform(0.25, -0.12, 0.04);
+  PointVector unconfirmed_scan;
+  unconfirmed_scan.reserve(world_points.size());
+  for (const Eigen::Vector3d &world_point : world_points)
+  {
+    unconfirmed_scan.push_back(unconfirmed_pose.inverse() * world_point);
+  }
+  const LidarOdometryResult unconfirmed_result =
+      unconfirmed_odometry.processScan(unconfirmed_scan, 6.6);
+  assert(unconfirmed_result.accepted);
+  assert(unconfirmed_result.final_linearization_valid);
+  assert(!unconfirmed_result.converged);
+  assert(!unconfirmed_result.map_updated);
+  assert(unconfirmed_result.map_update_deferred);
+  assert(unconfirmed_result.map_update_reason == "registration_not_converged");
+
+  LidarOdometryOptions strict_convergence_options = unconfirmed_options;
+  strict_convergence_options.require_convergence_for_acceptance = true;
+  LidarOdometry strict_convergence_odometry(strict_convergence_options);
+  assert(strict_convergence_odometry.processScan(world_points, 6.5).accepted);
+  const LidarOdometryResult strict_convergence_result =
+      strict_convergence_odometry.processScan(unconfirmed_scan, 6.6);
+  assert(!strict_convergence_result.accepted);
+  assert(strict_convergence_result.reject_reason ==
+         "registration_not_converged");
 
   // Exercise the FAST-LIO-style sample KNN plane path used as a fallback in
   // sparse parts of the rolling voxel map.
@@ -612,6 +704,336 @@ int main()
   assert(inertial_result.velocity.norm() < 0.02);
   assert(std::abs(inertial_result.gravity.norm() - 9.81) < 1e-6);
 
+  // Low-residual geometry alone must not override a precise stationary IMU
+  // prediction with a contradictory rotation. The aggregate correction NIS
+  // catches this wrong-but-locally-converged scan before it reaches the map.
+  LidarOdometryOptions rotation_nis_options = inertial_options;
+  rotation_nis_options.max_lidar_correction_rotation_deg = 10.0;
+  rotation_nis_options.lidar_rotation_correction_nis_gate = 1e-8;
+  rotation_nis_options.lidar_rotation_correction_std_floor_deg = 0.10;
+  LidarOdometry rotation_nis_odometry(rotation_nis_options);
+  for (int index = 0; index <= 440; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 30.0 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity = known_gyro_bias;
+    rotation_nis_odometry.addImuSample(sample);
+  }
+  assert(rotation_nis_odometry.imuInitialized());
+  assert(rotation_nis_odometry.processScan(world_points, 32.0).accepted);
+  Eigen::Isometry3d contradictory_rotation = Eigen::Isometry3d::Identity();
+  contradictory_rotation.linear() = Eigen::AngleAxisd(
+      0.08, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  PointVector contradictory_rotation_scan;
+  contradictory_rotation_scan.reserve(world_points.size());
+  for (const Eigen::Vector3d &world_point : world_points)
+  {
+    contradictory_rotation_scan.push_back(
+        contradictory_rotation.inverse() * world_point);
+  }
+  const LidarOdometryResult rotation_nis_result =
+      rotation_nis_odometry.processScan(contradictory_rotation_scan, 32.1);
+  assert(!rotation_nis_result.accepted);
+  assert(rotation_nis_result.reject_reason ==
+         "rotation_correction_innovation");
+  assert(rotation_nis_result.lidar_rotation_correction_nis >
+         rotation_nis_options.lidar_rotation_correction_nis_gate);
+
+  // Hidden-state bounds apply to the complete iterated scan. A contradictory
+  // but geometrically valid observation may use all IEKF iterations without
+  // multiplying the configured gyro-bias allowance by the iteration count.
+  LidarOdometryOptions bounded_hidden_options = inertial_options;
+  bounded_hidden_options.max_lidar_correction_rotation_deg = 10.0;
+  bounded_hidden_options.max_lidar_gyro_bias_step = 1e-5;
+  LidarOdometry bounded_hidden_odometry(bounded_hidden_options);
+  for (int index = 0; index <= 440; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 30.0 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity = known_gyro_bias;
+    bounded_hidden_odometry.addImuSample(sample);
+  }
+  assert(bounded_hidden_odometry.processScan(world_points, 32.0).accepted);
+  const Eigen::Vector3d gyro_bias_before_bounded_scan =
+      bounded_hidden_odometry.gyroBias();
+  const LidarOdometryResult bounded_hidden_result =
+      bounded_hidden_odometry.processScan(contradictory_rotation_scan, 32.1);
+  assert(bounded_hidden_result.accepted);
+  assert((bounded_hidden_result.gyro_bias - gyro_bias_before_bounded_scan).norm() <=
+         bounded_hidden_options.max_lidar_gyro_bias_step + 1e-9);
+
+  // The time-window guard is evaluated before state injection and map write.
+  LidarOdometryOptions persistent_yaw_options = bounded_hidden_options;
+  persistent_yaw_options.lidar_yaw_correction_window_sec = 10.0;
+  persistent_yaw_options.max_cumulative_lidar_yaw_correction_deg = 1.0;
+  LidarOdometry persistent_yaw_odometry(persistent_yaw_options);
+  for (int index = 0; index <= 440; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 30.0 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity = known_gyro_bias;
+    persistent_yaw_odometry.addImuSample(sample);
+  }
+  assert(persistent_yaw_odometry.processScan(world_points, 32.0).accepted);
+  const LidarOdometryResult persistent_yaw_result =
+      persistent_yaw_odometry.processScan(contradictory_rotation_scan, 32.1);
+  assert(!persistent_yaw_result.accepted);
+  assert(persistent_yaw_result.reject_reason ==
+         "persistent_lidar_yaw_correction");
+  assert(std::abs(persistent_yaw_result.cumulative_lidar_yaw_correction_deg) >
+         persistent_yaw_options.max_cumulative_lidar_yaw_correction_deg);
+
+  // Dataset profiles may preserve the well-supported non-yaw portion of the
+  // same registration. The cumulative gravity-axis correction is limited,
+  // its information is removed on the final relinearization, and the guarded
+  // pose is never inserted into the persistent map.
+  LidarOdometryOptions selective_yaw_options = persistent_yaw_options;
+  selective_yaw_options.limit_cumulative_lidar_yaw_correction = true;
+  selective_yaw_options.limited_lidar_yaw_information_scale = 0.0;
+  selective_yaw_options.defer_map_when_lidar_yaw_limited = true;
+  LidarOdometry selective_yaw_odometry(selective_yaw_options);
+  for (int index = 0; index <= 440; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 30.0 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity = known_gyro_bias;
+    selective_yaw_odometry.addImuSample(sample);
+  }
+  assert(selective_yaw_odometry.processScan(world_points, 32.0).accepted);
+  const LidarOdometryResult selective_yaw_result =
+      selective_yaw_odometry.processScan(contradictory_rotation_scan, 32.1);
+  assert(selective_yaw_result.accepted);
+  assert(selective_yaw_result.lidar_yaw_correction_limited);
+  assert(std::abs(selective_yaw_result.cumulative_lidar_yaw_correction_deg) <=
+         selective_yaw_options.max_cumulative_lidar_yaw_correction_deg +
+             1e-6);
+  assert(selective_yaw_result.lidar_yaw_information_scale == 0.0);
+  assert(!selective_yaw_result.map_updated);
+
+  // A delayed AT128 frame during a sharp turn can legitimately exceed the
+  // fixed per-scan rotation gate. Complete IMU propagation may expand only
+  // the total-motion gate; the correction relative to IMU remains bounded
+  // and is expanded modestly only when Ranger differential speed agrees.
+  LidarOdometryOptions fixed_turn_options = inertial_options;
+  fixed_turn_options.max_rotation_per_scan_deg = 8.0;
+  fixed_turn_options.max_rotation_speed_deg = 40.0;
+  fixed_turn_options.max_lidar_correction_rotation_deg = 2.8;
+  fixed_turn_options.wheel_enabled = true;
+  fixed_turn_options.wheel_yaw_rate_scale = -1.0 / 0.43;
+  fixed_turn_options.wheel_yaw_rate_min_speed = 0.0;
+  fixed_turn_options.wheel_yaw_rate_noise = 0.12;
+  fixed_turn_options.wheel_yaw_rate_innovation_gate = 16.0;
+  fixed_turn_options.wheel_yaw_rate_max_imu_difference = 0.20;
+  fixed_turn_options.turn_aware_motion_gate_enabled = false;
+  LidarOdometryOptions turn_aware_options = fixed_turn_options;
+  turn_aware_options.turn_aware_motion_gate_enabled = true;
+  turn_aware_options.turn_aware_rotation_margin_deg = 3.0;
+  turn_aware_options.turn_aware_max_rotation_deg = 90.0;
+  turn_aware_options.turn_aware_max_scan_dt = 1.25;
+  turn_aware_options.turn_aware_min_yaw_rate = 0.20;
+  turn_aware_options.turn_aware_lidar_correction_rotation_deg = 4.2;
+  turn_aware_options.turn_aware_wheel_imu_max_yaw_rate_difference = 0.20;
+  turn_aware_options.wheel_yaw_rate_relative_scale_uncertainty = 0.20;
+  LidarOdometry fixed_turn_odometry(fixed_turn_options);
+  LidarOdometry turn_aware_odometry(turn_aware_options);
+  for (int index = 0; index <= 400; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 20.0 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity = known_gyro_bias;
+    fixed_turn_odometry.addImuSample(sample);
+    turn_aware_odometry.addImuSample(sample);
+  }
+  assert(fixed_turn_odometry.imuInitialized());
+  assert(turn_aware_odometry.imuInitialized());
+  const LidarOdometryResult fixed_turn_initial =
+      fixed_turn_odometry.processScan(world_points, 22.0);
+  const LidarOdometryResult turn_aware_initial =
+      turn_aware_odometry.processScan(world_points, 22.0);
+  assert(fixed_turn_initial.accepted);
+  assert(turn_aware_initial.accepted);
+  for (int index = 1; index <= 100; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 22.0 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity =
+        known_gyro_bias + Eigen::Vector3d(0.0, 0.0, 1.0);
+    fixed_turn_odometry.addImuSample(sample);
+    turn_aware_odometry.addImuSample(sample);
+  }
+  WheelSample turn_wheel;
+  turn_wheel.stamp = 22.5;
+  turn_wheel.forward_speed = 0.0;
+  turn_wheel.differential_speed =
+      1.0 / fixed_turn_options.wheel_yaw_rate_scale;
+  turn_wheel.differential_disagreement = 0.0;
+  fixed_turn_odometry.addWheelSample(turn_wheel);
+  turn_aware_odometry.addWheelSample(turn_wheel);
+  Eigen::Isometry3d sharp_turn_pose = turn_aware_initial.pose;
+  sharp_turn_pose.linear() =
+      turn_aware_initial.pose.rotation() *
+      Eigen::AngleAxisd(0.5, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  PointVector sharp_turn_scan;
+  sharp_turn_scan.reserve(world_points.size());
+  for (const Eigen::Vector3d &world_point : world_points)
+  {
+    sharp_turn_scan.push_back(sharp_turn_pose.inverse() * world_point);
+  }
+  const LidarOdometryResult fixed_turn_result =
+      fixed_turn_odometry.processScan(sharp_turn_scan, 22.5);
+  const LidarOdometryResult turn_aware_result =
+      turn_aware_odometry.processScan(sharp_turn_scan, 22.5);
+  assert(!fixed_turn_result.accepted);
+  assert(fixed_turn_result.reject_reason == "implausible_scan_motion");
+  assert(turn_aware_result.accepted);
+  assert(turn_aware_result.turn_aware_gate_active);
+  assert(turn_aware_result.expected_rotation_deg > 25.0);
+  assert(turn_aware_result.rotation_motion_gate_deg >
+         turn_aware_result.expected_rotation_deg);
+  assert(turn_aware_result.used_wheel_yaw_rate);
+  assert(!turn_aware_result.wheel_yaw_rate_rejected);
+  assert(turn_aware_result.wheel_yaw_rate_effective_noise > 0.20);
+  assert(std::abs(turn_aware_result.wheel_yaw_rate_residual) < 0.02);
+  assert(turn_aware_result.lidar_correction_rotation_gate_deg >= 4.2);
+
+  // A slipping or delayed wheel sample must not pull gyro bias toward a
+  // contradictory yaw rate. IMU propagation still permits the physical turn,
+  // but the independent correction gate stays tight.
+  for (int index = 1; index <= 100; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 22.5 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity =
+        known_gyro_bias + Eigen::Vector3d(0.0, 0.0, 1.0);
+    turn_aware_odometry.addImuSample(sample);
+  }
+  WheelSample slipping_wheel = turn_wheel;
+  slipping_wheel.stamp = 23.0;
+  slipping_wheel.differential_speed = 0.0;
+  turn_aware_odometry.addWheelSample(slipping_wheel);
+  Eigen::Isometry3d second_turn_pose = sharp_turn_pose;
+  second_turn_pose.linear() =
+      sharp_turn_pose.rotation() *
+      Eigen::AngleAxisd(0.5, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  PointVector second_turn_scan;
+  second_turn_scan.reserve(world_points.size());
+  for (const Eigen::Vector3d &world_point : world_points)
+  {
+    second_turn_scan.push_back(second_turn_pose.inverse() * world_point);
+  }
+  const LidarOdometryResult slipping_wheel_result =
+      turn_aware_odometry.processScan(second_turn_scan, 23.0);
+  assert(slipping_wheel_result.accepted);
+  assert(slipping_wheel_result.turn_aware_gate_active);
+  assert(!slipping_wheel_result.used_wheel_yaw_rate);
+  assert(slipping_wheel_result.wheel_yaw_rate_rejected);
+  assert(std::abs(slipping_wheel_result.wheel_yaw_rate_residual) > 0.9);
+  assert(std::abs(slipping_wheel_result.lidar_correction_rotation_gate_deg -
+                  turn_aware_options.max_lidar_correction_rotation_deg) <
+         1e-9);
+
+  // A robust wheel/gyro bias window may anchor bg_z on straight motion, while
+  // a valid high-rate turn remains available for gating without entering the
+  // bias normal equation.
+  LidarOdometryOptions robust_bias_options = inertial_options;
+  robust_bias_options.wheel_enabled = true;
+  robust_bias_options.wheel_yaw_rate_scale = -1.0 / 0.43;
+  robust_bias_options.wheel_yaw_rate_min_speed = 0.0;
+  robust_bias_options.wheel_yaw_rate_max_imu_difference = 0.20;
+  robust_bias_options.wheel_yaw_bias_window_sec = 1.0;
+  robust_bias_options.wheel_yaw_bias_min_samples = 3;
+  robust_bias_options.wheel_yaw_bias_max_abs_rate = 0.10;
+  robust_bias_options.wheel_yaw_bias_max_mad = 0.01;
+  robust_bias_options.wheel_yaw_bias_noise_floor = 0.01;
+  robust_bias_options.wheel_yaw_bias_calibrate_offset = true;
+  robust_bias_options.lidar_acceleration_bias_require_stable_wheel_motion =
+      true;
+  LidarOdometry robust_bias_odometry(robust_bias_options);
+  for (int index = 0; index <= 400; ++index)
+  {
+    ImuSample sample;
+    sample.stamp = 40.0 + 0.005 * static_cast<double>(index);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity = known_gyro_bias;
+    robust_bias_odometry.addImuSample(sample);
+  }
+  assert(robust_bias_odometry.imuInitialized());
+  assert(robust_bias_odometry.processScan(world_points, 42.0).accepted);
+  LidarOdometryResult robust_bias_result;
+  constexpr double fixed_wheel_yaw_offset = -0.01;
+  for (int frame = 1; frame <= 3; ++frame)
+  {
+    for (int substep = 1; substep <= 20; ++substep)
+    {
+      ImuSample sample;
+      sample.stamp = 42.0 + 0.1 * static_cast<double>(frame - 1) +
+          0.005 * static_cast<double>(substep);
+      sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+      sample.angular_velocity = known_gyro_bias;
+      robust_bias_odometry.addImuSample(sample);
+    }
+    WheelSample straight_wheel;
+    straight_wheel.stamp = 42.0 + 0.1 * static_cast<double>(frame);
+    straight_wheel.forward_speed = 1.0;
+    straight_wheel.differential_speed =
+        fixed_wheel_yaw_offset / robust_bias_options.wheel_yaw_rate_scale;
+    straight_wheel.differential_disagreement = 0.0;
+    robust_bias_odometry.addWheelSample(straight_wheel);
+    robust_bias_result = robust_bias_odometry.processScan(
+        world_points, straight_wheel.stamp);
+    assert(robust_bias_result.accepted);
+  }
+  assert(robust_bias_result.used_wheel_yaw_rate);
+  assert(robust_bias_result.wheel_yaw_bias_window_samples == 3);
+  if (std::abs(robust_bias_result.wheel_yaw_bias_observation -
+               known_gyro_bias.z()) >= 1e-6)
+  {
+    std::cerr << "wheel bias calibration mismatch: corrected="
+              << robust_bias_result.wheel_yaw_bias_observation
+              << " raw="
+              << robust_bias_result.wheel_yaw_bias_raw_observation
+              << " offset=" << robust_bias_result.wheel_yaw_bias_offset
+              << " expected=" << known_gyro_bias.z() << '\n';
+  }
+  assert(std::abs(robust_bias_result.wheel_yaw_bias_observation -
+                  known_gyro_bias.z()) < 1e-6);
+  assert(std::abs(robust_bias_result.wheel_yaw_bias_raw_observation -
+                  (known_gyro_bias.z() - fixed_wheel_yaw_offset)) < 1e-6);
+  assert(std::abs(robust_bias_result.wheel_yaw_bias_offset +
+                  fixed_wheel_yaw_offset) < 1e-6);
+  assert(robust_bias_result.wheel_yaw_bias_offset_calibrated);
+  assert(robust_bias_result.wheel_yaw_bias_mad < 1e-9);
+  assert(robust_bias_result.acceleration_bias_update_allowed);
+
+  for (int substep = 1; substep <= 20; ++substep)
+  {
+    ImuSample sample;
+    sample.stamp = 42.3 + 0.005 * static_cast<double>(substep);
+    sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+    sample.angular_velocity =
+        known_gyro_bias + Eigen::Vector3d(0.0, 0.0, 0.5);
+    robust_bias_odometry.addImuSample(sample);
+  }
+  WheelSample curved_wheel;
+  curved_wheel.stamp = 42.4;
+  curved_wheel.forward_speed = 1.0;
+  curved_wheel.differential_speed =
+      0.5 / robust_bias_options.wheel_yaw_rate_scale;
+  curved_wheel.differential_disagreement = 0.0;
+  robust_bias_odometry.addWheelSample(curved_wheel);
+  const LidarOdometryResult curved_bias_result =
+      robust_bias_odometry.processScan(world_points, curved_wheel.stamp);
+  assert(!curved_bias_result.used_wheel_yaw_rate);
+  assert(curved_bias_result.wheel_yaw_bias_window_samples == 3);
+  assert(!curved_bias_result.acceleration_bias_update_allowed);
+
   // A registration outage must not turn into unbounded IMU-only Z drift.
   // The LiDAR scan is deliberately outside the local map while the IMU
   // reports a persistent vertical acceleration error.
@@ -622,6 +1044,8 @@ int main()
   loss_options.lidar_loss_max_horizontal_speed = 1.0;
   loss_options.lidar_loss_max_horizontal_step = 0.10;
   loss_options.lidar_loss_velocity_decay = 0.95;
+  loss_options.wheel_enabled = true;
+  loss_options.lidar_loss_use_wheel_dead_reckoning = true;
   loss_options.strong_support_min_correspondences = 100;
   loss_options.strong_support_min_azimuth_sectors = 1;
   loss_options.strong_support_max_rmse = 0.50;
@@ -694,6 +1118,43 @@ int main()
       assert(loss_result.map_updated);
     }
   }
+
+  // On a moving platform, freezing at the last accepted pose makes recovery
+  // impossible because every subsequent scan is projected into stale map
+  // coordinates. With synchronized wheel speed, keep the IMU turn and bounded
+  // forward motion alive while still rejecting the scan and withholding map
+  // insertion.
+  const Eigen::Isometry3d wheel_loss_reference = loss_result.pose;
+  for (int frame = 1; frame <= 8; ++frame)
+  {
+    for (int substep = 1; substep <= 20; ++substep)
+    {
+      ImuSample sample;
+      sample.stamp = 33.0 + 0.1 * static_cast<double>(frame - 1) +
+          0.005 * static_cast<double>(substep);
+      sample.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
+      sample.angular_velocity =
+          known_gyro_bias + Eigen::Vector3d(0.0, 0.0, 0.5);
+      loss_odometry.addImuSample(sample);
+    }
+    WheelSample loss_wheel;
+    loss_wheel.stamp = 33.0 + 0.1 * static_cast<double>(frame);
+    loss_wheel.forward_speed = 1.0;
+    loss_odometry.addWheelSample(loss_wheel);
+    loss_result = loss_odometry.processScan(
+        unrelated_scan, loss_wheel.stamp);
+    assert(!loss_result.accepted);
+  }
+  const Eigen::Isometry3d wheel_loss_delta =
+      wheel_loss_reference.inverse() * loss_result.pose;
+  assert(loss_result.loss_limited);
+  assert(!loss_result.loss_frozen);
+  assert(loss_result.consecutive_rejections >= 5);
+  assert(wheel_loss_delta.translation().head<2>().norm() > 0.30);
+  assert(wheel_loss_delta.translation().head<2>().norm() < 0.90);
+  assert(logSE3(wheel_loss_delta).head<3>().norm() * 180.0 /
+         std::acos(-1.0) > 10.0);
+  assert(!loss_result.map_updated);
 
   std::cout << "hybrid_localization_core_smoke_test: PASS\n";
   return 0;

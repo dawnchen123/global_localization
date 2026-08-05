@@ -1,0 +1,51 @@
+<launch>
+  <!-- Building02 runtime wrapper.  Dataset-specific tuning remains isolated
+       from the general Hesai launch and can be A/B tested as one profile. -->
+  <arg name="pointcloud_topic" default="/hesai/at128/points" />
+  <arg name="imu_topic" default="/adi/adis16465/imu" />
+  <arg name="wheel_topic" default="/insprobe/ranger/odometer" />
+  <arg name="camera_topic" default="/avt_camera/left/image/compressed" />
+  <arg name="sam3_queue_dir" default="/tmp/sam3_building02" />
+  <arg name="enable_sam3_semantics" default="true" />
+  <arg name="trajectory_save_path" default="" />
+  <arg name="frontend_trajectory_save_path" default="" />
+  <arg name="object_save_path" default="" />
+  <arg name="semantic_cloud_save_path" default="" />
+  <arg name="rviz" default="true" />
+
+  <include file="$(find fast_livo2_global_localization)/launch/hybrid_localization_hesai.launch">
+    <arg name="pointcloud_topic" value="$(arg pointcloud_topic)" />
+    <arg name="imu_topic" value="$(arg imu_topic)" />
+    <arg name="wheel_topic" value="$(arg wheel_topic)" />
+    <arg name="camera_topic" value="$(arg camera_topic)" />
+    <arg name="subscribe_wheel" value="true" />
+
+    <arg name="visual_fusion_profile" value="true" />
+    <arg name="subscribe_camera" value="true" />
+    <arg name="enable_visual_frontend" value="true" />
+    <arg name="visual_observation_only" value="false" />
+    <arg name="frontend_tuning_config"
+         value="$(find fast_livo2_global_localization)/config/hybrid_localization_building02_at128.yaml" />
+
+    <arg name="start_graph" value="true" />
+    <arg name="graph_tuning_config"
+         value="$(find fast_livo2_global_localization)/config/semantic_gtsam_pose_graph_building02.yaml" />
+    <arg name="process_registered_clouds" value="true" />
+    <arg name="enable_wheel_factors" value="true" />
+    <arg name="enable_sequential_ground_z" value="true" />
+    <arg name="enable_visual_loop_factors" value="true" />
+    <arg name="enable_xy_loops" value="false" />
+    <arg name="enable_z_loops" value="false" />
+    <arg name="enable_semantic_observation_factors" value="true" />
+    <arg name="enable_semantic_observation_xy_factors" value="true" />
+    <arg name="enable_semantic_observation_z_factors" value="true" />
+
+    <arg name="enable_sam3_semantics" value="$(arg enable_sam3_semantics)" />
+    <arg name="sam3_queue_dir" value="$(arg sam3_queue_dir)" />
+    <arg name="trajectory_save_path" value="$(arg trajectory_save_path)" />
+    <arg name="frontend_trajectory_save_path" value="$(arg frontend_trajectory_save_path)" />
+    <arg name="object_save_path" value="$(arg object_save_path)" />
+    <arg name="semantic_cloud_save_path" value="$(arg semantic_cloud_save_path)" />
+    <arg name="rviz" value="$(arg rviz)" />
+  </include>
+</launch>

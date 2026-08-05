@@ -66,7 +66,7 @@ roslaunch fast_livo2_global_localization hybrid_localization_hesai.launch \
   pointcloud_topic:=/hesai/at128/points \
   imu_topic:=/adi/adis16465/imu \
   camera_topic:=/avt_camera/left/image/compressed \
-  subscribe_wheel:=false \
+  subscribe_wheel:=true \
   subscribe_camera:=true \
   enable_visual_frontend:=true \
   visual_observation_only:=true \
@@ -75,14 +75,14 @@ roslaunch fast_livo2_global_localization hybrid_localization_hesai.launch \
   enable_sam3_visual_mask:=true \
   enable_sam3_lidar_filter:=false \
   enable_semantic_observation_factors:=true \
-  enable_semantic_observation_xy_factors:=true \
+  enable_semantic_observation_xy_factors:=false \
   enable_semantic_observation_z_factors:=true \
   sam3_queue_dir:=/tmp/sam3_street00 \
   trajectory_save_path:=/data/result/hesai_graph.csv \
   frontend_trajectory_save_path:=/data/result/hesai_frontend.csv \
   object_save_path:=/data/result/hesai_objects.csv \
   semantic_cloud_save_path:=/data/result/hesai_sam3_map.ply \
-  rviz:=false
+  rviz:=true
 ```
 
 这是长回放的稳定起点：SAM3 仍会发布 `/sam3/projected_semantic_points` 和
